@@ -228,6 +228,10 @@ def get_link2_table_printable_row(row):
     return s
 
 
+def get_indexed_table_printable_row(row):
+    return "i=%s" % row.i
+
+
 def get_singleton_table_printable_row(row):
     return "name=%s" % row.name
 
@@ -304,6 +308,14 @@ def print_idl(idl, step, terse=False):
         for row in l2.values():
             print_row("link2", row, step,
                       get_link2_table_printable_row(row),
+                      terse)
+            n += 1
+
+    if "indexed" in idl.tables:
+        ind = idl.tables["indexed"].rows
+        for row in ind.values():
+            print_row("indexed", row, step,
+                      get_indexed_table_printable_row(row),
                       terse)
             n += 1
 
@@ -434,7 +446,7 @@ def idl_set(idl, commands, step):
                 sys.stderr.write('"set" command requires 2 argument\n')
                 sys.exit(1)
 
-            s = txn.insert(idl.tables["simple"], new_uuid=args[0],
+            s = txn.insert(idl.tables["simple"], new_uuid=uuid.UUID(args[0]),
                            persist_uuid=True)
             s.i = int(args[1])
         elif name == "delete":
@@ -690,6 +702,9 @@ def do_idl(schema_file, remote, *commands):
     idl = ovs.db.idl.Idl(remote, schema_helper, leader_only=False)
     if "simple3" in idl.tables:
         idl.index_create("simple3", "simple3_by_name")
+    if "indexed" in idl.tables:
+        idx = idl.index_create("indexed", "indexed_by_i")
+        idx.add_column("i")
 
     if commands:
         remotes = remote.split(',')

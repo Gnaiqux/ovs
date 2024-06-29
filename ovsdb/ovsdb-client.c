@@ -451,9 +451,9 @@ usage(void)
            "    wait until DATABASE reaches STATE "
            "(\"added\" or \"connected\" or \"removed\")\n"
            "    in DATBASE on SERVER.\n"
-           "\n  dump [SERVER] [DATABASE] [TABLE]\n"
-           "    dump contents of TABLE (or all tables) in DATABASE on SERVER\n"
-           "    to stdout\n"
+           "\n  dump [SERVER] [DATABASE] [TABLE [COLUMN]...]\n"
+           "    dump contents of COLUMNs, TABLE (or all tables) in DATABASE\n"
+           "    on SERVER to stdout\n"
            "\n  backup [SERVER] [DATABASE] > SNAPSHOT\n"
            "    dump database contents in the form of a database file\n"
            "\n  [--force] restore [SERVER] [DATABASE] < SNAPSHOT\n"
@@ -474,6 +474,8 @@ usage(void)
     vlog_usage();
     ovs_replay_usage();
     printf("\nOther options:\n"
+           "  -t, --timeout=SECS          limits ovsdb-client runtime to\n"
+           "                              approximately SECS seconds.\n"
            "  -h, --help                  display this help message\n"
            "  -V, --version               display version information\n");
     exit(EXIT_SUCCESS);

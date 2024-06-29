@@ -246,6 +246,7 @@ Joe Stringer                       joe@ovn.org
 Jon Kohler                         jon@nutanix.com
 Jonathan Vestin                    jonavest@kau.se
 Jorge Arturo Sauma Vargas          jorge.sauma@hpe.com
+Jun Gu                             jun.gu@easystack.cn
 Jun Nakajima                       jun.nakajima@intel.com
 Jun Wang                           junwang01@cestc.cn
 JunhanYan                          juyan@redhat.com
@@ -474,6 +475,7 @@ Valient Gough                      vgough@pobox.com
 Vasu Dasari                        vdasari@gmail.com
 Venkata Anil Kommaddi              vkommadi@redhat.com
 Viacheslav Galaktionov             viacheslav.galaktionov@arknetworks.am
+Ville Skyttä                       ville.skytta@upcloud.com
 Vishal Deep Ajmera                 vishal.deep.ajmera@ericsson.com
 Vivien Bernet-Rollande             vbr@soprive.net
 Vlad Buslov                        vladbu@nvidia.com

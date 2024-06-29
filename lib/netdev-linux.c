@@ -2922,8 +2922,8 @@ tc_add_matchall_policer(struct netdev *netdev, uint64_t kbits_rate,
     basic_offset = nl_msg_start_nested(&request, TCA_OPTIONS);
     action_offset = nl_msg_start_nested(&request, TCA_MATCHALL_ACT);
     nl_msg_put_act_police(&request, 0, kbits_rate, kbits_burst,
-                          kpkts_rate * 1000, kpkts_burst * 1000, TC_ACT_UNSPEC,
-                          false);
+                          kpkts_rate * 1000ULL, kpkts_burst * 1000ULL,
+                          TC_ACT_UNSPEC, false);
     nl_msg_end_nested(&request, action_offset);
     nl_msg_end_nested(&request, basic_offset);
 
@@ -7174,6 +7174,11 @@ netdev_linux_prepend_vnet_hdr(struct dp_packet *b, int mtu)
             vnet->gso_type = VIRTIO_NET_HDR_GSO_TCPV4;
         } else if (dp_packet_hwol_tx_ipv6(b)) {
             vnet->gso_type = VIRTIO_NET_HDR_GSO_TCPV6;
+        } else {
+            VLOG_ERR_RL(&rl, "Unknown gso_type for TSO packet. "
+                        "Flags: %#"PRIx64,
+                        (uint64_t) *dp_packet_ol_flags_ptr(b));
+            return EINVAL;
         }
     } else {
         vnet->hdr_len = 0;

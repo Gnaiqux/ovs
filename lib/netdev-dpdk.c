@@ -464,9 +464,8 @@ struct netdev_dpdk {
         bool attached;
         /* If true, rte_eth_dev_start() was successfully called */
         bool started;
-        bool reset_needed;
-        /* 1 pad byte here. */
         struct eth_addr hwaddr;
+        /* 2 pad bytes here. */
         int mtu;
         int socket_id;
         int buf_size;
@@ -1355,12 +1354,14 @@ dpdk_eth_dev_init(struct netdev_dpdk *dev)
     }
 
     if (!strcmp(info.driver_name, "net_ice")
-        || !strcmp(info.driver_name, "net_i40e")) {
+        || !strcmp(info.driver_name, "net_i40e")
+        || !strcmp(info.driver_name, "net_iavf")) {
         /* FIXME: Driver advertises the capability but doesn't seem
          * to actually support it correctly.  Can remove this once
          * the driver is fixed on DPDK side. */
         VLOG_INFO("%s: disabled Tx outer udp checksum offloads for a "
-                  "net/ice or net/i40e port.", netdev_get_name(&dev->up));
+                  "net/ice, net/i40e or net/iavf port.",
+                  netdev_get_name(&dev->up));
         info.tx_offload_capa &= ~RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM;
         info.tx_offload_capa &= ~RTE_ETH_TX_OFFLOAD_VXLAN_TNL_TSO;
         info.tx_offload_capa &= ~RTE_ETH_TX_OFFLOAD_GENEVE_TNL_TSO;
@@ -1529,7 +1530,6 @@ common_construct(struct netdev *netdev, dpdk_port_t port_no,
     dev->virtio_features_state = OVS_VIRTIO_F_CLEAN;
     dev->attached = false;
     dev->started = false;
-    dev->reset_needed = false;
 
     ovsrcu_init(&dev->qos_conf, NULL);
 
@@ -2152,13 +2152,11 @@ netdev_dpdk_run(const struct netdev_class *netdev_class OVS_UNUSED)
             if (!pending_reset) {
                 continue;
             }
-            atomic_store_relaxed(&netdev_dpdk_pending_reset[port_id], false);
 
             ovs_mutex_lock(&dpdk_mutex);
             dev = netdev_dpdk_lookup_by_port_id(port_id);
             if (dev) {
                 ovs_mutex_lock(&dev->mutex);
-                dev->reset_needed = true;
                 netdev_request_reconfigure(&dev->up);
                 VLOG_DBG_RL(&rl, "%s: Device reset requested.",
                             netdev_get_name(&dev->up));
@@ -2395,7 +2393,18 @@ netdev_dpdk_set_config(struct netdev *netdev, const struct smap *args,
         }
     }
 
-    lsc_interrupt_mode = smap_get_bool(args, "dpdk-lsc-interrupt", false);
+    lsc_interrupt_mode = smap_get_bool(args, "dpdk-lsc-interrupt", true);
+    if (lsc_interrupt_mode && !(*info.dev_flags & RTE_ETH_DEV_INTR_LSC)) {
+        if (smap_get(args, "dpdk-lsc-interrupt")) {
+            VLOG_WARN_BUF(errp, "'%s': link status interrupt is not "
+                          "supported.", netdev_get_name(netdev));
+            err = EINVAL;
+            goto out;
+        }
+        VLOG_DBG("'%s': not enabling link status interrupt.",
+                 netdev_get_name(netdev));
+        lsc_interrupt_mode = false;
+    }
     if (dev->requested_lsc_interrupt_mode != lsc_interrupt_mode) {
         dev->requested_lsc_interrupt_mode = lsc_interrupt_mode;
         netdev_request_reconfigure(netdev);
@@ -2581,18 +2590,22 @@ static bool
 netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
 {
     struct dp_packet *pkt = CONTAINER_OF(mbuf, struct dp_packet, mbuf);
-    struct tcp_header *th;
+    void *l2;
+    void *l3;
+    void *l4;
 
-    const uint64_t all_requests = (RTE_MBUF_F_TX_IP_CKSUM |
-                                   RTE_MBUF_F_TX_L4_MASK  |
-                                   RTE_MBUF_F_TX_OUTER_IP_CKSUM  |
-                                   RTE_MBUF_F_TX_OUTER_UDP_CKSUM |
-                                   RTE_MBUF_F_TX_TCP_SEG);
-    const uint64_t all_marks = (RTE_MBUF_F_TX_IPV4 |
-                                RTE_MBUF_F_TX_IPV6 |
-                                RTE_MBUF_F_TX_OUTER_IPV4 |
-                                RTE_MBUF_F_TX_OUTER_IPV6 |
-                                RTE_MBUF_F_TX_TUNNEL_MASK);
+    const uint64_t all_inner_requests = (RTE_MBUF_F_TX_IP_CKSUM |
+                                         RTE_MBUF_F_TX_L4_MASK |
+                                         RTE_MBUF_F_TX_TCP_SEG);
+    const uint64_t all_outer_requests = (RTE_MBUF_F_TX_OUTER_IP_CKSUM |
+                                         RTE_MBUF_F_TX_OUTER_UDP_CKSUM);
+    const uint64_t all_requests = all_inner_requests | all_outer_requests;
+    const uint64_t all_inner_marks = (RTE_MBUF_F_TX_IPV4 |
+                                      RTE_MBUF_F_TX_IPV6);
+    const uint64_t all_outer_marks = (RTE_MBUF_F_TX_OUTER_IPV4 |
+                                      RTE_MBUF_F_TX_OUTER_IPV6 |
+                                      RTE_MBUF_F_TX_TUNNEL_MASK);
+    const uint64_t all_marks = all_inner_marks | all_outer_marks;
 
     if (!(mbuf->ol_flags & all_requests)) {
         /* No offloads requested, no marks should be set. */
@@ -2609,74 +2622,92 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
         return true;
     }
 
-    /* If packet is vxlan or geneve tunnel packet, calculate outer
-     * l2 len and outer l3 len. Inner l2/l3/l4 len are calculated
-     * before. */
     const uint64_t tunnel_type = mbuf->ol_flags & RTE_MBUF_F_TX_TUNNEL_MASK;
-    if (tunnel_type == RTE_MBUF_F_TX_TUNNEL_GENEVE ||
-        tunnel_type == RTE_MBUF_F_TX_TUNNEL_VXLAN) {
-        mbuf->outer_l2_len = (char *) dp_packet_l3(pkt) -
-                 (char *) dp_packet_eth(pkt);
-        mbuf->outer_l3_len = (char *) dp_packet_l4(pkt) -
-                 (char *) dp_packet_l3(pkt);
-
-        /* If neither inner checksums nor TSO is requested, inner marks
-         * should not be set. */
-        if (!(mbuf->ol_flags & (RTE_MBUF_F_TX_IP_CKSUM |
-                                RTE_MBUF_F_TX_L4_MASK  |
-                                RTE_MBUF_F_TX_TCP_SEG))) {
-            mbuf->ol_flags &= ~(RTE_MBUF_F_TX_IPV4 |
-                                RTE_MBUF_F_TX_IPV6);
-        }
-    } else if (OVS_UNLIKELY(tunnel_type)) {
+    if (OVS_UNLIKELY(tunnel_type &&
+                     tunnel_type != RTE_MBUF_F_TX_TUNNEL_GENEVE &&
+                     tunnel_type != RTE_MBUF_F_TX_TUNNEL_VXLAN)) {
         VLOG_WARN_RL(&rl, "%s: Unexpected tunnel type: %#"PRIx64,
                      netdev_get_name(&dev->up), tunnel_type);
         netdev_dpdk_mbuf_dump(netdev_get_name(&dev->up),
                               "Packet with unexpected tunnel type", mbuf);
         return false;
+    }
+
+    if (tunnel_type && (mbuf->ol_flags & all_inner_requests)) {
+        if (mbuf->ol_flags & all_outer_requests) {
+            mbuf->outer_l2_len = (char *) dp_packet_l3(pkt) -
+                                 (char *) dp_packet_eth(pkt);
+            mbuf->outer_l3_len = (char *) dp_packet_l4(pkt) -
+                                 (char *) dp_packet_l3(pkt);
+
+            /* Inner L2 length must account for the tunnel header length. */
+            l2 = dp_packet_l4(pkt);
+            l3 = dp_packet_inner_l3(pkt);
+            l4 = dp_packet_inner_l4(pkt);
+        } else {
+            /* If no outer offloading is requested, clear outer marks. */
+            mbuf->ol_flags &= ~all_outer_marks;
+            mbuf->outer_l2_len = 0;
+            mbuf->outer_l3_len = 0;
+
+            /* Skip outer headers. */
+            l2 = dp_packet_eth(pkt);
+            l3 = dp_packet_inner_l3(pkt);
+            l4 = dp_packet_inner_l4(pkt);
+        }
     } else {
-        mbuf->l2_len = (char *) dp_packet_l3(pkt) -
-               (char *) dp_packet_eth(pkt);
-        mbuf->l3_len = (char *) dp_packet_l4(pkt) -
-               (char *) dp_packet_l3(pkt);
+        if (tunnel_type) {
+            /* No inner offload is requested, fallback to non tunnel
+             * checksum offloads. */
+            mbuf->ol_flags &= ~all_inner_marks;
+            if (mbuf->ol_flags & RTE_MBUF_F_TX_OUTER_IP_CKSUM) {
+                mbuf->ol_flags |= RTE_MBUF_F_TX_IP_CKSUM;
+                mbuf->ol_flags |= RTE_MBUF_F_TX_IPV4;
+            }
+            if (mbuf->ol_flags & RTE_MBUF_F_TX_OUTER_UDP_CKSUM) {
+                mbuf->ol_flags |= RTE_MBUF_F_TX_UDP_CKSUM;
+                mbuf->ol_flags |= mbuf->ol_flags & RTE_MBUF_F_TX_OUTER_IPV4
+                                  ? RTE_MBUF_F_TX_IPV4 : RTE_MBUF_F_TX_IPV6;
+            }
+            mbuf->ol_flags &= ~(all_outer_requests | all_outer_marks);
+        }
         mbuf->outer_l2_len = 0;
         mbuf->outer_l3_len = 0;
+
+        l2 = dp_packet_eth(pkt);
+        l3 = dp_packet_l3(pkt);
+        l4 = dp_packet_l4(pkt);
     }
-    th = dp_packet_l4(pkt);
+
+    ovs_assert(l4);
+
+    mbuf->l2_len = (char *) l3 - (char *) l2;
+    mbuf->l3_len = (char *) l4 - (char *) l3;
 
     if (mbuf->ol_flags & RTE_MBUF_F_TX_TCP_SEG) {
-        if (!th) {
-            VLOG_WARN_RL(&rl, "%s: TCP Segmentation without L4 header"
-                         " pkt len: %"PRIu32"", dev->up.name, mbuf->pkt_len);
-            return false;
-        }
-    }
+        struct tcp_header *th = l4;
+        uint16_t link_tso_segsz;
+        int hdr_len;
 
-    if ((mbuf->ol_flags & RTE_MBUF_F_TX_L4_MASK) == RTE_MBUF_F_TX_TCP_CKSUM) {
-        if (!th) {
-            VLOG_WARN_RL(&rl, "%s: TCP offloading without L4 header"
-                         " pkt len: %"PRIu32"", dev->up.name, mbuf->pkt_len);
-            return false;
-        }
-
+        mbuf->l4_len = TCP_OFFSET(th->tcp_ctl) * 4;
         if (tunnel_type) {
-            mbuf->tso_segsz = dev->mtu - mbuf->l2_len - mbuf->l3_len -
-                              mbuf->l4_len - mbuf->outer_l3_len;
+            link_tso_segsz = dev->mtu - mbuf->l2_len - mbuf->l3_len -
+                             mbuf->l4_len - mbuf->outer_l3_len;
         } else {
-            mbuf->l4_len = TCP_OFFSET(th->tcp_ctl) * 4;
-            mbuf->tso_segsz = dev->mtu - mbuf->l3_len - mbuf->l4_len;
+            link_tso_segsz = dev->mtu - mbuf->l3_len - mbuf->l4_len;
         }
 
-        if (mbuf->ol_flags & RTE_MBUF_F_TX_TCP_SEG) {
-            int hdr_len = mbuf->l2_len + mbuf->l3_len + mbuf->l4_len;
-            if (OVS_UNLIKELY((hdr_len +
-                              mbuf->tso_segsz) > dev->max_packet_len)) {
-                VLOG_WARN_RL(&rl, "%s: Oversized TSO packet. hdr: %"PRIu32", "
-                             "gso: %"PRIu32", max len: %"PRIu32"",
-                             dev->up.name, hdr_len, mbuf->tso_segsz,
-                             dev->max_packet_len);
-                return false;
-            }
+        if (mbuf->tso_segsz > link_tso_segsz) {
+            mbuf->tso_segsz = link_tso_segsz;
+        }
+
+        hdr_len = mbuf->l2_len + mbuf->l3_len + mbuf->l4_len;
+        if (OVS_UNLIKELY((hdr_len + mbuf->tso_segsz) > dev->max_packet_len)) {
+            VLOG_WARN_RL(&rl, "%s: Oversized TSO packet. hdr: %"PRIu32", "
+                         "gso: %"PRIu32", max len: %"PRIu32"",
+                         dev->up.name, hdr_len, mbuf->tso_segsz,
+                         dev->max_packet_len);
+            return false;
         }
     }
 
@@ -6048,6 +6079,7 @@ static int
 netdev_dpdk_reconfigure(struct netdev *netdev)
 {
     struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
+    bool pending_reset;
     bool try_rx_steer;
     int err = 0;
 
@@ -6059,6 +6091,9 @@ netdev_dpdk_reconfigure(struct netdev *netdev)
         dev->requested_n_rxq += 1;
     }
 
+    atomic_read_relaxed(&netdev_dpdk_pending_reset[dev->port_id],
+                        &pending_reset);
+
     if (netdev->n_txq == dev->requested_n_txq
         && netdev->n_rxq == dev->requested_n_rxq
         && dev->rx_steer_flags == dev->requested_rx_steer_flags
@@ -6068,7 +6103,7 @@ netdev_dpdk_reconfigure(struct netdev *netdev)
         && dev->txq_size == dev->requested_txq_size
         && eth_addr_equals(dev->hwaddr, dev->requested_hwaddr)
         && dev->socket_id == dev->requested_socket_id
-        && dev->started && !dev->reset_needed) {
+        && dev->started && !pending_reset) {
         /* Reconfiguration is unnecessary */
 
         goto out;
@@ -6077,10 +6112,14 @@ netdev_dpdk_reconfigure(struct netdev *netdev)
 retry:
     dpdk_rx_steer_unconfigure(dev);
 
-    if (dev->reset_needed) {
+    if (pending_reset) {
+        /*
+         * Set false before reset to avoid missing a new reset interrupt event
+         * in a race with event callback.
+         */
+        atomic_store_relaxed(&netdev_dpdk_pending_reset[dev->port_id], false);
         rte_eth_dev_reset(dev->port_id);
         if_notifier_manual_report();
-        dev->reset_needed = false;
     } else {
         rte_eth_dev_stop(dev->port_id);
     }
@@ -6680,7 +6719,7 @@ parse_vhost_config(const struct smap *ovs_other_config)
 
     vhost_postcopy_enabled = smap_get_bool(ovs_other_config,
                                            "vhost-postcopy-support", false);
-    if (vhost_postcopy_enabled && memory_locked()) {
+    if (vhost_postcopy_enabled && memory_all_locked()) {
         VLOG_WARN("vhost-postcopy-support and mlockall are not compatible.");
         vhost_postcopy_enabled = false;
     }

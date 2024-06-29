@@ -35,9 +35,9 @@ ROW_CREATE = "create"
 ROW_UPDATE = "update"
 ROW_DELETE = "delete"
 
-OVSDB_UPDATE = 0
-OVSDB_UPDATE2 = 1
-OVSDB_UPDATE3 = 2
+OVSDB_UPDATE = "update"
+OVSDB_UPDATE2 = "update2"
+OVSDB_UPDATE3 = "update3"
 
 CLUSTERED = "clustered"
 RELAY = "relay"
@@ -77,7 +77,7 @@ class ColumnDefaultDict(dict):
         return item in self.keys()
 
 
-class Monitor(enum.IntEnum):
+class Monitor(enum.Enum):
     monitor = OVSDB_UPDATE
     monitor_cond = OVSDB_UPDATE2
     monitor_cond_since = OVSDB_UPDATE3
@@ -465,23 +465,18 @@ class Idl(object):
                 self.__parse_update(msg.params[2], OVSDB_UPDATE3)
                 self.last_id = msg.params[1]
             elif (msg.type == ovs.jsonrpc.Message.T_NOTIFY
-                    and msg.method == "update2"
-                    and len(msg.params) == 2):
-                # Database contents changed.
-                self.__parse_update(msg.params[1], OVSDB_UPDATE2)
-            elif (msg.type == ovs.jsonrpc.Message.T_NOTIFY
-                    and msg.method == "update"
+                    and msg.method in (OVSDB_UPDATE, OVSDB_UPDATE2)
                     and len(msg.params) == 2):
                 # Database contents changed.
                 if msg.params[0] == str(self.server_monitor_uuid):
-                    self.__parse_update(msg.params[1], OVSDB_UPDATE,
+                    self.__parse_update(msg.params[1], msg.method,
                                         tables=self.server_tables)
                     self.change_seqno = previous_change_seqno
                     if not self.__check_server_db():
                         self.force_reconnect()
                         break
                 else:
-                    self.__parse_update(msg.params[1], OVSDB_UPDATE)
+                    self.__parse_update(msg.params[1], msg.method)
             elif self.handle_monitor_canceled(msg):
                 break
             elif self.handle_monitor_cancel_reply(msg):
@@ -540,7 +535,7 @@ class Idl(object):
                 # Reply to our "monitor" of _Server request.
                 try:
                     self._server_monitor_request_id = None
-                    self.__parse_update(msg.result, OVSDB_UPDATE,
+                    self.__parse_update(msg.result, OVSDB_UPDATE2,
                                         tables=self.server_tables)
                     self.change_seqno = previous_change_seqno
                     if self.__check_server_db():
@@ -579,6 +574,11 @@ class Idl(object):
             elif msg.type == ovs.jsonrpc.Message.T_NOTIFY and msg.id == "echo":
                 # Reply to our echo request.  Ignore it.
                 pass
+            elif (msg.type == ovs.jsonrpc.Message.T_ERROR and
+                  self.state == self.IDL_S_SERVER_MONITOR_REQUESTED and
+                  msg.id == self._server_monitor_request_id):
+                self._server_monitor_request_id = None
+                self.__send_monitor_request()
             elif (msg.type == ovs.jsonrpc.Message.T_ERROR and
                   self.state == (
                       self.IDL_S_DATA_MONITOR_COND_SINCE_REQUESTED) and
@@ -912,7 +912,7 @@ class Idl(object):
         monitor_request = {"columns": columns}
         monitor_requests[table.name] = [monitor_request]
         msg = ovs.jsonrpc.Message.create_request(
-            'monitor', [self._server_db.name,
+            'monitor_cond', [self._server_db.name,
                              str(self.server_monitor_uuid),
                              monitor_requests])
         self._server_monitor_request_id = msg.id
@@ -1013,7 +1013,9 @@ class Idl(object):
             if not row:
                 raise error.Error('Modify non-existing row')
 
+            del table.rows[uuid]
             old_row = self.__apply_diff(table, row, row_update['modify'])
+            table.rows[uuid] = row
             return Notice(ROW_UPDATE, row, Row(self, table, uuid, old_row))
         else:
             raise error.Error('<row-update> unknown operation',
@@ -1044,9 +1046,10 @@ class Idl(object):
                 op = ROW_UPDATE
                 vlog.warn("cannot add existing row %s to table %s"
                           % (uuid, table.name))
+                del table.rows[uuid]
+
             changed |= self.__row_update(table, row, new)
-            if op == ROW_CREATE:
-                table.rows[uuid] = row
+            table.rows[uuid] = row
             if changed:
                 return Notice(ROW_CREATE, row)
         else:
@@ -1058,9 +1061,11 @@ class Idl(object):
                 # XXX rate-limit
                 vlog.warn("cannot modify missing row %s in table %s"
                           % (uuid, table.name))
+            else:
+                del table.rows[uuid]
+
             changed |= self.__row_update(table, row, new)
-            if op == ROW_CREATE:
-                table.rows[uuid] = row
+            table.rows[uuid] = row
             if changed:
                 return Notice(op, row, Row.from_json(self, table, uuid, old))
         return False
@@ -1854,7 +1859,7 @@ class Transaction(object):
                 if row._data is None:
                     op["op"] = "insert"
                     if row._persist_uuid:
-                        op["uuid"] = row.uuid
+                        op["uuid"] = str(row.uuid)
                     else:
                         op["uuid-name"] = _uuid_name_from_uuid(row.uuid)
 

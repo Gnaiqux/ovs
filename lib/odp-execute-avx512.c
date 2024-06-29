@@ -367,6 +367,8 @@ avx512_get_delta(__m256i old_header, __m256i new_header)
     v_delta = _mm256_permutexvar_epi32(v_swap32a, v_delta);
 
     v_delta = _mm256_hadd_epi32(v_delta, v_zeros);
+    v_delta = _mm256_shuffle_epi8(v_delta, v_swap16a);
+    v_delta = _mm256_hadd_epi32(v_delta, v_zeros);
     v_delta = _mm256_hadd_epi16(v_delta, v_zeros);
 
     /* Extract delta value. */
@@ -471,7 +473,7 @@ action_avx512_ipv4_set_addrs(struct dp_packet_batch *batch,
          * (v_pkt_masked). */
         __m256i v_new_hdr = _mm256_or_si256(v_key_shuf, v_pkt_masked);
 
-        if (dp_packet_hwol_tx_ip_csum(packet)) {
+        if (dp_packet_hwol_l3_ipv4(packet)) {
             dp_packet_ol_reset_ip_csum_good(packet);
         } else {
             ovs_be16 old_csum = ~nh->ip_csum;
@@ -575,6 +577,9 @@ avx512_ipv6_sum_header(__m512i ip6_header)
                                           0xF, 0xF, 0xF, 0xF);
 
     v_delta = _mm256_permutexvar_epi32(v_swap32a, v_delta);
+
+    v_delta = _mm256_hadd_epi32(v_delta, v_zeros);
+    v_delta = _mm256_shuffle_epi8(v_delta, v_swap16a);
     v_delta = _mm256_hadd_epi32(v_delta, v_zeros);
     v_delta = _mm256_hadd_epi16(v_delta, v_zeros);
 
@@ -736,6 +741,14 @@ action_avx512_set_ipv6(struct dp_packet_batch *batch, const struct nlattr *a)
         }
         /* Write back the modified IPv6 addresses. */
         _mm512_mask_storeu_epi64((void *) nh, 0x1F, v_new_hdr);
+
+        /* Scalar method for setting IPv6 tclass field. */
+        if (key->ipv6_tclass) {
+            uint8_t old_tc = ntohl(get_16aligned_be32(&nh->ip6_flow)) >> 20;
+            uint8_t key_tc = key->ipv6_tclass | (old_tc & ~mask->ipv6_tclass);
+
+            packet_set_ipv6_tc(&nh->ip6_flow, key_tc);
+        }
     }
 }
 #endif /* HAVE_AVX512VBMI */
