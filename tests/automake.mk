@@ -7,6 +7,7 @@ EXTRA_DIST += \
 	$(SYSTEM_TSO_TESTSUITE_AT) \
 	$(SYSTEM_AFXDP_TESTSUITE_AT) \
 	$(SYSTEM_OFFLOADS_TESTSUITE_AT) \
+	$(SYSTEM_DPDK_OFFLOADS_TESTSUITE_AT) \
 	$(SYSTEM_DPDK_TESTSUITE_AT) \
 	$(OVSDB_CLUSTER_TESTSUITE_AT) \
 	$(TESTSUITE) \
@@ -15,14 +16,14 @@ EXTRA_DIST += \
 	$(SYSTEM_TSO_TESTSUITE) \
 	$(SYSTEM_AFXDP_TESTSUITE) \
 	$(SYSTEM_OFFLOADS_TESTSUITE) \
+	$(SYSTEM_DPDK_OFFLOADS_TESTSUITE) \
 	$(SYSTEM_DPDK_TESTSUITE) \
 	$(OVSDB_CLUSTER_TESTSUITE) \
 	tests/atlocal.in \
 	$(srcdir)/package.m4 \
 	$(srcdir)/tests/test-dpparse.py \
 	$(srcdir)/tests/test-ofparse.py \
-	$(srcdir)/tests/testsuite \
-	$(srcdir)/tests/testsuite.patch
+	$(srcdir)/tests/testsuite
 
 COMMON_MACROS_AT = \
 	tests/ovsdb-macros.at \
@@ -34,6 +35,7 @@ TESTSUITE_AT = \
 	tests/completion.at \
 	tests/checkpatch.at \
 	tests/library.at \
+	tests/stopwatch.at \
 	tests/heap.at \
 	tests/bundle.at \
 	tests/classifier.at \
@@ -63,6 +65,7 @@ TESTSUITE_AT = \
 	tests/json.at \
 	tests/jsonrpc.at \
 	tests/jsonrpc-py.at \
+	tests/pfd-stream.at \
 	tests/pmd.at \
 	tests/alb.at \
 	tests/tunnel.at \
@@ -186,6 +189,13 @@ SYSTEM_OFFLOADS_TESTSUITE_AT = \
 	tests/system-offloads-testsuite.at \
 	tests/system-offloads-testsuite-macros.at
 
+SYSTEM_DPDK_OFFLOADS_TESTSUITE_AT = \
+	tests/system-common-macros.at \
+	tests/system-dpdk-macros.at \
+	tests/system-dpdk-offloads.at \
+	tests/system-dpdk-offloads-macros.at \
+	tests/system-dpdk-offloads-testsuite.at
+
 SYSTEM_DPDK_TESTSUITE_AT = \
 	tests/system-common-macros.at \
 	tests/system-dpdk-macros.at \
@@ -195,18 +205,18 @@ SYSTEM_DPDK_TESTSUITE_AT = \
 check_SCRIPTS += tests/atlocal
 
 TESTSUITE = $(srcdir)/tests/testsuite
-TESTSUITE_PATCH = $(srcdir)/tests/testsuite.patch
 TESTSUITE_DIR = $(abs_top_builddir)/tests/testsuite.dir
 SYSTEM_KMOD_TESTSUITE = $(srcdir)/tests/system-kmod-testsuite
 SYSTEM_USERSPACE_TESTSUITE = $(srcdir)/tests/system-userspace-testsuite
 SYSTEM_TSO_TESTSUITE = $(srcdir)/tests/system-tso-testsuite
 SYSTEM_AFXDP_TESTSUITE = $(srcdir)/tests/system-afxdp-testsuite
 SYSTEM_OFFLOADS_TESTSUITE = $(srcdir)/tests/system-offloads-testsuite
+SYSTEM_DPDK_OFFLOADS_TESTSUITE = $(srcdir)/tests/system-dpdk-offloads-testsuite
 SYSTEM_DPDK_TESTSUITE = $(srcdir)/tests/system-dpdk-testsuite
 OVSDB_CLUSTER_TESTSUITE = $(srcdir)/tests/ovsdb-cluster-testsuite
 DISTCLEANFILES += tests/atconfig tests/atlocal
 
-AUTOTEST_PATH = utilities:vswitchd:ovsdb:vtep:tests:ipsec:$(PTHREAD_WIN32_DIR_DLL):$(SSL_DIR)
+AUTOTEST_PATH = utilities:vswitchd:ovsdb:vtep:tests:ipsec:$(SSL_DIR)
 
 check-local:
 	set $(SHELL) '$(TESTSUITE)' -C tests AUTOTEST_PATH=$(AUTOTEST_PATH); \
@@ -315,6 +325,12 @@ check-offloads-valgrind: all $(valgrind_wrappers) $(check_DATA)
 	@echo '----------------------------------------------------------------------'
 	@echo 'Valgrind output can be found in tests/system-offloads-testsuite.dir/*/valgrind.*'
 	@echo '----------------------------------------------------------------------'
+check-dpdk-offloads-valgrind: all $(valgrind_wrappers) $(check_DATA)
+	$(SHELL) '$(SYSTEM_DPDK_OFFLOADS_TESTSUITE)' -C tests VALGRIND='$(VALGRIND)' AUTOTEST_PATH='tests/valgrind:$(AUTOTEST_PATH)' -d $(TESTSUITEFLAGS) -j1
+	@echo
+	@echo '----------------------------------------------------------------------'
+	@echo 'Valgrind output can be found in tests/system-dpdk-offloads-testsuite.dir/*/valgrind.*'
+	@echo '----------------------------------------------------------------------'
 check-tso-valgrind: all $(valgrind_wrappers) $(check_DATA)
 	$(SHELL) '$(SYSTEM_TSO_TESTSUITE)' -C tests VALGRIND='$(VALGRIND)' AUTOTEST_PATH='tests/valgrind:$(AUTOTEST_PATH)' -d $(TESTSUITEFLAGS) -j1
 	@echo
@@ -357,6 +373,10 @@ check-offloads: all
 	set $(SHELL) '$(SYSTEM_OFFLOADS_TESTSUITE)' -C tests  AUTOTEST_PATH='$(AUTOTEST_PATH)'; \
 	"$$@" $(TESTSUITEFLAGS) -j1 || (test X'$(RECHECK)' = Xyes && "$$@" --recheck)
 
+check-dpdk-offloads: all
+	set $(SHELL) '$(SYSTEM_DPDK_OFFLOADS_TESTSUITE)' -C tests  AUTOTEST_PATH='$(AUTOTEST_PATH)'; \
+	"$$@" $(TESTSUITEFLAGS) -j1 || (test X'$(RECHECK)' = Xyes && "$$@" --recheck)
+
 check-dpdk: all
 	set $(SHELL) '$(SYSTEM_DPDK_TESTSUITE)' -C tests  AUTOTEST_PATH='$(AUTOTEST_PATH)'; \
 	"$$@" $(TESTSUITEFLAGS) -j1 || (test X'$(RECHECK)' = Xyes && "$$@" --recheck)
@@ -371,16 +391,9 @@ check-ovsdb-cluster: all
 
 AUTOTEST = $(AUTOM4TE) --language=autotest
 
-if WIN32
-$(TESTSUITE): package.m4 $(TESTSUITE_AT) $(COMMON_MACROS_AT) $(TESTSUITE_PATCH)
-	$(AM_V_GEN)$(AUTOTEST) -I '$(srcdir)' -o testsuite.tmp $@.at
-	patch -p0 testsuite.tmp $(TESTSUITE_PATCH)
-	$(AM_V_at)mv testsuite.tmp $@
-else
 $(TESTSUITE): package.m4 $(TESTSUITE_AT) $(COMMON_MACROS_AT)
 	$(AM_V_GEN)$(AUTOTEST) -I '$(srcdir)' -o $@.tmp $@.at
 	$(AM_V_at)mv $@.tmp $@
-endif
 
 $(SYSTEM_KMOD_TESTSUITE): package.m4 $(SYSTEM_TESTSUITE_AT) $(SYSTEM_KMOD_TESTSUITE_AT) $(COMMON_MACROS_AT)
 	$(AM_V_GEN)$(AUTOTEST) -I '$(srcdir)' -o $@.tmp $@.at
@@ -399,6 +412,10 @@ $(SYSTEM_AFXDP_TESTSUITE): package.m4 $(SYSTEM_TESTSUITE_AT) $(SYSTEM_AFXDP_TEST
 	$(AM_V_at)mv $@.tmp $@
 
 $(SYSTEM_OFFLOADS_TESTSUITE): package.m4 $(SYSTEM_TESTSUITE_AT) $(SYSTEM_OFFLOADS_TESTSUITE_AT) $(COMMON_MACROS_AT)
+	$(AM_V_GEN)$(AUTOTEST) -I '$(srcdir)' -o $@.tmp $@.at
+	$(AM_V_at)mv $@.tmp $@
+
+$(SYSTEM_DPDK_OFFLOADS_TESTSUITE): package.m4 $(SYSTEM_TESTSUITE_AT) $(SYSTEM_DPDK_OFFLOADS_TESTSUITE_AT) $(COMMON_MACROS_AT)
 	$(AM_V_GEN)$(AUTOTEST) -I '$(srcdir)' -o $@.tmp $@.at
 	$(AM_V_at)mv $@.tmp $@
 
@@ -483,6 +500,7 @@ tests_ovstest_SOURCES = \
 	tests/test-skiplist.c \
 	tests/test-stp.c \
 	tests/test-unixctl.c \
+	tests/test-unix-socket.c \
 	tests/test-util.c \
 	tests/test-uuid.c \
 	tests/test-uuidset.c \
@@ -491,15 +509,12 @@ tests_ovstest_SOURCES = \
 	tests/test-aa.c \
 	tests/test-stopwatch.c
 
-if !WIN32
-tests_ovstest_SOURCES += \
-	tests/test-unix-socket.c
-endif
-
 if LINUX
 tests_ovstest_SOURCES += \
+	tests/test-lib-route-table.c \
 	tests/test-netlink-conntrack.c \
-	tests/test-netlink-policy.c
+	tests/test-netlink-policy.c \
+	tests/test-psample.c
 endif
 
 tests_ovstest_LDADD = lib/libopenvswitch.la
@@ -518,7 +533,6 @@ tests_test_type_props_SOURCES = tests/test-type-props.c
 CHECK_PYFILES = \
 	tests/appctl.py \
 	tests/flowgen.py \
-	tests/genpkts.py \
 	tests/ovsdb-monitor-sort.py \
 	tests/system-dpdk-find-device.py \
 	tests/test-daemon.py \

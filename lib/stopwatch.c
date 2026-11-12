@@ -84,6 +84,7 @@ struct stopwatch_packet {
 static struct shash stopwatches = SHASH_INITIALIZER(&stopwatches);
 static struct ovs_mutex stopwatches_lock = OVS_MUTEX_INITIALIZER;
 static pthread_cond_t stopwatches_sync = PTHREAD_COND_INITIALIZER;
+static bool stopwatches_sync_requested = false;
 
 static struct latch stopwatch_latch;
 static struct guarded_list stopwatch_commands;
@@ -294,7 +295,7 @@ stopwatch_show_protected(int argc, const char *argv[], struct ds *s)
 {
     struct stopwatch *sw;
 
-    if (argc > 1) {
+    if (argc == 2) {
         sw = shash_find_data(&stopwatches, argv[1]);
         if (!sw) {
             ds_put_cstr(s, "No such stopwatch");
@@ -302,10 +303,67 @@ stopwatch_show_protected(int argc, const char *argv[], struct ds *s)
         }
         stopwatch_print(sw, argv[1], s);
     } else {
+        unsigned long long threshold = 0;
         struct shash_node *node;
+        int no_samples = 0;
+        int tunits = -1;
+
+        if (argc > 2) {
+            if (strcmp(argv[1], "-t") && strcmp(argv[1], "--threshold")) {
+                ds_put_format(s, "Unknown option: %s", argv[1]);
+                return false;
+            }
+            if (!str_to_ullong(argv[2], 10, &threshold)) {
+                ds_put_format(s, "Invalid threshold: %s", argv[2]);
+                return false;
+            }
+            if (argc == 4) {
+                enum stopwatch_units all[] = { SW_MS, SW_US, SW_NS };
+                for (size_t i = 0; i < ARRAY_SIZE(all); i++) {
+                    if (!strcmp(unit_name[all[i]], argv[3])) {
+                        tunits = all[i];
+                        break;
+                    }
+                }
+                if (tunits < 0) {
+                    ds_put_format(s, "Unknown units: %s"
+                        " (supported: %s, %s or %s).", argv[3],
+                        unit_name[SW_MS], unit_name[SW_US], unit_name[SW_NS]);
+                    return false;
+                }
+            }
+        }
+
         SHASH_FOR_EACH (node, &stopwatches) {
+            double t = threshold;
+            int u = tunits;
+
             sw = node->data;
+
+            /* Convert threshold units into stopwatch units. */
+            if (u >= 0 && u != sw->units) {
+                while (u < sw->units) {
+                    u++;
+                    t *= 1000;
+                }
+                while (u > sw->units) {
+                    u--;
+                    t /= 1000;
+                }
+            }
+
+            if (sw->max < t) {
+                continue;
+            }
+
+            if (!sw->n_samples) {
+                no_samples++;
+                continue;
+            }
             stopwatch_print(sw, node->name, s);
+        }
+        if (no_samples) {
+            ds_put_format(s, "%d stopwatches with no samples\n", no_samples);
         }
     }
 
@@ -439,6 +497,7 @@ stopwatch_thread(void *ign OVS_UNUSED)
                 stopwatch_end_sample_protected(pkt);
                 break;
             case OP_SYNC:
+                stopwatches_sync_requested = true;
                 xpthread_cond_signal(&stopwatches_sync);
                 break;
             case OP_RESET:
@@ -487,8 +546,9 @@ stopwatch_exit(void)
 static void
 do_init_stopwatch(void)
 {
-    unixctl_command_register("stopwatch/show", "[NAME]", 0, 1,
-                             stopwatch_show, NULL);
+    unixctl_command_register("stopwatch/show",
+                             "[ NAME | -t|--threshold N [unit] ]",
+                             0, 4, stopwatch_show, NULL);
     unixctl_command_register("stopwatch/reset", "[NAME]", 0, 1,
                              stopwatch_reset, NULL);
     guarded_list_init(&stopwatch_commands);
@@ -547,6 +607,9 @@ stopwatch_sync(void)
     struct stopwatch_packet *pkt = stopwatch_packet_create(OP_SYNC);
     ovs_mutex_lock(&stopwatches_lock);
     stopwatch_packet_write(pkt);
-    ovs_mutex_cond_wait(&stopwatches_sync, &stopwatches_lock);
+    while (!stopwatches_sync_requested) {
+        ovs_mutex_cond_wait(&stopwatches_sync, &stopwatches_lock);
+    }
+    stopwatches_sync_requested = false;
     ovs_mutex_unlock(&stopwatches_lock);
 }

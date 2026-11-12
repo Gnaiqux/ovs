@@ -56,7 +56,8 @@
 
 VLOG_DEFINE_THIS_MODULE(vswitchd);
 
-/* --mlockall: If set, locks all process memory into physical RAM, preventing
+/* --mlockall: If set, locks all present process memory pages into physical
+ * RAM and all the new pages the moment they are faulted in, preventing
  * the kernel from paging any of its memory to disk. */
 static bool want_mlockall;
 
@@ -88,7 +89,6 @@ main(int argc, char *argv[])
 
     dns_resolve_init(true);
     ovs_cmdl_proctitle_init(argc, argv);
-    service_start(&argc, &argv);
     remote = parse_options(argc, argv, &unixctl_path);
     fatal_ignore_sigpipe();
 
@@ -96,10 +96,16 @@ main(int argc, char *argv[])
 
     if (want_mlockall) {
 #ifdef HAVE_MLOCKALL
-        if (mlockall(MCL_CURRENT | MCL_FUTURE)) {
-            VLOG_ERR("mlockall failed: %s", ovs_strerror(errno));
-        } else {
-            set_memory_locked();
+/* MCL_ONFAULT introduced in Linux kernel 4.4. */
+#ifndef MCL_ONFAULT
+#define MCL_ONFAULT 4
+#endif
+        if (mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)) {
+            if (mlockall(MCL_CURRENT | MCL_FUTURE)) {
+                VLOG_ERR("mlockall failed: %s", ovs_strerror(errno));
+            } else {
+                set_all_memory_locked();
+            }
         }
 #else
         VLOG_ERR("mlockall not supported on this system");
@@ -140,9 +146,6 @@ main(int argc, char *argv[])
         }
         OVS_USDT_PROBE(main, poll_block);
         poll_block();
-        if (should_service_stop()) {
-            exit_args.exiting = true;
-        }
     }
     bridge_exit(exit_args.cleanup);
 
@@ -152,7 +155,6 @@ main(int argc, char *argv[])
     free(exit_args.conns);
 
     unixctl_server_destroy(unixctl);
-    service_stop();
     vlog_disable_async();
     ovsrcu_exit();
     dns_resolve_destroy();

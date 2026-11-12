@@ -18,9 +18,7 @@
 #include "ovs-thread.h"
 #include <errno.h>
 #include <poll.h>
-#ifndef _WIN32
 #include <signal.h>
-#endif
 #include <stdlib.h>
 #include <unistd.h>
 #include "compiler.h"
@@ -113,9 +111,9 @@ TRY_LOCK_FUNCTION(rwlock, trywrlock);
 TRY_LOCK_FUNCTION(spin, trylock);
 #endif
 
-#define UNLOCK_FUNCTION(TYPE, FUN, WHERE) \
+#define UNLOCK_FUNCTION(TYPE, FUN, WHERE, CONST) \
     void \
-    ovs_##TYPE##_##FUN(const struct ovs_##TYPE *l_) \
+    ovs_##TYPE##_##FUN(CONST struct ovs_##TYPE *l_) \
         OVS_NO_THREAD_SAFETY_ANALYSIS \
     { \
         struct ovs_##TYPE *l = CONST_CAST(struct ovs_##TYPE *, l_); \
@@ -131,13 +129,13 @@ TRY_LOCK_FUNCTION(spin, trylock);
                        ovs_strerror(error)); \
         } \
     }
-UNLOCK_FUNCTION(mutex, unlock, "<unlocked>");
-UNLOCK_FUNCTION(mutex, destroy, NULL);
-UNLOCK_FUNCTION(rwlock, unlock, "<unlocked>");
-UNLOCK_FUNCTION(rwlock, destroy, NULL);
+UNLOCK_FUNCTION(mutex, unlock, "<unlocked>", const);
+UNLOCK_FUNCTION(mutex, destroy, NULL, /* non-const */);
+UNLOCK_FUNCTION(rwlock, unlock, "<unlocked>", const);
+UNLOCK_FUNCTION(rwlock, destroy, NULL, /* non-const */);
 #ifdef HAVE_PTHREAD_SPIN_LOCK
-UNLOCK_FUNCTION(spin, unlock, "<unlocked>");
-UNLOCK_FUNCTION(spin, destroy, NULL);
+UNLOCK_FUNCTION(spin, unlock, "<unlocked>", const);
+UNLOCK_FUNCTION(spin, destroy, NULL, /* non-const */);
 #endif
 
 #define XPTHREAD_FUNC1(FUNCTION, PARAM1)                \
@@ -194,14 +192,11 @@ XPTHREAD_FUNC2(pthread_key_create, pthread_key_t *, destructor_func *);
 XPTHREAD_FUNC1(pthread_key_delete, pthread_key_t);
 XPTHREAD_FUNC2(pthread_setspecific, pthread_key_t, const void *);
 
-#ifndef _WIN32
 XPTHREAD_FUNC3(pthread_sigmask, int, const sigset_t *, sigset_t *);
-#endif
 
 static void
-ovs_mutex_init__(const struct ovs_mutex *l_, int type)
+ovs_mutex_init__(struct ovs_mutex *l, int type)
 {
-    struct ovs_mutex *l = CONST_CAST(struct ovs_mutex *, l_);
     pthread_mutexattr_t attr;
     int error;
 
@@ -217,21 +212,21 @@ ovs_mutex_init__(const struct ovs_mutex *l_, int type)
 
 /* Initializes 'mutex' as a normal (non-recursive) mutex. */
 void
-ovs_mutex_init(const struct ovs_mutex *mutex)
+ovs_mutex_init(struct ovs_mutex *mutex)
 {
     ovs_mutex_init__(mutex, PTHREAD_MUTEX_ERRORCHECK);
 }
 
 /* Initializes 'mutex' as a recursive mutex. */
 void
-ovs_mutex_init_recursive(const struct ovs_mutex *mutex)
+ovs_mutex_init_recursive(struct ovs_mutex *mutex)
 {
     ovs_mutex_init__(mutex, PTHREAD_MUTEX_RECURSIVE);
 }
 
 /* Initializes 'mutex' as a recursive mutex. */
 void
-ovs_mutex_init_adaptive(const struct ovs_mutex *mutex)
+ovs_mutex_init_adaptive(struct ovs_mutex *mutex)
 {
 #ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
     ovs_mutex_init__(mutex, PTHREAD_MUTEX_ADAPTIVE_NP);
@@ -241,9 +236,8 @@ ovs_mutex_init_adaptive(const struct ovs_mutex *mutex)
 }
 
 void
-ovs_rwlock_init(const struct ovs_rwlock *l_)
+ovs_rwlock_init(struct ovs_rwlock *l)
 {
-    struct ovs_rwlock *l = CONST_CAST(struct ovs_rwlock *, l_);
     int error;
 
     l->where = "<unlocked>";
@@ -256,9 +250,6 @@ ovs_rwlock_init(const struct ovs_rwlock *l_)
     error = pthread_rwlock_init(&l->lock, &attr);
     xpthread_rwlockattr_destroy(&attr);
 #else
-    /* It is important to avoid passing a rwlockattr in this case because
-     * Windows pthreads 2.9.1 (and earlier) fail and abort if passed one, even
-     * one without any special attributes. */
     error = pthread_rwlock_init(&l->lock, NULL);
 #endif
 
@@ -287,9 +278,8 @@ ovs_mutex_cond_wait(pthread_cond_t *cond, const struct ovs_mutex *mutex_)
 
 #ifdef HAVE_PTHREAD_SPIN_LOCK
 static void
-ovs_spin_init__(const struct ovs_spin *l_, int pshared)
+ovs_spin_init__(struct ovs_spin *l, int pshared)
 {
-    struct ovs_spin *l = CONST_CAST(struct ovs_spin *, l_);
     int error;
 
     l->where = "<unlocked>";
@@ -300,7 +290,7 @@ ovs_spin_init__(const struct ovs_spin *l_, int pshared)
 }
 
 void
-ovs_spin_init(const struct ovs_spin *spin)
+ovs_spin_init(struct ovs_spin *spin)
 {
     ovs_spin_init__(spin, PTHREAD_PROCESS_PRIVATE);
 }
@@ -545,7 +535,6 @@ assert_single_threaded_at(const char *where)
     }
 }
 
-#ifndef _WIN32
 /* Forks the current process (checking that this is allowed).  Aborts with
  * VLOG_FATAL if fork() returns an error, and otherwise returns the value
  * returned by fork().
@@ -569,7 +558,6 @@ xfork_at(const char *where)
     }
     return pid;
 }
-#endif
 
 /* Notes that the process must not call fork() from now on, for the specified
  * 'reason'.  (The process may still fork() if it execs itself immediately
@@ -641,13 +629,7 @@ count_cpu_cores__(void)
 {
     long int n_cores;
 
-#ifndef _WIN32
     n_cores = sysconf(_SC_NPROCESSORS_ONLN);
-#else
-    SYSTEM_INFO sysinfo;
-    GetSystemInfo(&sysinfo);
-    n_cores = sysinfo.dwNumberOfProcessors;
-#endif
 #ifdef __linux__
     if (n_cores > 0) {
         cpu_set_t *set = CPU_ALLOC(n_cores);
@@ -697,13 +679,7 @@ count_total_cores(void)
 {
     long int n_cores;
 
-#ifndef _WIN32
     n_cores = sysconf(_SC_NPROCESSORS_CONF);
-#else
-    n_cores = 0;
-    errno = ENOTSUP;
-#endif
-
     return n_cores > 0 ? n_cores : 0;
 }
 
@@ -802,12 +778,7 @@ ovsthread_key_destruct__(void *slots_)
     free(slots);
 }
 
-/* Cancels the callback to ovsthread_key_destruct__().
- *
- * Cancelling the call to the destructor during the main thread exit
- * is needed while using pthreads-win32 library in Windows. It has been
- * observed that in pthreads-win32, a call to the destructor during
- * main thread exit causes undefined behavior. */
+/* Cancels the callback to ovsthread_key_destruct__(). */
 static void
 ovsthread_cancel_ovsthread_key_destruct__(void *aux OVS_UNUSED)
 {

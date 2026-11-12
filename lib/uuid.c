@@ -305,7 +305,7 @@ error:
 int
 uuid_is_partial_string(const char *s)
 {
-    static const char tmpl[UUID_LEN] = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx";
+    const char *tmpl = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx";
     size_t i;
     for (i = 0; i < UUID_LEN; i++) {
         if (s[i] == '\0') {
@@ -361,11 +361,9 @@ do_init(void)
     sha1_update(&sha1_ctx, random_seed, sizeof random_seed);
     sha1_update(&sha1_ctx, &now, sizeof now);
     sha1_update_int(&sha1_ctx, getpid());
-#ifndef _WIN32
     sha1_update_int(&sha1_ctx, getppid());
     sha1_update_int(&sha1_ctx, getuid());
     sha1_update_int(&sha1_ctx, getgid());
-#endif
     sha1_final(&sha1_ctx, sha1);
 
     /* Generate key. */

@@ -13,8 +13,6 @@ EXTRA_DIST += \
 	rhel/etc_openvswitch_default.conf \
 	rhel/etc_sysconfig_network-scripts_ifdown-ovs \
 	rhel/etc_sysconfig_network-scripts_ifup-ovs \
-	rhel/openvswitch.spec \
-	rhel/openvswitch.spec.in \
 	rhel/openvswitch-fedora.spec \
 	rhel/openvswitch-fedora.spec.in \
 	rhel/usr_share_openvswitch_scripts_ovs-systemd-reload \
@@ -23,6 +21,7 @@ EXTRA_DIST += \
 	rhel/usr_lib_udev_rules.d_91-vfio.rules \
 	rhel/usr_lib_systemd_system_openvswitch.service \
 	rhel/usr_lib_systemd_system_ovsdb-server.service \
+	rhel/usr_lib_systemd_system_ovsdb-server.socket \
 	rhel/usr_lib_systemd_system_ovs-vswitchd.service.in \
 	rhel/usr_lib_systemd_system_ovs-delete-transient-ports.service \
 	rhel/usr_lib_systemd_system_openvswitch-ipsec.service
@@ -33,9 +32,6 @@ update_rhel_spec = \
   $(AM_V_GEN)($(ro_shell) && sed -e 's,[@]VERSION[@],$(VERSION),g') \
     < $(srcdir)/rhel/$(@F).in > $(@F).tmp || exit 1; \
   if cmp -s $(@F).tmp $@; then touch $@; rm $(@F).tmp; else mv $(@F).tmp $@; fi
-
-$(srcdir)/rhel/openvswitch.spec: rhel/openvswitch.spec.in $(top_builddir)/config.status
-	$(update_rhel_spec)
 
 $(srcdir)/rhel/openvswitch-fedora.spec: rhel/openvswitch-fedora.spec.in $(top_builddir)/config.status
 	$(update_rhel_spec)

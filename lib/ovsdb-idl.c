@@ -99,6 +99,8 @@ struct ovsdb_idl {
     struct ovs_list rows_to_reparse; /* Stores rows that might need to be
                                       * re-parsed due to insertion of a
                                       * referenced row. */
+    bool server_schema_received; /* Set to true when the IDL has received
+                                  * the DB schema from the server. */
 };
 
 static struct ovsdb_cs_ops ovsdb_idl_cs_ops;
@@ -111,6 +113,7 @@ struct ovsdb_idl_txn {
     enum ovsdb_idl_txn_status status;
     char *error;
     bool dry_run;
+    bool assert_read_only;
     struct ds comment;
 
     /* Increments. */
@@ -204,6 +207,17 @@ static void ovsdb_idl_add_to_indexes(const struct ovsdb_idl_row *);
 static void ovsdb_idl_remove_from_indexes(const struct ovsdb_idl_row *);
 static int ovsdb_idl_try_commit_loop_txn(struct ovsdb_idl_loop *loop,
                                          bool *may_need_wakeup);
+static void ovsdb_idl_condition_clone(struct ovsdb_idl_condition *dest,
+                                      const struct ovsdb_idl_condition *);
+static void ovsdb_idl_create_req_condition(
+        struct ovsdb_idl *,
+        const struct ovsdb_idl_table_class *,
+        const struct ovsdb_idl_condition *);
+static void ovsdb_idl_destroy_req_condition(struct ovsdb_idl_table *);
+static unsigned int ovsdb_idl_set_condition__(
+        struct ovsdb_idl *,
+        const struct ovsdb_idl_table_class *,
+        const struct ovsdb_idl_condition *);
 
 static void add_tracked_change_for_references(struct ovsdb_idl_row *);
 
@@ -265,6 +279,7 @@ ovsdb_idl_create_unconnected(const struct ovsdb_idl_class *class,
         .txn = NULL,
         .outstanding_txns = HMAP_INITIALIZER(&idl->outstanding_txns),
         .verify_write_only = false,
+        .server_schema_received = false,
         .deleted_untracked_rows
             = OVS_LIST_INITIALIZER(&idl->deleted_untracked_rows),
         .rows_to_reparse
@@ -297,7 +312,8 @@ ovsdb_idl_create_unconnected(const struct ovsdb_idl_class *class,
             = table->change_seqno[OVSDB_IDL_CHANGE_DELETE] = 0;
         table->idl = idl;
         table->in_server_schema = false;
-        sset_init(&table->schema_columns);
+        table->req_cond = NULL;
+        shash_init(&table->schema_columns);
     }
 
     return idl;
@@ -340,6 +356,17 @@ ovsdb_idl_reset_min_index(struct ovsdb_idl *idl)
     ovsdb_cs_reset_min_index(idl->cs);
 }
 
+static void
+ovsdb_idl_schema_columns_clear(struct shash *schema_columns)
+{
+    struct shash_node *node;
+
+    SHASH_FOR_EACH (node, schema_columns) {
+        ovsdb_type_destroy(node->data);
+    }
+    shash_clear_free_data(schema_columns);
+}
+
 /* Destroys 'idl' and all of the data structures that it manages. */
 void
 ovsdb_idl_destroy(struct ovsdb_idl *idl)
@@ -354,9 +381,14 @@ ovsdb_idl_destroy(struct ovsdb_idl *idl)
         ovsdb_cs_destroy(idl->cs);
         for (size_t i = 0; i < idl->class_->n_tables; i++) {
             struct ovsdb_idl_table *table = &idl->tables[i];
+
             ovsdb_idl_destroy_indexes(table);
             shash_destroy(&table->columns);
-            sset_destroy(&table->schema_columns);
+
+            ovsdb_idl_schema_columns_clear(&table->schema_columns);
+            shash_destroy(&table->schema_columns);
+            ovsdb_idl_destroy_req_condition(table);
+
             hmap_destroy(&table->rows);
             free(table->modes);
         }
@@ -728,7 +760,9 @@ ovsdb_idl_check_consistency(const struct ovsdb_idl *idl)
                 size_t n_columns = shash_count(&row->table->columns);
                 for (size_t j = 0; j < n_columns; j++) {
                     const struct ovsdb_type *type = &class->columns[j].type;
-                    const struct ovsdb_datum *datum = &row->new_datum[j];
+                    const struct ovsdb_datum *datum;
+
+                    datum = ovsdb_idl_read(row, &class->columns[j]);
                     add_row_references(&type->key,
                                        datum->keys, datum->n, &row->uuid,
                                        &dsts, &n_dsts, &allocated_dsts);
@@ -770,23 +804,31 @@ ovsdb_idl_compose_monitor_request(const struct json *schema_json, void *idl_)
     struct shash *schema = ovsdb_cs_parse_schema(schema_json);
     struct json *monitor_requests = json_object_create();
 
+    idl->server_schema_received = true;
     for (size_t i = 0; i < idl->class_->n_tables; i++) {
         struct ovsdb_idl_table *table = &idl->tables[i];
         const struct ovsdb_idl_table_class *tc = table->class_;
         struct json *monitor_request;
-        const struct sset *table_schema
+        struct shash *table_schema
             = schema ? shash_find_data(schema, table->class_->name) : NULL;
 
         struct json *columns
             = table->need_table ? json_array_create_empty() : NULL;
-        sset_clear(&table->schema_columns);
+
+        ovsdb_idl_schema_columns_clear(&table->schema_columns);
         for (size_t j = 0; j < tc->n_columns; j++) {
             const struct ovsdb_idl_column *column = &tc->columns[j];
-            bool idl_has_column = (table_schema &&
-                                  sset_contains(table_schema, column->name));
+            bool idl_has_column = false;
+            struct shash_node *node;
 
-            if (idl_has_column) {
-                sset_add(&table->schema_columns, column->name);
+            if (table_schema) {
+                node = shash_find(table_schema, column->name);
+                if (node) {
+                    idl_has_column = true;
+                    shash_add(&table->schema_columns,
+                              column->name, node->data);
+                    shash_delete(table_schema, node);
+                }
             }
 
             if (column->is_synthetic) {
@@ -817,8 +859,16 @@ ovsdb_idl_compose_monitor_request(const struct json *schema_json, void *idl_)
                           idl->class_->database, table->class_->name);
                 json_destroy(columns);
                 table->in_server_schema = false;
+                ovsdb_cs_clear_condition(idl->cs, table->class_->name);
                 continue;
             } else if (schema && table_schema) {
+                if (!table->in_server_schema) {
+                    /* The server didn't have this table before and now it
+                     * does.  It should've dropped the transaction history,
+                     * but it's better if we do not ask for it in the first
+                     * place, as our conditions could be out of sync. */
+                    ovsdb_cs_reset_last_id(idl->cs);
+                }
                 table->in_server_schema = true;
             }
 
@@ -826,6 +876,14 @@ ovsdb_idl_compose_monitor_request(const struct json *schema_json, void *idl_)
             json_object_put(monitor_request, "columns", columns);
             json_object_put(monitor_requests, tc->name,
                             json_array_create_1(monitor_request));
+        }
+
+        if (!table->in_server_schema) {
+            ovsdb_cs_clear_condition(idl->cs, table->class_->name);
+        } else if (table->req_cond) {
+            /* Update the monitor condition request according to the
+             * db schema. */
+            ovsdb_idl_set_condition__(idl, tc, table->req_cond);
         }
     }
     ovsdb_cs_free_schema(schema);
@@ -993,8 +1051,38 @@ ovsdb_idl_server_has_column(const struct ovsdb_idl *idl,
     const struct ovsdb_idl_table *table =
         ovsdb_idl_table_from_column(idl, column);
 
-    return (table->in_server_schema && sset_find(&table->schema_columns,
-                                                 column->name));
+    return (table->in_server_schema && shash_find(&table->schema_columns,
+                                                  column->name));
+}
+
+/* Returns the type of a 'column' as defined in the schema reported
+ * by the server if the 'idl' has seen the 'column' in that schema.
+ * Returns NULL otherwise.
+ *
+ * Always returns NULL if idl has never been connected.
+ *
+ * Please see ovsdb_idl_compose_monitor_request() which sets
+ * 'struct ovsdb_idl_table *'->schema_columns accordingly.
+ *
+ * Usually this function is used indirectly through one of the
+ * "server_column_type" functions generated by ovsdb-idlc.
+ *
+ * Having different types between the server and the client in many
+ * cases will result in complete communication breakdown, so this
+ * function is mostly useful for checking for type constraints (enum,
+ * n_max) in case the server's schema is older or newer. */
+const struct ovsdb_type *
+ovsdb_idl_server_column_type(const struct ovsdb_idl *idl,
+                             const struct ovsdb_idl_column *column)
+{
+    const struct ovsdb_idl_table *table =
+        ovsdb_idl_table_from_column(idl, column);
+
+    if (!table->in_server_schema) {
+        return NULL;
+    }
+
+    return shash_find_data(&table->schema_columns, column->name);
 }
 
 /* A single clause within an ovsdb_idl_condition. */
@@ -1101,6 +1189,41 @@ ovsdb_idl_condition_add_clause__(struct ovsdb_idl_condition *condition,
     hmap_insert(&condition->clauses, &clause->hmap_node, hash);
 }
 
+static void
+ovsdb_idl_destroy_req_condition(struct ovsdb_idl_table *table)
+{
+    ovsdb_idl_condition_destroy(table->req_cond);
+    free(table->req_cond);
+    table->req_cond = NULL;
+}
+
+static void
+ovsdb_idl_condition_clone(struct ovsdb_idl_condition *dest,
+                          const struct ovsdb_idl_condition *source)
+{
+    ovsdb_idl_condition_init(dest);
+
+    struct ovsdb_idl_clause *clause;
+    HMAP_FOR_EACH (clause, hmap_node, &source->clauses) {
+        ovsdb_idl_condition_add_clause__(dest, clause, clause->hmap_node.hash);
+    }
+    dest->is_true = source->is_true;
+}
+
+static void
+ovsdb_idl_create_req_condition(struct ovsdb_idl *idl,
+                               const struct ovsdb_idl_table_class *tc,
+                               const struct ovsdb_idl_condition *condition)
+{
+    struct ovsdb_idl_table *table = shash_find_data(&idl->table_by_name,
+                                                    tc->name);
+    if (table) {
+        ovsdb_idl_destroy_req_condition(table);
+        table->req_cond = xzalloc(sizeof *table->req_cond);
+        ovsdb_idl_condition_clone(table->req_cond, condition);
+    }
+}
+
 /* Adds a clause to the condition for replicating the table with class 'tc' in
  * 'idl'.
  *
@@ -1179,6 +1302,55 @@ ovsdb_idl_condition_to_json(const struct ovsdb_idl_condition *cnd)
     return json_array_create(clauses, n);
 }
 
+static unsigned int
+ovsdb_idl_set_condition__(struct ovsdb_idl *idl,
+                          const struct ovsdb_idl_table_class *tc,
+                          const struct ovsdb_idl_condition *condition)
+{
+    struct ovsdb_idl_condition filter_cond =
+        OVSDB_IDL_CONDITION_INIT(&filter_cond);
+    struct json *cond_json;
+    unsigned int seqno;
+
+    if (!idl->server_schema_received) {
+        /* Can't filter yet - pass through.  Will be filtered once we know
+         * the server schema. */
+        goto set_condition;
+    }
+
+    struct ovsdb_idl_table *t = ovsdb_idl_table_from_class(idl, tc);
+    if (!t || !t->in_server_schema) {
+        /* Not on the server, should not set. */
+        seqno = ovsdb_idl_get_condition_seqno(idl);
+        goto exit;
+    }
+
+    if (hmap_is_empty(&condition->clauses)) {
+        /* Trivial condition and the table is present on the server. */
+        goto set_condition;
+    }
+
+    /* Non-trivial condition for a table that is in the server schema.
+     * Filter out columns that are not. */
+    struct ovsdb_idl_clause *clause;
+    HMAP_FOR_EACH (clause, hmap_node, &condition->clauses) {
+        if (ovsdb_idl_server_has_column(idl, clause->column)) {
+            ovsdb_idl_condition_add_clause__(&filter_cond, clause,
+                                             clause->hmap_node.hash);
+        }
+    }
+    condition = &filter_cond;
+
+set_condition:
+    cond_json = ovsdb_idl_condition_to_json(condition);
+    seqno = ovsdb_cs_set_condition(idl->cs, tc->name, cond_json);
+    json_destroy(cond_json);
+
+exit:
+    ovsdb_idl_condition_destroy(&filter_cond);
+    return seqno;
+}
+
 /* Sets the replication condition for 'tc' in 'idl' to 'condition' and
  * arranges to send the new condition to the database server.
  *
@@ -1190,10 +1362,8 @@ ovsdb_idl_set_condition(struct ovsdb_idl *idl,
                         const struct ovsdb_idl_table_class *tc,
                         const struct ovsdb_idl_condition *condition)
 {
-    struct json *cond_json = ovsdb_idl_condition_to_json(condition);
-    unsigned int seqno = ovsdb_cs_set_condition(idl->cs, tc->name, cond_json);
-    json_destroy(cond_json);
-    return seqno;
+    ovsdb_idl_create_req_condition(idl, tc, condition);
+    return ovsdb_idl_set_condition__(idl, tc, condition);
 }
 
 /* Turns off OVSDB_IDL_ALERT and OVSDB_IDL_TRACK for 'column' in 'idl'.
@@ -2013,8 +2183,7 @@ ovsdb_idl_index_write(struct ovsdb_idl_row *const_row,
     size_t column_idx = column - class->columns;
 
     if (bitmap_is_set(row->written, column_idx)) {
-        free(row->new_datum[column_idx].values);
-        free(row->new_datum[column_idx].keys);
+        ovsdb_datum_destroy(&row->new_datum[column_idx], &column->type);
     } else {
         bitmap_set1(row->written, column_idx);
      }
@@ -2547,7 +2716,10 @@ ovsdb_idl_get_row_for_uuid(const struct ovsdb_idl *idl,
                            const struct ovsdb_idl_table_class *tc,
                            const struct uuid *uuid)
 {
-    return ovsdb_idl_get_row(ovsdb_idl_table_from_class(idl, tc), uuid);
+    const struct ovsdb_idl_row *row;
+
+    row = ovsdb_idl_get_row(ovsdb_idl_table_from_class(idl, tc), uuid);
+    return (row && ovsdb_idl_row_exists(row)) ? row : NULL;
 }
 
 static struct ovsdb_idl_row *
@@ -2717,6 +2889,7 @@ ovsdb_idl_txn_create(struct ovsdb_idl *idl)
     txn->status = TXN_UNCOMMITTED;
     txn->error = NULL;
     txn->dry_run = false;
+    txn->assert_read_only = false;
     ds_init(&txn->comment);
 
     txn->inc_table = NULL;
@@ -2785,6 +2958,7 @@ ovsdb_idl_txn_increment(struct ovsdb_idl_txn *txn,
     ovs_assert(!txn->inc_table);
     ovs_assert(column->type.key.type == OVSDB_TYPE_INTEGER);
     ovs_assert(column->type.value.type == OVSDB_TYPE_VOID);
+    ovs_assert(!txn->assert_read_only);
 
     txn->inc_table = row->table->class_->name;
     txn->inc_column = column->name;
@@ -2836,8 +3010,7 @@ where_uuid_equals(const struct uuid *uuid)
                 json_string_create("=="),
                 json_array_create_2(
                     json_string_create("uuid"),
-                    json_string_create_nocopy(
-                        xasprintf(UUID_FMT, UUID_ARGS(uuid))))));
+                    json_string_create_uuid(uuid))));
 }
 
 static const struct ovsdb_idl_row *
@@ -2861,11 +3034,11 @@ substitute_uuids(struct json *json, const struct ovsdb_idl_txn *txn)
         struct uuid uuid;
         size_t i;
 
-        if (json->array.n == 2
-            && json->array.elems[0]->type == JSON_STRING
-            && json->array.elems[1]->type == JSON_STRING
-            && !strcmp(json->array.elems[0]->string, "uuid")
-            && uuid_from_string(&uuid, json->array.elems[1]->string)) {
+        if (json_array_size(json) == 2
+            && json_array_at(json, 0)->type == JSON_STRING
+            && json_array_at(json, 1)->type == JSON_STRING
+            && !strcmp(json_string(json_array_at(json, 0)), "uuid")
+            && uuid_from_string(&uuid, json_string(json_array_at(json, 1)))) {
             const struct ovsdb_idl_row *row;
 
             row = ovsdb_idl_txn_get_row(txn, &uuid);
@@ -2881,9 +3054,11 @@ substitute_uuids(struct json *json, const struct ovsdb_idl_txn *txn)
             }
         }
 
-        for (i = 0; i < json->array.n; i++) {
-            json->array.elems[i] = substitute_uuids(json->array.elems[i],
-                                                      txn);
+        for (i = 0; i < json_array_size(json); i++) {
+            json_array_set(
+                json, i,
+                substitute_uuids(
+                    CONST_CAST(struct json *, json_array_at(json, i)), txn));
         }
     } else if (json->type == JSON_OBJECT) {
         struct shash_node *node;
@@ -2993,9 +3168,14 @@ ovsdb_idl_txn_extract_mutations(struct ovsdb_idl_row *row,
                     /* Find out if value really changed. */
                     struct ovsdb_datum *new_datum;
                     unsigned int pos;
+
                     new_datum = map_op_datum(map_op);
-                    ovsdb_datum_find_key(old_datum, &new_datum->keys[0],
-                                         key_type, &pos);
+                    if (!ovsdb_datum_find_key(old_datum, &new_datum->keys[0],
+                                              key_type, &pos)) {
+                        VLOG_WARN("Trying to update a value for a key that no "
+                                  "longer exists in the map.");
+                        continue;
+                    }
                     if (ovsdb_atom_equals(&new_datum->values[0],
                                           &old_datum->values[pos],
                                           value_type)) {
@@ -3306,8 +3486,7 @@ ovsdb_idl_txn_commit(struct ovsdb_idl_txn *txn)
                 struct json *value;
                 if (row->persist_uuid) {
                     uuid_json = "uuid";
-                    value = json_string_create_nocopy(
-                        xasprintf(UUID_FMT, UUID_ARGS(&row->uuid)));
+                    value = json_string_create_uuid(&row->uuid);
                 } else {
                     uuid_json = "uuid-name";
                     value = json_string_create_nocopy(
@@ -3318,7 +3497,7 @@ ovsdb_idl_txn_commit(struct ovsdb_idl_txn *txn)
 
                 insert = xmalloc(sizeof *insert);
                 insert->dummy = row->uuid;
-                insert->op_index = operations->array.n - 1;
+                insert->op_index = json_array_size(operations) - 1;
                 uuid_zero(&insert->real);
                 hmap_insert(&txn->inserted_rows, &insert->hmap_node,
                             uuid_hash(&insert->dummy));
@@ -3388,7 +3567,7 @@ ovsdb_idl_txn_commit(struct ovsdb_idl_txn *txn)
     /* Add increment. */
     if (txn->inc_table && (any_updates || txn->inc_force)) {
         any_updates = true;
-        txn->inc_index = operations->array.n - 1;
+        txn->inc_index = json_array_size(operations) - 1;
 
         struct json *op = json_object_create();
         json_object_put_string(op, "op", "mutate");
@@ -3506,6 +3685,18 @@ ovsdb_idl_txn_abort(struct ovsdb_idl_txn *txn)
     }
 }
 
+/* If 'assert' is true, configures the IDL to generate an assertion
+ * failure when a write operation is attempted on the transaction.
+ * Otherwise, write operations are allowed on the transaction.
+ * The check will turn into no-op when building with NDEBUG. */
+void
+ovsdb_idl_txn_assert_read_only(struct ovsdb_idl_txn *txn, bool assert)
+{
+    if (txn) {
+        txn->assert_read_only = assert;
+    }
+}
+
 /* Returns a string that reports the error status for 'txn'.  The caller must
  * not modify or free the returned string.  A call to ovsdb_idl_txn_destroy()
  * for 'txn' may free the returned string.
@@ -3596,6 +3787,7 @@ ovsdb_idl_txn_write__(const struct ovsdb_idl_row *row_,
     ovs_assert(row->new_datum != NULL);
     ovs_assert(column_idx < class->n_columns);
     ovs_assert(row->old_datum == NULL || column_mode & OVSDB_IDL_MONITOR);
+    ovs_assert(!row->table->idl->txn->assert_read_only);
 
     if (row->table->idl->verify_write_only && !write_only) {
         VLOG_ERR("Bug: Attempt to write to a read/write column (%s:%s) when"
@@ -3780,9 +3972,12 @@ ovsdb_idl_txn_delete(const struct ovsdb_idl_row *row_)
 
     ovs_assert(row->new_datum != NULL);
     ovs_assert(!is_index_row(row_));
+    ovs_assert(!row->table->idl->txn->assert_read_only);
     ovsdb_idl_remove_from_indexes(row_);
     if (!row->old_datum) {
         ovsdb_idl_row_unparse(row);
+        ovsdb_idl_destroy_all_map_op_lists(row);
+        ovsdb_idl_destroy_all_set_op_lists(row);
         ovsdb_idl_row_clear_new(row);
         ovs_assert(!row->prereqs);
         hmap_remove(&row->table->rows, &row->hmap_node);
@@ -3807,6 +4002,7 @@ ovsdb_idl_txn_insert__(struct ovsdb_idl_txn *txn,
     struct ovsdb_idl_row *row = ovsdb_idl_row_create__(class);
 
     ovs_assert(uuid || !persist_uuid);
+    ovs_assert(!txn->assert_read_only);
     if (uuid) {
         ovs_assert(!ovsdb_idl_txn_get_row(txn, uuid));
         row->uuid = *uuid;
@@ -3901,21 +4097,21 @@ check_json_type(const struct json *json, enum json_type type, const char *name)
 
 static bool
 ovsdb_idl_txn_process_inc_reply(struct ovsdb_idl_txn *txn,
-                                const struct json_array *results)
+                                const struct json *results)
 {
-    struct json *count, *rows, *row, *column;
+    const struct json *count, *rows, *row, *column;
     struct shash *mutate, *select;
 
-    if (txn->inc_index + 2 > results->n) {
+    if (txn->inc_index + 2 > json_array_size(results)) {
         VLOG_WARN_RL(&syntax_rl, "reply does not contain enough operations "
                      "for increment (has %"PRIuSIZE", needs %u)",
-                     results->n, txn->inc_index + 2);
+                     json_array_size(results), txn->inc_index + 2);
         return false;
     }
 
     /* We know that this is a JSON object because the loop in
      * ovsdb_idl_txn_process_reply() checked. */
-    mutate = json_object(results->elems[txn->inc_index]);
+    mutate = json_object(json_array_at(results, txn->inc_index));
     count = shash_find_data(mutate, "count");
     if (!check_json_type(count, JSON_INTEGER, "\"mutate\" reply \"count\"")) {
         return false;
@@ -3927,18 +4123,18 @@ ovsdb_idl_txn_process_inc_reply(struct ovsdb_idl_txn *txn,
         return false;
     }
 
-    select = json_object(results->elems[txn->inc_index + 1]);
+    select = json_object(json_array_at(results, txn->inc_index + 1));
     rows = shash_find_data(select, "rows");
     if (!check_json_type(rows, JSON_ARRAY, "\"select\" reply \"rows\"")) {
         return false;
     }
-    if (rows->array.n != 1) {
+    if (json_array_size(rows) != 1) {
         VLOG_WARN_RL(&syntax_rl, "\"select\" reply \"rows\" has %"PRIuSIZE" elements "
                      "instead of 1",
-                     rows->array.n);
+                     json_array_size(rows));
         return false;
     }
-    row = rows->array.elems[0];
+    row = json_array_at(rows, 0);
     if (!check_json_type(row, JSON_OBJECT, "\"select\" reply row")) {
         return false;
     }
@@ -3953,7 +4149,7 @@ ovsdb_idl_txn_process_inc_reply(struct ovsdb_idl_txn *txn,
 
 static bool
 ovsdb_idl_txn_process_insert_reply(struct ovsdb_idl_txn_insert *insert,
-                                   const struct json_array *results)
+                                   const struct json *results)
 {
     static const struct ovsdb_base_type uuid_type = OVSDB_BASE_UUID_INIT;
     struct ovsdb_error *error;
@@ -3961,16 +4157,16 @@ ovsdb_idl_txn_process_insert_reply(struct ovsdb_idl_txn_insert *insert,
     union ovsdb_atom uuid;
     struct shash *reply;
 
-    if (insert->op_index >= results->n) {
+    if (insert->op_index >= json_array_size(results)) {
         VLOG_WARN_RL(&syntax_rl, "reply does not contain enough operations "
                      "for insert (has %"PRIuSIZE", needs %u)",
-                     results->n, insert->op_index);
+                     json_array_size(results), insert->op_index);
         return false;
     }
 
     /* We know that this is a JSON object because the loop in
      * ovsdb_idl_txn_process_reply() checked. */
-    reply = json_object(results->elems[insert->op_index]);
+    reply = json_object(json_array_at(results, insert->op_index));
     json_uuid = shash_find_data(reply, "uuid");
     if (!check_json_type(json_uuid, JSON_ARRAY, "\"insert\" reply \"uuid\"")) {
         return false;
@@ -4017,14 +4213,15 @@ ovsdb_idl_txn_process_reply(struct ovsdb_idl *idl,
         status = TXN_ERROR;
         ovsdb_idl_txn_set_error_json(txn, msg->result);
     } else {
-        struct json_array *ops = &msg->result->array;
+        const struct json *ops = msg->result;
         int hard_errors = 0;
         int soft_errors = 0;
         int lock_errors = 0;
-        size_t i;
+        size_t i, n;
 
-        for (i = 0; i < ops->n; i++) {
-            struct json *op = ops->elems[i];
+        n = json_array_size(ops);
+        for (i = 0; i < n; i++) {
+            const struct json *op = json_array_at(ops, i);
 
             if (op->type == JSON_NULL) {
                 /* This isn't an error in itself but indicates that some prior
@@ -4036,18 +4233,20 @@ ovsdb_idl_txn_process_reply(struct ovsdb_idl *idl,
                 error = shash_find_data(json_object(op), "error");
                 if (error) {
                     if (error->type == JSON_STRING) {
-                        if (!strcmp(error->string, "timed out")) {
+                        const char *error_string = json_string(error);
+
+                        if (!strcmp(error_string, "timed out")) {
                             soft_errors++;
-                        } else if (!strcmp(error->string,
+                        } else if (!strcmp(error_string,
                                            "unknown database")) {
                             ovsdb_cs_flag_inconsistency(idl->cs);
                             soft_errors++;
-                        } else if (!strcmp(error->string, "not owner")) {
+                        } else if (!strcmp(error_string, "not owner")) {
                             lock_errors++;
-                        } else if (!strcmp(error->string, "not allowed")) {
+                        } else if (!strcmp(error_string, "not allowed")) {
                             hard_errors++;
                             ovsdb_idl_txn_set_error_json(txn, op);
-                        } else if (strcmp(error->string, "aborted")) {
+                        } else if (strcmp(error_string, "aborted")) {
                             hard_errors++;
                             ovsdb_idl_txn_set_error_json(txn, op);
                             VLOG_WARN_RL(&other_rl,
@@ -4162,6 +4361,8 @@ ovsdb_idl_txn_add_map_op(struct ovsdb_idl_row *row,
                          struct ovsdb_datum *datum,
                          enum map_op_type op_type)
 {
+    ovs_assert(!row->table->idl->txn->assert_read_only);
+
     const struct ovsdb_idl_table_class *class;
     size_t column_idx;
     struct map_op *map_op;
@@ -4198,6 +4399,8 @@ ovsdb_idl_txn_add_set_op(struct ovsdb_idl_row *row,
                          struct ovsdb_datum *datum,
                          enum set_op_type op_type)
 {
+    ovs_assert(!row->table->idl->txn->assert_read_only);
+
     const struct ovsdb_idl_table_class *class;
     size_t column_idx;
     struct set_op *set_op;

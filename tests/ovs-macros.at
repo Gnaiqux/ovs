@@ -88,44 +88,6 @@ seq () {
     done
 }
 
-if test "$IS_WIN32" = "yes"; then
-    pwd () {
-        command pwd -W "$@"
-    }
-
-    diff () {
-        command diff --strip-trailing-cr "$@"
-    }
-
-    # tskill is more effective than taskkill but it isn't always installed.
-    if (tskill //?) >/dev/null 2>&1; then :; else
-        tskill () { taskkill //F //PID $1 >/dev/null; }
-    fi
-
-    kill () {
-        signal=
-        retval=0
-        for arg; do
-            arg=$(echo $arg | tr -d '\n\r')
-            case $arg in
-            -*) signal=$arg ;;
-            [1-9][0-9]*)
-                # tasklist always returns 0.
-                # If pid does exist, there will be a line with the pid.
-                if tasklist //fi "PID eq $arg" | grep $arg >/dev/null; then
-                    if test "X$signal" != "X-0"; then
-                        tskill $arg
-                    fi
-                else
-                    retval=1
-                fi
-                ;;
-            esac
-        done
-        return $retval
-    }
-fi
-
 # parent_pid PID
 #
 # Prints the PID of the parent of process PID.
@@ -360,9 +322,75 @@ m4_ifndef([AT_FAIL_IF],
     [AT_CHECK([($1) \
     && exit 99 || exit 0], [0], [ignore], [ignore])])])
 
+dnl Start retis to track all the traffic passing through OVS.
+m4_define([RETIS_CHECK_AND_RUN],
+  [if test "$OVS_TEST_WITH_RETIS" = yes && retis --version > /dev/null; then
+       on_exit 'retis sort --utc retis.data > retis.sorted'
+       OVS_DAEMONIZE([retis -p ifdump collect --utc --allow-system-changes \
+                          --ovs-track --out --print 2>retis.err 1>retis.log],
+                     [retis.pid])
+       OVS_WAIT_UNTIL([grep -q 'loaded' retis.err])
+   fi])
+
+dnl Add a rule to always accept the traffic.
+dnl The first argument to this macro should be the command to run:
+dnl iptables or ip6tables
+dnl The second argument to this macro should be the interface name (netdev)
+m4_define([IPTABLES_ACCEPT],
+  [AT_CHECK([$1 -I INPUT 1 -i $2 -j ACCEPT])
+   on_exit '$1 -D INPUT 1'])
+
+dnl Certain Linux distributions, like CentOS, have default iptable rules
+dnl to reject input traffic from bridges such as br-underlay.
+dnl This implies the existence of a ip filter INPUT chain for IPv4 or an
+dnl ip6 filter INPUT chain for IPv6.  If that chain exists then add a rule
+dnl to it to always accept all traffic.
+dnl The first argument to this macro should be the filter chain: ip or ipv6
+dnl The second argument to this macro should be the interface name (netdev)
+m4_define([NFT_ACCEPT],
+  [if nft list chain $1 filter INPUT > /dev/null 2>1; then
+     AT_CHECK([nft -ae \
+               "insert rule $1 filter INPUT iifname \"$2\" counter accept"],
+               [0], [stdout-nolog])
+     dnl Extract handle, which is used to delete the rule
+     AT_CHECK([sed -n 's/.*handle //; T; p' < stdout], [0], [stdout])
+     on_exit "nft \"delete rule $1 filter INPUT handle $(cat stdout)\""
+   fi])
+
 dnl Certain Linux distributions, like CentOS, have default iptable rules
 dnl to reject input traffic from bridges such as br-underlay.
 dnl Add a rule to always accept the traffic.
-m4_define([IPTABLES_ACCEPT],
-  [AT_CHECK([iptables -I INPUT 1 -i $1 -j ACCEPT])
-   on_exit 'iptables -D INPUT 1 -i $1'])
+dnl IPv4 variant of this macro.
+m4_define([XT_ACCEPT],
+  [if test $HAVE_NFT = yes; then
+       NFT_ACCEPT([ip], [$1])
+   else
+       IPTABLES_ACCEPT([iptables], [$1])
+   fi])
+
+dnl Certain Linux distributions, like CentOS, have default iptable rules
+dnl to reject input traffic from bridges such as br-underlay.
+dnl Add a rule to always accept the traffic.
+dnl IPv6 variant of this macro.
+m4_define([XT6_ACCEPT],
+  [if test $HAVE_NFT = yes; then
+       NFT_ACCEPT([ip6], [$1])
+   else
+       IPTABLES_ACCEPT([ip6tables], [$1])
+   fi])
+
+dnl CHECK_CPU_DISCOVERED([n_cpu])
+dnl
+dnl Waits until CPUs are discovered and checks if the number of discovered CPUs
+dnl is greater or equal to 'n_cpu'.  Without the 'n_cpu' parameter checks that
+dnl at least one CPU is discovered.
+m4_define([CHECK_CPU_DISCOVERED], [
+    PATTERN="Discovered [[0-9]]* NUMA nodes and [[0-9]]* CPU cores"
+    OVS_WAIT_UNTIL([grep "$PATTERN" ovs-vswitchd.log])
+    N_CPU=$(grep "$PATTERN" ovs-vswitchd.log \
+            | sed -e 's/.* \([[0-9]]*\) CPU cores/\1/')
+    if [[ -z "$1" ]]
+        then AT_CHECK([test "$N_CPU" -gt "0"])
+        else AT_SKIP_IF([test "$N_CPU" -lt "$1"])
+    fi
+])

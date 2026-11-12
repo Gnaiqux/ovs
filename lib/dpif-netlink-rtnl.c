@@ -127,16 +127,12 @@ vport_type_to_kind(enum ovs_vport_type type,
         } else {
             return NULL;
         }
-    case OVS_VPORT_TYPE_GTPU:
-        return NULL;
-    case OVS_VPORT_TYPE_SRV6:
-        return "srv6";
     case OVS_VPORT_TYPE_BAREUDP:
         return "bareudp";
     case OVS_VPORT_TYPE_NETDEV:
     case OVS_VPORT_TYPE_INTERNAL:
-    case OVS_VPORT_TYPE_LISP:
-    case OVS_VPORT_TYPE_STT:
+    case OVS_VPORT_TYPE_GTPU:
+    case OVS_VPORT_TYPE_SRV6:
     case OVS_VPORT_TYPE_UNSPEC:
     case __OVS_VPORT_TYPE_MAX:
     default:
@@ -318,8 +314,6 @@ dpif_netlink_rtnl_verify(const struct netdev_tunnel_config *tnl_cfg,
         break;
     case OVS_VPORT_TYPE_NETDEV:
     case OVS_VPORT_TYPE_INTERNAL:
-    case OVS_VPORT_TYPE_LISP:
-    case OVS_VPORT_TYPE_STT:
     case OVS_VPORT_TYPE_GTPU:
     case OVS_VPORT_TYPE_SRV6:
     case OVS_VPORT_TYPE_UNSPEC:
@@ -411,8 +405,6 @@ dpif_netlink_rtnl_create(const struct netdev_tunnel_config *tnl_cfg,
         break;
     case OVS_VPORT_TYPE_NETDEV:
     case OVS_VPORT_TYPE_INTERNAL:
-    case OVS_VPORT_TYPE_LISP:
-    case OVS_VPORT_TYPE_STT:
     case OVS_VPORT_TYPE_GTPU:
     case OVS_VPORT_TYPE_SRV6:
     case OVS_VPORT_TYPE_UNSPEC:
@@ -452,7 +444,7 @@ exit:
 }
 
 int
-dpif_netlink_rtnl_port_create(struct netdev *netdev)
+dpif_netlink_rtnl_tunnel_create(struct netdev *netdev)
 {
     const struct netdev_tunnel_config *tnl_cfg;
     char namebuf[NETDEV_VPORT_NAME_BUFSIZE];
@@ -514,7 +506,7 @@ dpif_netlink_rtnl_port_create(struct netdev *netdev)
 }
 
 int
-dpif_netlink_rtnl_port_destroy(const char *name, const char *type)
+dpif_netlink_rtnl_tunnel_destroy(const char *name, const char *type)
 {
     switch (netdev_to_ovs_vport_type(type)) {
     case OVS_VPORT_TYPE_VXLAN:
@@ -523,103 +515,16 @@ dpif_netlink_rtnl_port_destroy(const char *name, const char *type)
     case OVS_VPORT_TYPE_ERSPAN:
     case OVS_VPORT_TYPE_IP6ERSPAN:
     case OVS_VPORT_TYPE_IP6GRE:
-    case OVS_VPORT_TYPE_SRV6:
     case OVS_VPORT_TYPE_BAREUDP:
         return dpif_netlink_rtnl_destroy(name);
     case OVS_VPORT_TYPE_NETDEV:
     case OVS_VPORT_TYPE_INTERNAL:
-    case OVS_VPORT_TYPE_LISP:
-    case OVS_VPORT_TYPE_STT:
     case OVS_VPORT_TYPE_GTPU:
+    case OVS_VPORT_TYPE_SRV6:
     case OVS_VPORT_TYPE_UNSPEC:
     case __OVS_VPORT_TYPE_MAX:
     default:
         return EOPNOTSUPP;
     }
     return 0;
-}
-
-/**
- * Probe for whether the modules are out-of-tree (openvswitch) or in-tree
- * (upstream kernel).
- *
- * We probe for "ovs_geneve" via rtnetlink. As long as this returns something
- * other than EOPNOTSUPP we know that the module in use is the out-of-tree one.
- * This will be used to determine which netlink interface to use when creating
- * ports; rtnetlink or compat/genetlink.
- *
- * See ovs_tunnels_out_of_tree
- */
-bool
-dpif_netlink_rtnl_probe_oot_tunnels(void)
-{
-    char namebuf[NETDEV_VPORT_NAME_BUFSIZE];
-    struct netdev *netdev = NULL;
-    bool out_of_tree = false;
-    const char *name;
-    int error;
-
-    error = netdev_open("ovs-system-probe", "geneve", &netdev);
-    if (!error) {
-        struct ofpbuf *reply;
-        const struct netdev_tunnel_config *tnl_cfg;
-
-        tnl_cfg = netdev_get_tunnel_config(netdev);
-        if (!tnl_cfg) {
-            return true;
-        }
-
-        name = netdev_vport_get_dpif_port(netdev, namebuf, sizeof namebuf);
-
-        /* The geneve module exists when ovs-vswitchd crashes
-         * and restarts, handle the case here.
-         */
-        error = dpif_netlink_rtnl_getlink(name, &reply);
-        if (!error) {
-
-            struct nlattr *linkinfo[ARRAY_SIZE(linkinfo_policy)];
-            struct nlattr *rtlink[ARRAY_SIZE(rtlink_policy)];
-            const char *kind;
-
-            if (!nl_policy_parse(reply,
-                                 NLMSG_HDRLEN + sizeof(struct ifinfomsg),
-                                 rtlink_policy, rtlink,
-                                 ARRAY_SIZE(rtlink_policy))
-                || !nl_parse_nested(rtlink[IFLA_LINKINFO], linkinfo_policy,
-                                    linkinfo, ARRAY_SIZE(linkinfo_policy))) {
-                VLOG_ABORT("Error fetching Geneve tunnel device %s "
-                           "linkinfo", name);
-            }
-
-            kind = nl_attr_get_string(linkinfo[IFLA_INFO_KIND]);
-
-            if (!strcmp(kind, "ovs_geneve")) {
-                out_of_tree = true;
-            } else if (!strcmp(kind, "geneve")) {
-                out_of_tree = false;
-            } else {
-                VLOG_ABORT("Geneve tunnel device %s with kind %s"
-                           " not supported", name, kind);
-            }
-
-            ofpbuf_delete(reply);
-            netdev_close(netdev);
-
-            return out_of_tree;
-        }
-
-        error = dpif_netlink_rtnl_create(tnl_cfg, name, OVS_VPORT_TYPE_GENEVE,
-                                         "ovs_geneve",
-                                         (NLM_F_REQUEST | NLM_F_ACK
-                                          | NLM_F_CREATE));
-        if (error != EOPNOTSUPP) {
-            if (!error) {
-                dpif_netlink_rtnl_destroy(name);
-            }
-            out_of_tree = true;
-        }
-        netdev_close(netdev);
-    }
-
-    return out_of_tree;
 }

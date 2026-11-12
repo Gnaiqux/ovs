@@ -245,75 +245,13 @@ build upon them to verify your implementation.
 
 The datapath tests make some assumptions about the environment. They must be
 run under root privileges on a Linux system with support for network
-namespaces. For ease of use, the OVS source tree includes a vagrant box to
-invoke these tests. Running the tests inside Vagrant provides kernel isolation,
-protecting your development host from kernel panics or configuration conflicts
-in the testsuite. If you wish to run the tests without using the vagrant box,
-there are further instructions below.
+namespaces.
 
-Vagrant
-+++++++
-
-.. important::
-
-  Requires Vagrant (version 1.7.0 or later) and a compatible hypervisor
-
-.. note::
-  You must bootstrap and configure the sources (see
-  doc:`/intro/install/general`) before you run the steps described
-  here.
-
-A Vagrantfile is provided allowing to compile and provision the source tree as
-found locally in a virtual machine using the following command::
-
-    $ vagrant up
-
-This will bring up a Fedora 23 VM by default. If you wish to use a different
-box or a vagrant backend not supported by the default box, the ``Vagrantfile``
-can be modified to use a different box as base.
-
-The VM can be reprovisioned at any time::
-
-    $ vagrant provision
-
-OVS out-of-tree compilation environment can be set up with::
-
-    $ ./boot.sh
-    $ vagrant provision --provision-with configure_ovs,build_ovs
-
-This will set up an out-of-tree build environment inside the VM in
-``/root/build``.  The source code can be found in ``/vagrant``.
-
-To recompile and reinstall OVS in the VM using RPM::
-
-    $ ./boot.sh
-    $ vagrant provision --provision-with configure_ovs,install_rpm
-
-Two provisioners are included to run system tests with the OVS kernel module or
-with a userspace datapath. This tests are different from the self-tests
-mentioned above. To run them::
-
-    $ ./boot.sh
-    $ vagrant provision --provision-with \
-        configure_ovs,test_ovs_kmod,test_ovs_system_userspace
-
-The results of the testsuite reside in the VM root user's home directory::
-
-    $ vagrant ssh
-    $ sudo -s
-    $ cd /root/build
-    $ ls tests/system*
-
-Native
-++++++
-
-The datapath testsuite as invoked by Vagrant above may also be run manually on
-a Linux system with root privileges. Make sure, no other Open vSwitch instance
-is running on the test suite. These tests may take several minutes to complete,
-and cannot be run in parallel.
+Make sure, no other Open vSwitch instance is running on the test suite. These
+tests may take several minutes to complete, and cannot be run in parallel.
 
 Userspace datapath
-'''''''''''''''''''
++++++++++++++++++++
 
 To invoke the datapath testsuite with the userspace datapath, run::
 
@@ -325,7 +263,7 @@ All the features documented under `Unit Tests`_ are available for the userspace
 datapath testsuite.
 
 Userspace datapath with DPDK
-''''''''''''''''''''''''''''
+++++++++++++++++++++++++++++
 
 To test :doc:`/intro/install/dpdk` (i.e., the build was configured with
 ``--with-dpdk``, the DPDK is installed), run the testsuite and generate
@@ -358,78 +296,38 @@ with a mlx5 device::
 All tests are skipped if no hugepages are configured. User must look into the DPDK
 manual to figure out how to `Configure hugepages`_.
 
-.. _Configure hugepages: https://doc.dpdk.org/guides-23.11/linux_gsg/sys_reqs.html
+.. _Configure hugepages: https://doc.dpdk.org/guides-25.11/linux_gsg/sys_reqs.html
 
 All the features documented under `Unit Tests`_ are available for the DPDK
 testsuite.
 
-Userspace datapath: Testing and Validation of CPU-specific Optimizations
-''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+Userspace datapath with DPDK offload
+++++++++++++++++++++++++++++++++++++
 
-As multiple versions of the datapath classifier, packet parsing functions and
-actions can co-exist, each with different CPU ISA optimizations, it is
-important to validate that they all give the exact same results.  To easily
-test all the implementations, an ``autovalidator`` implementation of them
-exists. This implementation runs all other available implementations, and
-verifies that the results are identical.
+To invoke the userspace datapath tests with DPDK and its rte_flow offload,
+the same prerequisites apply as above. In addition, six Virtual Function (VF)
+interfaces must be preconfigured on a single Physical Function (PF) that
+supports rte_flow hardware offload.
 
-Running the OVS unit tests with the autovalidator enabled ensures all
-implementations provide the same results.  Note that the performance of the
-autovalidator is lower than all other implementations, as it tests the scalar
-implementation against itself, and against all other enabled implementations.
+This is an example on how to set this up for an NVIDIA blade on port
+``ens2f0np0``::
 
-To adjust the autovalidator priority for a datapath classifier, use this
-command::
+    OVS_PF_PCI=$(basename $(readlink /sys/class/net/ens2f0np0/device))
+    echo 0 > /sys/bus/pci/devices/$OVS_PF_PCI/sriov_numvfs
+    devlink dev eswitch set pci/$OVS_PF_PCI mode switchdev
+    echo 6 > /sys/bus/pci/devices/$OVS_PF_PCI/sriov_numvfs
 
-    $ ovs-appctl dpif-netdev/subtable-lookup-prio-set autovalidator 7
+This PF's PCI ID needs to be passed with the OVS_PF_PCI variable.
+To invoke the DPDK offloads testsuite with the userspace datapath, run::
 
-To set the autovalidator for the packet parser, use this command::
-
-    $ ovs-appctl dpif-netdev/miniflow-parser-set autovalidator
-
-To set the autovalidator for actions, use this command::
-
-    $ ovs-appctl odp-execute/action-impl-set autovalidator
-
-To run the OVS unit test suite with the autovalidator as the default
-implementation, it is required to recompile OVS.  During the recompilation,
-the default priority of the `autovalidator` implementation is set to the
-maximum priority, ensuring every test will be run with every implementation.
-Priority is only related to mfex autovalidator and not the actions
-autovalidator.::
-
-    $ ./configure --enable-autovalidator --enable-mfex-default-autovalidator \
-        --enable-actions-default-autovalidator
-
-The following line should be seen in the configuration log when the above
-options are used::
-
-    checking whether DPCLS Autovalidator is default implementation... yes
-    checking whether MFEX Autovalidator is default implementation... yes
-    checking whether actions Autovalidator is default implementation... yes
-
-Compile OVS in debug mode to have `ovs_assert` statements error out if
-there is a mismatch in the datapath classifier lookup or packet parser
-implementations.
-
-Since the AVX512 implementation of the datapath interface is disabled by
-default, a compile time option is available in order to test it with the OVS
-unit test suite::
-
-    $ ./configure --enable-dpif-default-avx512
-
-The following line should be seen in the configuration log when the above
-option is used::
-
-    checking whether DPIF AVX512 is default implementation... yes
+    make check-dpdk-offloads OVS_PF_PCI=0000:17:00.0
 
 .. note::
-  Run all the available testsuites including `make check`,
-  `make check-system-userspace` and `make check-dpdk` to ensure the optimal
-  test coverage.
+   This has only been tested on NVIDIA blades due to the limited availability
+   of other blades that support rte_flow.
 
 Kernel datapath
-'''''''''''''''
++++++++++++++++
 
 Make targets are also provided for testing the Linux kernel module. Note that
 these tests operate by inserting modules into the running Linux kernel, so if
@@ -454,6 +352,29 @@ datapath testsuite.
   the Linux kernel organization open source git repositories.
 
   https://git.kernel.org/pub/scm/network/iproute2/iproute2.git
+
+It is also possible to run `retis`_ capture along with the `check-kernel` and
+`check-offloads` tests by setting `OVS_TEST_WITH_RETIS` environment variable
+to 'yes'.  This can be useful for debugging the test cases.  For example, the
+following command can be used to run the test 167 under `retis`::
+
+    $ make check-kernel OVS_TEST_WITH_RETIS=yes TESTSUITEFLAGS='167 -d'
+
+After the test is completed, the following data will be available in the test
+directory:
+
+* `retis.err` - standard error stream of the `retis collect`.
+* `retis.log` - standard output of the `retis collect`, contains all captured
+  events in the order they appeared.
+* `retis.data` - raw events collected by retis, `retis sort` or other commands
+  can be used on this file for further analysis.
+* `retis.sorted` - text file containing the output of `retis sort` executed on
+  the `retis.data`, for convenience.
+
+Requires retis version 1.5 or newer and enabling support for
+:doc:`/topics/usdt-probes`.
+
+.. _retis: https://github.com/retis-org/retis
 
 .. _testing-static-analysis:
 
@@ -488,60 +409,3 @@ suitability of different vSwitch implementations in a telco deployment
 environment. More information can be found on the `Anuket project wiki`_.
 
 .. _Anuket project wiki: https://wiki.anuket.io/display/HOME/ViNePERF
-
-Proof of Concepts
-~~~~~~~~~~~~~~~~~
-
-Proof of Concepts are documentation materialized into Ansible recipes
-executed in VirtualBox or Libvirt environments orchestrated by Vagrant.
-Proof of Concepts allow developers to create small virtualized setups that
-demonstrate how certain Open vSwitch features are intended to work avoiding
-user introduced errors by overlooking instructions.  Proof of Concepts
-are also helpful when integrating with thirdparty software, because standard
-unit tests with make check are limited.
-
-Vagrant by default uses VirtualBox provider.  However, if Libvirt is your
-choice of virtualization technology, then you can use it by installing Libvirt
-plugin::
-
-    $ vagrant plugin install vagrant-libvirt
-
-And then appending ``--provider=libvirt`` flag to vagrant commands.
-
-The host where Vagrant runs does not need to have any special software
-installed besides vagrant, virtualbox (or libvirt and libvirt-dev) and
-ansible.
-
-The following Proof of Concepts are supported:
-
-Builders
-++++++++
-
-This particular Proof of Concept demonstrates integration with Debian and RPM
-packaging tools::
-
-    $ cd ./poc/builders
-    $ vagrant up
-
-Once that command finished you can get packages from ``/var/www/html``
-directory.  Since those hosts are also configured as repositories then
-you can add them to ``/etc/apt/sources.list.d`` or ``/etc/yum.repos.d``
-configuration files on another host to retrieve packages with yum or
-apt-get.
-
-When you have made changes to OVS source code and want to rebuild packages
-run::
-
-    $ git commit -a
-    $ vagrant rsync && vagrant provision
-
-Whenever packages are rebuilt the Open vSwitch release number increases
-by one and you can simply upgrade Open vSwitch by running ``yum`` or
-``apt-get`` update commands.
-
-Once you are done with experimenting you can tear down setup with::
-
-    $ vagrant destroy
-
-Sometimes deployment of Proof of Concept may fail, if, for example, VMs
-don't have network reachability to the Internet.

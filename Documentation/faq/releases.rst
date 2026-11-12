@@ -32,66 +32,26 @@ Q: What does it mean for an Open vSwitch release to be LTS (long-term support)?
     If a significant bug is identified in an LTS release, we will provide an
     updated release that includes the fix.  Releases that are not LTS may not
     be fixed and may just be supplanted by the next major release.  The current
-    LTS release is 2.17.x.
+    LTS release is 3.7.x.
 
     For more information on the Open vSwitch release process, refer to
     :doc:`/internals/release-process`.
 
 Q: What Linux kernel versions does each Open vSwitch release work with?
 
-    A: The following table lists the Linux kernel versions against which the
-    given versions of the Open vSwitch kernel module will successfully build.
-    The Linux kernel versions are upstream kernel versions, so Linux kernels
-    modified from the upstream sources may not build in some cases even if they
-    are based on a supported version.  This is most notably true of Red Hat
-    Enterprise Linux (RHEL) kernels, which are extensively modified from
-    upstream.
-
-    ============ ==============
-    Open vSwitch Linux kernel
-    ============ ==============
-    1.4.x        2.6.18 to 3.2
-    1.5.x        2.6.18 to 3.2
-    1.6.x        2.6.18 to 3.2
-    1.7.x        2.6.18 to 3.3
-    1.8.x        2.6.18 to 3.4
-    1.9.x        2.6.18 to 3.8
-    1.10.x       2.6.18 to 3.8
-    1.11.x       2.6.18 to 3.8
-    2.0.x        2.6.32 to 3.10
-    2.1.x        2.6.32 to 3.11
-    2.3.x        2.6.32 to 3.14
-    2.4.x        2.6.32 to 4.0
-    2.5.x        2.6.32 to 4.3
-    2.6.x        3.10 to 4.7
-    2.7.x        3.10 to 4.9
-    2.8.x        3.10 to 4.12
-    2.9.x        3.10 to 4.13
-    2.10.x       3.16 to 4.17
-    2.11.x       3.16 to 4.18
-    2.12.x       3.16 to 5.0
-    2.13.x       3.16 to 5.0
-    2.14.x       3.16 to 5.5
-    2.15.x       3.16 to 5.8
-    2.16.x       3.16 to 5.8
-    2.17.x       3.16 to 5.8
-    3.0+         N/A
-    ============ ==============
-
-    Open vSwitch userspace should also work with the Linux kernel module built
-    into Linux 3.3 and later.
-
-    Open vSwitch userspace is not sensitive to the Linux kernel version.  It
-    should build against almost any kernel, certainly against 2.6.32 and later.
-
-    Open vSwitch branches 2.10 through 2.14 will still compile against the
-    RHEL and CentOS 7 3.10 based kernels since they have diverged from the
-    Linux kernel.org 3.10 kernels.
+    A: Open vSwitch userspace works with the kernel module shipped with
+    Linux upstream 3.3 and later.
 
     Building the Linux kernel module from the Open vSwitch source tree was
     deprecated starting with Open vSwitch 2.15.  And the kernel module
     source code was completely removed from the Open vSwitch source tree in
     3.0 release.
+
+Q: Does Open vSwitch support running on Windows (Hyper-V)?
+
+   A: Support for the Windows datapath, a.k.a. Hyper-V, was deprecated starting
+   with Open vSwitch 3.7, and the source code was completely removed from the
+   Open vSwitch source tree in 4.0.
 
 Q: Are all features available with all datapaths?
 
@@ -101,74 +61,59 @@ Q: Are all features available with all datapaths?
 
     Supported datapaths:
 
-    Linux upstream
-      The datapath implemented by the kernel module shipped with Linux
-      upstream.  Since features have been gradually introduced into the kernel,
+    Linux kernel
+      The datapath implemented by the module shipped with upstream Linux
+      kernel.  Since features have been gradually introduced into the kernel,
       the table mentions the first Linux release whose OVS module supports the
       feature.
-
-    Linux OVS tree
-      The datapath implemented by the Linux kernel module distributed with
-      the OVS source tree. This datapath is deprecated starting with OVS
-      2.15 and support capped at Linux kernel version 5.8.  As of OVS 3.0
-      the Linux OVS tree is no longer supported.
 
     Userspace
       This datapath supports conventional system devices as well as
       DPDK and AF_XDP devices when support for those is built.  This
       is the only datapath that works on NetBSD, FreeBSD and Mac OSX.
 
-    Hyper-V
-      Also known as the Windows datapath.
-
     The following table lists the datapath supported features from an
-    Open vSwitch user's perspective.  The "Linux upstream" column
-    lists the Linux kernel version that introduced a given feature
-    into its kernel module.  The "Linux OVS tree" and "Userspace"
-    columns list the Open vSwitch release versions that introduced a
-    given feature into the included kernel module or the userspace
-    datapath, respectively.
+    Open vSwitch user's perspective.  The "Linux kernel" column lists the
+    upstream Linux kernel version that introduced a given feature into its
+    kernel module.  The "Userspace" column lists the Open vSwitch release
+    versions that introduced a given feature into the built-in userspace
+    datapath.
 
-    ========================== ============== ============== ========= =======
-    Feature                    Linux upstream Linux OVS tree Userspace Hyper-V
-    ========================== ============== ============== ========= =======
-    Connection tracking             4.3            2.5          2.6      YES
-    Connection tracking-IPv6        YES            YES          YES      3.0
-    Conntrack Fragment Reass.       4.3            2.6          2.12     YES
-    Conntrack IPv6 Fragment         4.3            2.6          2.12     3.1
-    Conntrack Timeout Policies      5.2            2.12         2.14     NO
-    Conntrack Zone Limit            4.18           2.10         2.13     YES
-    Conntrack NAT                   4.6            2.6          2.8      YES
-    Conntrack NAT6                  4.6            2.6          2.8      3.0
-    Conntrack Helper Persist.       YES            YES          3.3      NO
-    Tunnel - LISP                   NO             2.11         NO       NO
-    Tunnel - STT                    NO             2.4          NO       YES
-    Tunnel - GRE                    3.11           1.0          2.4      YES
-    Tunnel - VXLAN                  3.12           1.10         2.4      YES
-    Tunnel - Geneve                 3.18           2.4          2.4      YES
-    Tunnel - GRE-IPv6               4.18           2.6          2.6      NO
-    Tunnel - VXLAN-IPv6             4.3            2.6          2.6      NO
-    Tunnel - Geneve-IPv6            4.4            2.6          2.6      3.0
-    Tunnel - ERSPAN                 4.18           2.10         2.10     NO
-    Tunnel - ERSPAN-IPv6            4.18           2.10         2.10     NO
-    Tunnel - GTP-U                  NO             NO           2.14     NO
-    Tunnel - SRv6                   NO             NO           3.2      NO
-    Tunnel - Bareudp                5.7            NO           NO       NO
-    QoS - Policing                  YES            1.1          2.6      NO
-    QoS - Shaping                   YES            1.1          NO       NO
-    sFlow                           YES            1.0          1.0      NO
-    IPFIX                           3.10           1.11         1.11     YES
-    Set action                      YES            1.0          1.0    PARTIAL
-    NIC Bonding                     YES            1.0          1.0      YES
-    Multiple VTEPs                  YES            1.10         1.10     YES
-    Meter action                    4.15           2.10         2.7      NO
-    check_pkt_len action            5.2            2.12         2.12     NO
-    ========================== ============== ============== ========= =======
+    ========================== ============ =========
+    Feature                    Linux kernel Userspace
+    ========================== ============ =========
+    Connection tracking            4.3         2.6
+    Connection tracking-IPv6       YES         YES
+    Conntrack Fragment Reass.      4.3         2.12
+    Conntrack IPv6 Fragment        4.3         2.12
+    Conntrack Timeout Policies     5.2         2.14
+    Conntrack Zone Limit           4.18        2.13
+    Conntrack NAT                  4.6         2.8
+    Conntrack NAT6                 4.6         2.8
+    Conntrack Helper Persist.      YES         3.3
+    Tunnel - GRE                   4.3         2.4
+    Tunnel - VXLAN                 4.3         2.4
+    Tunnel - Geneve                4.3         2.4
+    Tunnel - GRE-IPv6              4.18        2.6
+    Tunnel - VXLAN-IPv6            4.3         2.6
+    Tunnel - Geneve-IPv6           4.4         2.6
+    Tunnel - ERSPAN                4.18        2.10
+    Tunnel - ERSPAN-IPv6           4.18        2.10
+    Tunnel - GTP-U                 NO          2.14
+    Tunnel - SRv6                  NO          3.2
+    Tunnel - Bareudp               5.7         NO
+    QoS - Policing                 YES         2.6
+    QoS - Shaping                  YES         NO
+    sFlow                          YES         1.0
+    IPFIX                          3.10        1.11
+    Set action                     YES         1.0
+    NIC Bonding                    YES         1.0
+    Multiple VTEPs                 YES         1.10
+    Meter action                   4.15        2.7
+    check_pkt_len action           5.2         2.12
+    ========================== ============ =========
 
     Do note, however:
-
-    * Only a limited set of flow fields is modifiable via the set action by the
-      Hyper-V datapath.
 
     * Userspace datapath support, in some cases, is dependent on the associated
       interface types.  For example, DPDK interfaces support ingress and egress
@@ -178,20 +123,19 @@ Q: Are all features available with all datapaths?
     vSwitch user, e.g. because their absence can be hidden by the ofproto layer
     (usually this comes with a performance penalty).
 
-    ===================== ============== ============== ========= =======
-    Feature               Linux upstream Linux OVS tree Userspace Hyper-V
-    ===================== ============== ============== ========= =======
-    SCTP flows            3.12           YES            YES       YES
-    MPLS                  3.19           YES            YES       YES
-    UFID                  4.0            YES            YES       NO
-    Megaflows             3.12           YES            YES       NO
-    Masked set action     4.0            YES            YES       NO
-    Recirculation         3.19           YES            YES       YES
-    TCP flags matching    3.13           YES            YES       NO
-    Validate flow actions YES            YES            N/A       NO
-    Multiple datapaths    YES            YES            YES       NO
-    Tunnel TSO - STT      N/A            YES            NO        YES
-    ===================== ============== ============== ========= =======
+    ===================== ============ =========
+    Feature               Linux kernel Userspace
+    ===================== ============ =========
+    SCTP flows            3.12         YES
+    MPLS                  3.19         YES
+    UFID                  4.0          YES
+    Megaflows             3.12         YES
+    Masked set action     4.0          YES
+    Recirculation         3.19         YES
+    TCP flags matching    3.13         YES
+    Validate flow actions YES          N/A
+    Multiple datapaths    YES          YES
+    ===================== ============ =========
 
 Q: What DPDK version does each Open vSwitch release work with?
 
@@ -216,11 +160,16 @@ Q: What DPDK version does each Open vSwitch release work with?
     2.14.x       19.11.13
     2.15.x       20.11.6
     2.16.x       20.11.6
-    2.17.x       21.11.6
-    3.0.x        21.11.6
-    3.1.x        22.11.4
-    3.2.x        22.11.4
-    3.3.x        23.11
+    2.17.x       21.11.9
+    3.0.x        21.11.9
+    3.1.x        22.11.7
+    3.2.x        22.11.7
+    3.3.x        23.11.7
+    3.4.x        23.11.7
+    3.5.x        24.11.6
+    3.6.x        24.11.6
+    3.7.x        25.11.2
+    4.0.x        25.11.2
     ============ ========
 
 Q: Are all the DPDK releases that OVS versions work with maintained?
@@ -237,54 +186,17 @@ Q: Are all the DPDK releases that OVS versions work with maintained?
     The latest information about DPDK stable and LTS releases can be found
     at `DPDK stable`_.
 
-.. _DPDK stable: http://doc.dpdk.org/guides-23.11/contributing/stable.html
-
-Q: I get an error like this when I configure Open vSwitch:
-
-        configure: error: Linux kernel in <dir> is version <x>, but
-        version newer than <y> is not supported (please refer to the
-        FAQ for advice)
-
-    What should I do?
-
-    A: You have the following options:
-
-    - Use the Linux kernel module supplied with the kernel that you are using.
-      (See also the following FAQ.)
-
-    - If there is a newer released version of Open vSwitch, consider building
-      that one, because it may support the kernel that you are building
-      against.  (To find out, consult the table in the previous FAQ.)
-
-    - For Open vSwitch releases prior to 3.0, the corresponding Open
-      vSwitch branch may support the kernel that you are using, so consider
-      building the kernel module from that branch.  For Open vSwitch 2.17,
-      the only non EOL release to which this applies, the branch is
-      "branch-2.17".
-
-    All versions of Open vSwitch userspace are compatible with all versions of
-    the Open vSwitch kernel module, so you do not have to use the kernel module
-    from one source along with the userspace programs from the same source.
+.. _DPDK stable: https://doc.dpdk.org/guides-25.11/contributing/stable.html
 
 Q: What features are not available in the Open vSwitch kernel datapath that
 ships as part of the upstream Linux kernel?
 
-    A: The kernel module in upstream Linux does not include support for LISP.
-    Work is in progress to add support for LISP to the upstream Linux version
-    of the Open vSwitch kernel module. For now, if you need this feature, use
-    the kernel module from the Open vSwitch distribution instead of the
-    upstream Linux kernel module.
+    A: Certain features require kernel support to function or to have
+    reasonable performance.  If the ovs-vswitchd log file indicates that a
+    feature is not supported, consider upgrading to a newer upstream Linux
+    release.
 
-    Certain features require kernel support to function or to have reasonable
-    performance. If the ovs-vswitchd log file indicates that a feature is not
-    supported, consider upgrading to a newer upstream Linux release or using
-    the kernel module paired with the userspace distribution.
-
-    Please note that as of Open vSwitch 3.0 the kernel module is no longer
-    part of the Open vSwitch distribution.
-
-Q: Why do tunnels not work when using a kernel module other than the one
-packaged with Open vSwitch?
+Q: Why do tunnels not work when using a Linux kernel module?
 
     A: Support for tunnels was added to the upstream Linux kernel module after
     the rest of Open vSwitch. As a result, some kernels may contain support for
@@ -294,34 +206,23 @@ packaged with Open vSwitch?
     ======== ============
     Protocol Linux Kernel
     ======== ============
-    GRE      3.11
-    VXLAN    3.12
-    Geneve   3.18
+    GRE      4.3
+    VXLAN    4.3
+    Geneve   4.3
     ERSPAN   4.18
-    LISP     not upstream
-    STT      not upstream
     ======== ============
 
-    If you are using a version of the kernel that is older than the one listed
-    above, it is still possible to use that tunnel protocol. However, you must
-    compile and install the kernel module included with the Open vSwitch
-    distribution rather than the one on your machine. If problems persist after
-    doing this, check to make sure that the module that is loaded is the one
-    you expect.
-
-    Please note that as of Open vSwitch 3.0 the kernel module is no longer
-    part of the Open vSwitch distribution.
+    Open vSwitch 3.7 and earlier supported GRE, VXLAN and Geneve on kernels
+    older than specified above by utilizing the legacy OVS-specific kernel
+    vport types.  Newer versions of Open vSwitch no longer support that method
+    and fully rely on standard kernel tunnel devices with ``COLLECT_METADATA``
+    support.  This makes Linux 4.3 a minimal requirement for these tunnels.
 
 Q: Why are UDP tunnel checksums not computed for VXLAN or Geneve?
 
     A: Generating outer UDP checksums requires kernel support that was not part
-    of the initial implementation of these protocols. If using the upstream
-    Linux Open vSwitch module, you must use kernel 4.0 or newer. The
-    out-of-tree modules from Open vSwitch release 2.4 and later support UDP
-    checksums.
-
-    Please note that as of Open vSwitch 3.0 the kernel module is no longer
-    part of the Open vSwitch distribution.
+    of the initial implementation of these protocols. The kernel modules
+    shipped with upstream Linux 4.0 and later support UDP checksums.
 
 Q: What features are not available when using the userspace datapath?
 
@@ -331,11 +232,10 @@ Q: What features are not available when using the userspace datapath?
 
 Q: Should userspace or kernel be upgraded first to minimize downtime?
 
-    A. In general, the Open vSwitch userspace should be used with the kernel
-    version included in the same release or with the version from upstream
-    Linux.  However, when upgrading between two releases of Open vSwitch it is
-    best to migrate userspace first to reduce the possibility of
-    incompatibilities.
+    A. In general, the Open vSwitch userspace should work with any kernel
+    version from upstream Linux.  However, when upgrading between two releases
+    of Open vSwitch it is best to migrate userspace first to reduce the
+    possibility of incompatibilities.
 
 Q: What happened to the bridge compatibility feature?
 

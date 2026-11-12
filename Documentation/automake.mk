@@ -20,7 +20,6 @@ DOC_SOURCE = \
 	Documentation/intro/install/netbsd.rst \
 	Documentation/intro/install/rhel.rst \
 	Documentation/intro/install/userspace.rst \
-	Documentation/intro/install/windows.rst \
 	Documentation/tutorials/index.rst \
 	Documentation/tutorials/faucet.rst \
 	Documentation/tutorials/ovs-advanced.rst \
@@ -45,7 +44,7 @@ DOC_SOURCE = \
 	Documentation/topics/fuzzing/ovs-fuzzing-infrastructure.rst \
 	Documentation/topics/fuzzing/ovs-fuzzers.rst \
 	Documentation/topics/fuzzing/security-analysis-of-ovs-fuzzers.rst \
-	Documentation/topics/testing.rst \
+	Documentation/topics/flow-visualization.rst \
 	Documentation/topics/integration.rst \
 	Documentation/topics/language-bindings.rst \
 	Documentation/topics/networking-namespaces.rst \
@@ -55,12 +54,12 @@ DOC_SOURCE = \
 	Documentation/topics/ovsdb-replication.rst \
 	Documentation/topics/porting.rst \
 	Documentation/topics/record-replay.rst \
+	Documentation/topics/testing.rst \
 	Documentation/topics/tracing.rst \
 	Documentation/topics/usdt-probes.rst \
 	Documentation/topics/userspace-checksum-offloading.rst \
 	Documentation/topics/userspace-tso.rst \
 	Documentation/topics/userspace-tx-steering.rst \
-	Documentation/topics/windows.rst \
 	Documentation/howto/index.rst \
 	Documentation/howto/dpdk.rst \
 	Documentation/howto/ipsec.rst \
@@ -68,7 +67,6 @@ DOC_SOURCE = \
 	Documentation/howto/libvirt.rst \
 	Documentation/howto/selinux.rst \
 	Documentation/howto/ssl.rst \
-	Documentation/howto/lisp.rst \
 	Documentation/howto/qos.png \
 	Documentation/howto/qos.rst \
 	Documentation/howto/sflow.png \
@@ -111,7 +109,6 @@ DOC_SOURCE = \
 	Documentation/internals/contributing/backporting-patches.rst \
 	Documentation/internals/contributing/inclusive-language.rst \
 	Documentation/internals/contributing/coding-style.rst \
-	Documentation/internals/contributing/coding-style-windows.rst \
 	Documentation/internals/contributing/documentation-style.rst \
 	Documentation/internals/contributing/libopenvswitch-abi.rst \
 	Documentation/internals/contributing/submitting-patches.rst \
@@ -162,13 +159,10 @@ RST_MANPAGES = \
 	ovs-actions.7.rst \
 	ovs-appctl.8.rst \
 	ovs-ctl.8.rst \
-	ovs-l3ping.8.rst \
-	ovs-parse-backtrace.8.rst \
+	ovs-flowviz.8.rst \
 	ovs-pki.8.rst \
 	ovs-tcpdump.8.rst \
 	ovs-tcpundump.1.rst \
-	ovs-test.8.rst \
-	ovs-vlan-test.8.rst \
 	ovsdb-server.7.rst \
 	ovsdb.5.rst \
 	ovsdb.7.rst
@@ -206,8 +200,8 @@ set_mandirs = \
 	man8dir='$(man8dir)' \
 	man9dir='$(man9dir)'
 
-# Given an $rst of "ovs-vlan-test.8.rst", sets $stem to
-# "ovs-vlan-test", $section to "8", and $mandir to $man8dir.
+# Given an $rst of "ovs-tcpdump.8.rst", sets $stem to
+# "ovs-tcpdump", $section to "8", and $mandir to $man8dir.
 extract_stem_and_section = \
 	stem=`echo "$$rst" | sed -n 's/^\(.*\)\.\([0-9]\).rst$$/\1/p'`; \
 	section=`echo "$$rst" | sed -n 's/^\(.*\)\.\([0-9]\).rst$$/\2/p'`; \

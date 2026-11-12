@@ -87,6 +87,8 @@ void nl_msg_cancel_nested(struct ofpbuf *, size_t offset);
 bool nl_msg_end_non_empty_nested(struct ofpbuf *, size_t offset);
 void nl_msg_put_nested(struct ofpbuf *, uint16_t type,
                        const void *data, size_t size);
+void nl_msg_wrap_nested(struct ofpbuf *, uint16_t type,
+                        size_t offset, size_t size);
 void nl_msg_reset_size(struct ofpbuf *, size_t offset);
 
 /* Prepending attributes. */
@@ -152,6 +154,7 @@ enum nl_attr_type
     NL_A_IPV6,
     NL_A_NESTED,
     NL_A_LL_ADDR,
+    NL_A_RTA_VIA,
     N_NL_ATTR_TYPES
 };
 

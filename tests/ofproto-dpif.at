@@ -20,6 +20,28 @@ check_dpflow_stats () {
     echo "n_flows=$flows n_buckets=$buckets"
 }
 
+sort_dpif_offload_show () {
+    awk '
+        /^  -/ { dashlines[[++n]] = $0; next }
+        { print }
+        END {
+            # asort(dashlines) is a GNU extension, so we need to do it
+            # manually here as ofproto-dpif is also executed on FreeBSD.
+            for (i = 1; i <= n; i++) {
+                for (j = i + 1; j <= n; j++) {
+                    if (dashlines[[i]] > dashlines[[j]]) {
+                        tmp = dashlines[[i]]
+                        dashlines[[i]] = dashlines[[j]]
+                        dashlines[[j]] = tmp
+                    }
+                }
+            }
+
+            for (i=1; i<=n; i++) print dashlines[[i]]
+        }
+    '
+}
+
 m4_divert_pop([PREPARE_TESTS])
 
 
@@ -29,35 +51,73 @@ AT_CHECK([ovs-appctl revalidator/wait])
 OVS_VSWITCHD_STOP
 AT_CLEANUP
 
+AT_SETUP([ofproto-dpif - upcall/show JSON output])
+OVS_VSWITCHD_START([], [], [=override])
+
+dnl Use one revalidator thread for deterministic output.
+AT_CHECK([ovs-vsctl set open_vswitch . other_config:n-revalidator-threads=1])
+OVS_WAIT_UNTIL_EQUAL([ovs-appctl upcall/show | grep -c '(keys'], [1])
+
+dnl Add a second datapath to check the output with multiple datapaths.
+dnl Wait for both revalidators to be initialized, i.e. to have a non-zero ID.
+AT_CHECK([ovs-vsctl add-br br1 -- set bridge br1 datapath-type=netdev])
+OVS_WAIT_UNTIL_EQUAL([ovs-appctl upcall/show | \
+                       grep -c '^  [[1-9]][[0-9]]*: (keys'], [2])
+
+AT_CHECK([ovs-appctl --format json --pretty upcall/show | \
+          sed -e 's/: [[0-9]][[0-9]]*/: <cleared>/g'      \
+              -e 's/"[[0-9]][[0-9]]*": {/"<revalidator>": {/g'], [0], [dnl
+{
+  "dummy@ovs-dummy": {
+    "dump-duration-ms": <cleared>,
+    "flows": {
+      "average": <cleared>,
+      "current": <cleared>,
+      "limit": <cleared>,
+      "maximum": <cleared>,
+      "offloaded": <cleared>},
+    "revalidators": {
+      "<revalidator>": {
+        "keys": <cleared>}},
+    "ufid-enabled": true},
+  "netdev@ovs-netdev": {
+    "dump-duration-ms": <cleared>,
+    "flows": {
+      "average": <cleared>,
+      "current": <cleared>,
+      "limit": <cleared>,
+      "maximum": <cleared>,
+      "offloaded": <cleared>},
+    "revalidators": {
+      "<revalidator>": {
+        "keys": <cleared>}},
+    "ufid-enabled": true}}
+])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
 AT_SETUP([ofproto-dpif - lldp revalidator event(REV_RECONFIGURE)])
 OVS_VSWITCHD_START(
     [add-port br0 p1 -- set interface p1 ofport_request=1 type=dummy]
 )
 dnl first revalidation triggered by add interface
-AT_CHECK([ovs-appctl coverage/read-counter rev_reconfigure], [0], [dnl
-1
-])
+CHECK_COVERAGE([rev_reconfigure], [1])
 
 dnl enable lldp
 AT_CHECK([ovs-vsctl set interface p1 lldp:enable=true])
 AT_CHECK([ovs-appctl revalidator/wait])
-AT_CHECK([ovs-appctl coverage/read-counter rev_reconfigure], [0], [dnl
-2
-])
+CHECK_COVERAGE([rev_reconfigure], [2])
 
 dnl disable lldp
 AT_CHECK([ovs-vsctl set interface p1 lldp:enable=false])
 AT_CHECK([ovs-appctl revalidator/wait])
-AT_CHECK([ovs-appctl coverage/read-counter rev_reconfigure], [0], [dnl
-3
-])
+CHECK_COVERAGE([rev_reconfigure], [3])
 
 dnl remove lldp, no revalidation as lldp was disabled
 AT_CHECK([ovs-vsctl remove interface p1 lldp enable])
 AT_CHECK([ovs-appctl revalidator/wait])
-AT_CHECK([ovs-appctl coverage/read-counter rev_reconfigure], [0], [dnl
-3
-])
+CHECK_COVERAGE([rev_reconfigure], [3])
 
 OVS_VSWITCHD_STOP
 AT_CLEANUP
@@ -348,6 +408,49 @@ recirc_id(0),in_port(4),packet_type(ns=0,id=0),eth(src=50:54:00:00:00:09,dst=50:
 recirc_id(0),in_port(4),packet_type(ns=0,id=0),eth(src=50:54:00:00:00:09,dst=ff:ff:ff:ff:ff:ff),eth_type(0x8035), packets:0, bytes:0, used:never, actions: <del>
 recirc_id(0),in_port(4),packet_type(ns=0,id=0),eth(src=50:54:00:00:00:0b,dst=ff:ff:ff:ff:ff:ff),eth_type(0x8035), packets:0, bytes:0, used:never, actions: <del>
 ])
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - active-backup bonding set primary])
+
+OVS_VSWITCHD_START(
+  [add-bond br0 bond0 p1 p2 bond_mode=active-backup \
+                other_config:bond-primary=p1 -- \
+   set bridge br0 other-config:hwaddr=aa:66:aa:66:aa:00 -- \
+   set interface p1 type=dummy options:pstream=punix:$OVS_RUNDIR/p1.sock ofport_request=1 -- \
+   set interface p2 type=dummy options:pstream=punix:$OVS_RUNDIR/p2.sock ofport_request=2 -- \
+   add-port br0 p7 -- set interface p7 ofport_request=7 type=dummy -- \
+   add-br br1 -- \
+   set bridge br1 other-config:hwaddr=aa:66:aa:66:00:00 -- \
+   set bridge br1 datapath-type=dummy -- \
+   add-bond br1 bond1 p3 p4 bond_mode=active-backup \
+                other_config:bond-primary=p3 -- \
+   set interface p3 type=dummy options:stream=unix:$OVS_RUNDIR/p1.sock ofport_request=3 -- \
+   set interface p4 type=dummy options:stream=unix:$OVS_RUNDIR/p2.sock ofport_request=4 -- \
+   add-port br1 p8 -- set interface p8 ofport_request=8 type=dummy])
+
+WAIT_FOR_DUMMY_PORTS([p3], [p4])
+
+AT_CHECK([ovs-ofctl add-flow br0 action=normal])
+AT_CHECK([ovs-ofctl add-flow br1 action=normal])
+
+dnl Create datapath flow with bidirectional traffic.
+AT_CHECK([ovs-appctl netdev-dummy/receive p8 'in_port(8),eth(src=50:54:00:00:00:0a,dst=50:54:00:00:00:09),eth_type(0x0800),ipv4(src=10.0.0.1,dst=10.0.0.2,proto=1,tos=0,ttl=64,frag=no),icmp(type=8,code=0)'])
+AT_CHECK([ovs-appctl netdev-dummy/receive p7 'in_port(7),eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a),eth_type(0x0800),ipv4(src=10.0.0.2,dst=10.0.0.1,proto=1,tos=0,ttl=64,frag=no),icmp(type=8,code=0)'])
+AT_CHECK([ovs-appctl netdev-dummy/receive p8 'in_port(8),eth(src=50:54:00:00:00:0a,dst=50:54:00:00:00:09),eth_type(0x0800),ipv4(src=10.0.0.1,dst=10.0.0.2,proto=1,tos=0,ttl=64,frag=no),icmp(type=8,code=0)'])
+AT_CHECK([ovs-appctl netdev-dummy/receive p7 'in_port(7),eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a),eth_type(0x0800),ipv4(src=10.0.0.2,dst=10.0.0.1,proto=1,tos=0,ttl=64,frag=no),icmp(type=8,code=0)'])
+
+dnl Set p2 and p4 as primary.
+AT_CHECK([ovs-vsctl set port bond0 other_config:bond-primary=p2 -- \
+                    set port bond1 other_config:bond-primary=p4])
+
+OVS_WAIT_UNTIL([ovs-appctl bond/show | grep -q 'active-backup primary: p4'])
+
+AT_CHECK([ovs-appctl revalidator/wait])
+
+AT_CHECK([ovs-appctl dpctl/dump-flows --names | grep -q "actions:p[[13]]"], [1])
+AT_CHECK([ovs-appctl dpctl/dump-flows --names | grep -q "actions:p[[24]]"], [0])
+
 OVS_VSWITCHD_STOP
 AT_CLEANUP
 
@@ -757,6 +860,73 @@ Datapath actions: drop
 OVS_VSWITCHD_STOP()
 AT_CLEANUP
 
+AT_SETUP([ofproto-dpif - active bond member survives restart])
+dnl Create bond0 with members p1, p2 and p3. Initially, set p2 as active.
+dnl Restart ovs-vswitchd. Check that p2 is still active.
+OVS_VSWITCHD_START(
+  [add-bond br0 bond0 p1 p2 p3 bond_mode=active-backup -- \
+   set interface p1 type=dummy ofport_request=1 -- \
+   set interface p2 type=dummy ofport_request=2 -- \
+   set interface p3 type=dummy ofport_request=3 --])
+AT_CHECK([ovs-appctl bond/set-active-member bond0 p2], [0], [ignore])
+OVS_WAIT_UNTIL_EQUAL([ovs-appctl bond/show | STRIP_RECIRC_ID | STRIP_ACTIVE_MEMBER_MAC], [dnl
+---- bond0 ----
+bond_mode: active-backup
+bond may use recirculation: no, <del>
+bond-hash-basis: 0
+lb_output action: disabled, bond-id: -1
+updelay: 0 ms
+downdelay: 0 ms
+lacp_status: off
+lacp_fallback_ab: false
+active-backup primary: <none>
+<active member mac del>
+
+member p1: enabled
+  may_enable: true
+
+member p2: enabled
+  active member
+  may_enable: true
+
+member p3: enabled
+  may_enable: true
+])
+
+dnl Restart ovs-vswitchd with an empty ovs-vswitchd log file.
+OVS_APP_EXIT_AND_WAIT([ovs-vswitchd])
+mv ovs-vswitchd.log ovs-vswitchd_1.log
+AT_CHECK([ovs-vswitchd --enable-dummy --disable-system --disable-system-route --detach \
+         --no-chdir --pidfile --log-file -vfile:rconn:dbg -vvconn -vofproto_dpif -vunixctl],
+         [0], [], [stderr])
+
+OVS_WAIT_UNTIL_EQUAL([ovs-appctl bond/show | STRIP_RECIRC_ID | STRIP_ACTIVE_MEMBER_MAC], [dnl
+---- bond0 ----
+bond_mode: active-backup
+bond may use recirculation: no, <del>
+bond-hash-basis: 0
+lb_output action: disabled, bond-id: -1
+updelay: 0 ms
+downdelay: 0 ms
+lacp_status: off
+lacp_fallback_ab: false
+active-backup primary: <none>
+<active member mac del>
+
+member p1: enabled
+  may_enable: true
+
+member p2: enabled
+  active member
+  may_enable: true
+
+member p3: enabled
+  may_enable: true
+])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
 AT_SETUP([ofproto-dpif - bond - allow duplicated frames])
 dnl Receiving of duplicated multicast frames should be allowed with 'all_members_active'.
 OVS_VSWITCHD_START([dnl
@@ -1048,15 +1218,16 @@ add_of_ports br0 1 10 11
 
 ovs-appctl vlog/set ofproto_dpif:file:dbg
 AT_CHECK([ovs-ofctl -O OpenFlow12 add-group br0 'group_id=1234,type=select,bucket=output:10,bucket=output:11'])
-AT_CHECK([grep -A6 "Constructing select group 1234" ovs-vswitchd.log | sed 's/^.*ofproto_dpif/ofproto_dpif/'], [0], [dnl
+OVS_WAIT_UNTIL_EQUAL([grep -A6 "Constructing select group 1234" ovs-vswitchd.log \
+                        | sed 's/^.*ofproto_dpif/ofproto_dpif/'], [dnl
 ofproto_dpif|DBG|Constructing select group 1234
 ofproto_dpif|DBG|No selection method specified. Trying dp_hash.
 ofproto_dpif|DBG|  Minimum weight: 1, total weight: 2
 ofproto_dpif|DBG|  Using 16 hash values:
 ofproto_dpif|DBG|  Bucket 0: weight=1, target=8.00 hits=8
 ofproto_dpif|DBG|  Bucket 1: weight=1, target=8.00 hits=8
-ofproto_dpif|DBG|Use dp_hash with 16 hash values using algorithm 1.
-])
+ofproto_dpif|DBG|Use dp_hash with 16 hash values using algorithm 1.])
+
 AT_CHECK([ovs-ofctl -O OpenFlow12 add-flow br0 'ip actions=write_actions(group:1234)'])
 
 # Try a bunch of different flows and make sure that they get distributed
@@ -1121,7 +1292,8 @@ add_of_ports br0 1 10 11 12 13 14
 
 ovs-appctl vlog/set ofproto_dpif:file:dbg
 AT_CHECK([ovs-ofctl -O OpenFlow13 add-group br0 'group_id=1234,type=select,bucket=weight:5,output:10,bucket=weight:10,output:11,bucket=weight:25,output:12,bucket=weight:60,output:13,bucket=weight:0,output:14'])
-AT_CHECK([grep -A9 "Constructing select group 1234" ovs-vswitchd.log | sed 's/^.*ofproto_dpif/ofproto_dpif/'], [0], [dnl
+OVS_WAIT_UNTIL_EQUAL([grep -A9 "Constructing select group 1234" ovs-vswitchd.log \
+                        | sed 's/^.*ofproto_dpif/ofproto_dpif/'], [dnl
 ofproto_dpif|DBG|Constructing select group 1234
 ofproto_dpif|DBG|No selection method specified. Trying dp_hash.
 ofproto_dpif|DBG|  Minimum weight: 5, total weight: 100
@@ -1131,8 +1303,8 @@ ofproto_dpif|DBG|  Bucket 1: weight=10, target=3.20 hits=3
 ofproto_dpif|DBG|  Bucket 2: weight=25, target=8.00 hits=8
 ofproto_dpif|DBG|  Bucket 3: weight=60, target=19.20 hits=19
 ofproto_dpif|DBG|  Bucket 4: weight=0, target=0.00 hits=0
-ofproto_dpif|DBG|Use dp_hash with 32 hash values using algorithm 1.
-])
+ofproto_dpif|DBG|Use dp_hash with 32 hash values using algorithm 1.])
+
 AT_CHECK([ovs-ofctl -O OpenFlow12 add-flow br0 'ip actions=write_actions(group:1234)'])
 
 # Try 1000 different flows and make sure that they get distributed according to weights
@@ -1160,13 +1332,167 @@ n_flows=ok n_buckets=ok
 #   bucket4:    0                   0
 
 ovs-appctl time/warp 1000
-AT_CHECK([ovs-ofctl -O OpenFlow13 dump-group-stats br0 | sed 's/duration=[[0-9]]\.[[0-9]]*s,//' | check_group_stats 40 80 200 500],
+AT_CHECK([ovs-ofctl -O OpenFlow13 dump-group-stats br0 | check_group_stats 40 80 200 500],
 [0], [dnl
 bucket0 >= 40
 bucket1 >= 80
 bucket2 >= 200
 bucket3 >= 500
 ])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - select group with dp_hash and equal weights])
+
+OVS_VSWITCHD_START
+add_of_ports br0 1 10
+
+AT_CHECK([ovs-appctl vlog/set ofproto_dpif:file:dbg vconn:file:info])
+
+AT_DATA([stddev.awk], [
+  {
+    # $1 (target) is a mean value, because all weights are the same.
+    # $2 (hits) is an actual number of hashes assigned to this bucket.
+    n_hashes += $2
+    n_buckets++
+    sum_sq_diff += ($2 - $1) * ($2 - $1)
+  }
+  END {
+    mean = n_hashes / n_buckets
+    stddev = sqrt(sum_sq_diff / n_buckets)
+    stddevp = stddev * 100 / mean
+
+    print "hashes:", n_hashes, "buckets:", n_buckets
+    print "mean:", mean, "stddev:", stddev, "(", stddevp, "% )"
+
+    # Make sure that standard deviation of load between buckets is below 12.5%.
+    # Note: it's not a strict requirement, but a good number that passes tests.
+    if (stddevp <= 12.5) { print "PASS" }
+    else { print "FAIL" }
+  }
+])
+
+m4_define([CHECK_DISTRIBUTION], [
+  OVS_WAIT_UNTIL([test $(tail -n $1 ovs-vswitchd.log \
+                            | grep -c '|DBG|.*Bucket') -eq $2])
+  AT_CHECK([tail -n $1 ovs-vswitchd.log | grep '|DBG|.*Bucket' \
+                | sed 's/.*target=\([[0-9\.]]*\) hits=\([[0-9]]*\)/\1 \2/' \
+                | awk -f stddev.awk], [0], [stdout])
+  AT_CHECK([grep -q "buckets: $2" stdout])
+  AT_CHECK([grep -q 'PASS' stdout])
+])
+
+m4_define([OF_GROUP], [group_id=$1,type=select,selection_method=dp_hash])
+m4_define([OFG_BUCKET], [bucket=weight=$1,output:10])
+
+dnl Test load distribution in groups with up to 64 equally weighted buckets.
+m4_define([OFG_BUCKETS], [OFG_BUCKET(100)])
+m4_for([id], [1], [64], [1], [
+  get_log_next_line_num
+  AT_CHECK([ovs-ofctl -O OpenFlow15 add-group br0 \
+                "OF_GROUP(id),OFG_BUCKETS()"])
+  CHECK_DISTRIBUTION([+$LINENUM], [id])
+  m4_append([OFG_BUCKETS], [,OFG_BUCKET(100)])
+])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - select group with dp_hash, insert/remove buckets])
+
+OVS_VSWITCHD_START
+add_of_ports br0 1 10
+
+AT_CHECK([ovs-appctl vlog/set ofproto_dpif:file:dbg])
+
+dnl Add a group without buckets.
+AT_CHECK([ovs-ofctl -O OpenFlow15 add-group br0 \
+            'group_id=1235,type=select,selection_method=dp_hash'])
+AT_CHECK([grep -A3 "Constructing select group 1235" ovs-vswitchd.log \
+            | sed 's/^.*ofproto_dpif/ofproto_dpif/'], [0], [dnl
+ofproto_dpif|DBG|Constructing select group 1235
+ofproto_dpif|DBG|Selection method specified: dp_hash.
+ofproto_dpif|DBG|  Don't apply dp_hash method without buckets.
+ofproto_dpif|DBG|Falling back to default hash method.
+])
+
+m4_define([OFG_BUCKET], [bucket=weight=$1,bucket_id=$1,output:10])
+
+dnl Add two buckets one by one.
+get_log_next_line_num
+AT_CHECK([ovs-ofctl -O OpenFlow15 insert-buckets br0 \
+            group_id=1235,command_bucket_id=last,OFG_BUCKET([5])])
+OVS_WAIT_UNTIL_EQUAL([tail -n +$LINENUM ovs-vswitchd.log \
+                        | grep -E '(Bucket|group 1235)' \
+                        | sed 's/^.*ofproto_dpif/ofproto_dpif/'], [dnl
+ofproto_dpif|DBG|Constructing select group 1235
+ofproto_dpif|DBG|  Bucket 5: weight=5, target=16.00 hits=16
+ofproto_dpif|DBG|Modifying select group 1235
+ofproto_dpif|DBG|  Bucket 5: weight=5, target=16.00 hits=16])
+
+get_log_next_line_num
+AT_CHECK([ovs-ofctl -O OpenFlow15 insert-buckets br0 \
+            group_id=1235,command_bucket_id=last,OFG_BUCKET([6])])
+OVS_WAIT_UNTIL_EQUAL([tail -n +$LINENUM ovs-vswitchd.log \
+                        | grep -E '(Bucket|group 1235)' \
+                        | sed 's/^.*ofproto_dpif/ofproto_dpif/'], [dnl
+ofproto_dpif|DBG|Constructing select group 1235
+ofproto_dpif|DBG|  Bucket 6: weight=6, target=16.00 hits=16
+ofproto_dpif|DBG|Modifying select group 1235
+ofproto_dpif|DBG|  Bucket 5: weight=5, target=7.27 hits=7
+ofproto_dpif|DBG|  Bucket 6: weight=6, target=8.73 hits=9])
+
+dnl Add two more in the middle.
+get_log_next_line_num
+AT_CHECK([ovs-ofctl -O OpenFlow15 insert-buckets br0 \
+            group_id=1235,command_bucket_id=5,OFG_BUCKET([7]),OFG_BUCKET([8])])
+OVS_WAIT_UNTIL_EQUAL([tail -n +$LINENUM ovs-vswitchd.log \
+                        | grep -E '(Bucket|group 1235)' \
+                        | sed 's/^.*ofproto_dpif/ofproto_dpif/'], [dnl
+ofproto_dpif|DBG|Constructing select group 1235
+ofproto_dpif|DBG|  Bucket 7: weight=7, target=7.47 hits=7
+ofproto_dpif|DBG|  Bucket 8: weight=8, target=8.53 hits=9
+ofproto_dpif|DBG|Modifying select group 1235
+ofproto_dpif|DBG|  Bucket 5: weight=5, target=3.08 hits=3
+ofproto_dpif|DBG|  Bucket 7: weight=7, target=4.31 hits=4
+ofproto_dpif|DBG|  Bucket 8: weight=8, target=4.92 hits=5
+ofproto_dpif|DBG|  Bucket 6: weight=6, target=3.69 hits=4])
+
+dnl Remove the last bucket.
+get_log_next_line_num
+AT_CHECK([ovs-ofctl -O OpenFlow15 remove-buckets br0 \
+            group_id=1235,command_bucket_id=last])
+OVS_WAIT_UNTIL_EQUAL([tail -n +$LINENUM ovs-vswitchd.log \
+                        | grep -E '(Bucket|group 1235)' \
+                        | sed 's/^.*ofproto_dpif/ofproto_dpif/'], [dnl
+ofproto_dpif|DBG|Constructing select group 1235
+ofproto_dpif|DBG|Modifying select group 1235
+ofproto_dpif|DBG|  Bucket 5: weight=5, target=4.00 hits=4
+ofproto_dpif|DBG|  Bucket 7: weight=7, target=5.60 hits=6
+ofproto_dpif|DBG|  Bucket 8: weight=8, target=6.40 hits=6])
+
+dnl Remove the one in the middle.
+get_log_next_line_num
+AT_CHECK([ovs-ofctl -O OpenFlow15 remove-buckets br0 \
+            group_id=1235,command_bucket_id=7])
+OVS_WAIT_UNTIL_EQUAL([tail -n +$LINENUM ovs-vswitchd.log \
+                        | grep -E '(Bucket|group 1235)' \
+                        | sed 's/^.*ofproto_dpif/ofproto_dpif/'], [dnl
+ofproto_dpif|DBG|Constructing select group 1235
+ofproto_dpif|DBG|Modifying select group 1235
+ofproto_dpif|DBG|  Bucket 5: weight=5, target=6.15 hits=6
+ofproto_dpif|DBG|  Bucket 8: weight=8, target=9.85 hits=10])
+
+dnl Remove all the remaining.
+get_log_next_line_num
+AT_CHECK([ovs-ofctl -O OpenFlow15 remove-buckets br0 \
+            group_id=1235,command_bucket_id=all])
+OVS_WAIT_UNTIL_EQUAL([tail -n +$LINENUM ovs-vswitchd.log \
+                        | grep -E '(Bucket|group 1235)' \
+                        | sed 's/^.*ofproto_dpif/ofproto_dpif/'], [dnl
+ofproto_dpif|DBG|Constructing select group 1235
+ofproto_dpif|DBG|Modifying select group 1235])
 
 OVS_VSWITCHD_STOP
 AT_CLEANUP
@@ -1178,34 +1504,34 @@ add_of_ports br0 1 10 11
 
 ovs-appctl vlog/set ofproto_dpif:file:dbg
 AT_CHECK([ovs-ofctl -O OpenFlow15 add-group br0 'group_id=1234,type=select,selection_method=dp_hash,bucket=output:10,bucket=output:11'])
-AT_CHECK([grep -A6 "Constructing select group 1234" ovs-vswitchd.log | sed 's/^.*ofproto_dpif/ofproto_dpif/'], [0], [dnl
+OVS_WAIT_UNTIL_EQUAL([grep -A6 "Constructing select group 1234" ovs-vswitchd.log \
+                        | sed 's/^.*ofproto_dpif/ofproto_dpif/'], [dnl
 ofproto_dpif|DBG|Constructing select group 1234
 ofproto_dpif|DBG|Selection method specified: dp_hash.
 ofproto_dpif|DBG|  Minimum weight: 1, total weight: 2
 ofproto_dpif|DBG|  Using 16 hash values:
 ofproto_dpif|DBG|  Bucket 0: weight=1, target=8.00 hits=8
 ofproto_dpif|DBG|  Bucket 1: weight=1, target=8.00 hits=8
-ofproto_dpif|DBG|Use dp_hash with 16 hash values using algorithm 0.
-])
+ofproto_dpif|DBG|Use dp_hash with 16 hash values using algorithm 0.])
 
 # Fall back to legacy hash with zero buckets
 AT_CHECK([ovs-ofctl -O OpenFlow15 add-group br0 'group_id=1235,type=select,selection_method=dp_hash'])
-AT_CHECK([grep -A3 "Constructing select group 1235" ovs-vswitchd.log | sed 's/^.*ofproto_dpif/ofproto_dpif/'], [0], [dnl
+OVS_WAIT_UNTIL_EQUAL([grep -A3 "Constructing select group 1235" ovs-vswitchd.log \
+                        | sed 's/^.*ofproto_dpif/ofproto_dpif/'], [dnl
 ofproto_dpif|DBG|Constructing select group 1235
 ofproto_dpif|DBG|Selection method specified: dp_hash.
 ofproto_dpif|DBG|  Don't apply dp_hash method without buckets.
-ofproto_dpif|DBG|Falling back to default hash method.
-])
+ofproto_dpif|DBG|Falling back to default hash method.])
 
 # Fall back to legacy hash with zero buckets
 AT_CHECK([ovs-ofctl -O OpenFlow15 add-group br0 'group_id=1236,type=select,selection_method=dp_hash,bucket=weight=1,output:10,bucket=weight=1000,output:11'])
-AT_CHECK([grep -A4 "Constructing select group 1236" ovs-vswitchd.log | sed 's/^.*ofproto_dpif/ofproto_dpif/'], [0], [dnl
+OVS_WAIT_UNTIL_EQUAL([grep -A4 "Constructing select group 1236" ovs-vswitchd.log \
+                        | sed 's/^.*ofproto_dpif/ofproto_dpif/'], [dnl
 ofproto_dpif|DBG|Constructing select group 1236
 ofproto_dpif|DBG|Selection method specified: dp_hash.
 ofproto_dpif|DBG|  Minimum weight: 1, total weight: 1001
 ofproto_dpif|DBG|  Too many hash values required: 1024
-ofproto_dpif|DBG|Falling back to default hash method.
-])
+ofproto_dpif|DBG|Falling back to default hash method.])
 
 OVS_VSWITCHD_STOP
 AT_CLEANUP
@@ -1304,6 +1630,35 @@ AT_CHECK([tail -1 stdout], [0],
 OVS_VSWITCHD_STOP
 AT_CLEANUP
 
+AT_SETUP([ofproto-dpif - select group with dp_hash, tracing])
+OVS_VSWITCHD_START
+add_of_ports br0 1 2
+
+AT_CHECK([ovs-ofctl -O OpenFlow15 add-group br0 \
+  'group_id=1,type=select,bucket=bucket_id:0,weight:10,actions=output:p1'])
+
+AT_CHECK([ovs-ofctl -O OpenFlow15 add-flow br0 \
+  'in_port=p1,dl_src=50:54:00:00:00:09,dl_dst=50:54:00:00:00:0a,actions=group:1'])
+
+AT_CHECK([ovs-appctl ofproto/trace br0 \
+  in_port=p1,tcp,dl_src=50:54:00:00:00:09,dl_dst=50:54:00:00:00:0a,nw_src=10.2.0.2,nw_dst=10.2.0.3 | grep -- '->'], [0], [dnl
+     -> selection method in use: dp_hash, recirculating
+])
+
+AT_CHECK([ovs-ofctl -O OpenFlow15 add-group br0 \
+  'group_id=2,type=select,selection_method=dp_hash'])
+
+AT_CHECK([ovs-ofctl -O OpenFlow15 add-flow br0 \
+  'in_port=p2,dl_src=50:54:00:00:00:09,dl_dst=50:54:00:00:00:0a,actions=group:2'])
+
+AT_CHECK([ovs-appctl ofproto/trace br0 \
+  in_port=p2,tcp,dl_src=50:54:00:00:00:09,dl_dst=50:54:00:00:00:0a,nw_src=10.2.0.2,nw_dst=10.2.0.3 | grep -- '->'], [0], [dnl
+     -> no live bucket
+])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
 AT_SETUP([ofproto-dpif - group stats single bucket])
 OVS_VSWITCHD_START
 add_of_ports br0 1 10 11
@@ -1348,35 +1703,49 @@ AT_CLEANUP
 
 AT_SETUP([ofproto-dpif - registers])
 OVS_VSWITCHD_START
-add_of_ports br0 20 21 22 33 90
+add_of_ports br0 20 21 22 33 34 90
 AT_DATA([flows.txt], [dnl
-in_port=90                 actions=resubmit:2,resubmit:3,resubmit:4,resubmit:91
-in_port=91                 actions=resubmit:5,resubmit:6,resubmit:7,resubmit:92
-in_port=92                 actions=resubmit:8,resubmit:9,resubmit:10,resubmit:11,resubmit:93
-in_port=93                 actions=resubmit:12,resubmit:13,resubmit:14,resubmit:15
+in_port=90 actions=resubmit:2,resubmit:3,resubmit:4,resubmit:91
+in_port=91 actions=resubmit:5,resubmit:6,resubmit:7,resubmit:92
+in_port=92 actions=resubmit:8,resubmit:9,resubmit:10,resubmit:11,resubmit:93
+in_port=93 actions=resubmit:12,resubmit:13,resubmit:14,resubmit:15,resubmit:16,resubmit:17,resubmit:18,resubmit:94
+in_port=94 actions=resubmit:22,resubmit:23,resubmit:24,resubmit:25,resubmit:26,resubmit:27,resubmit:28
 
-in_port=2                  actions=load:0x000db000->NXM_NX_REG0[[]]
-in_port=3                  actions=load:0xdea->NXM_NX_REG0[[20..31]]
-in_port=4                  actions=load:0xeef->NXM_NX_REG0[[0..11]]
-in_port=5                  actions=move:NXM_NX_REG0[[]]->NXM_NX_REG1[[]]
-in_port=6                  actions=load:0x22222222->NXM_NX_REG2[[]]
-in_port=7                  actions=move:NXM_NX_REG1[[20..31]]->NXM_NX_REG2[[0..11]]
-in_port=8                  actions=move:NXM_NX_REG1[[0..11]]->NXM_NX_REG2[[20..31]]
-in_port=9,reg0=0xdeadbeef  actions=output:20
-in_port=10,reg1=0xdeadbeef actions=output:21
-in_port=11,reg2=0xeef22dea actions=output:22
+in_port=2  actions=load:0x000db000->NXM_NX_REG0[[]],load:0x000db000->NXOXM_ET_REG16[[]],load:0x000db000->NXOXM_ET_REG29[[]],
+in_port=3  actions=load:0xdea->NXM_NX_REG0[[20..31]],load:0xdea->NXOXM_ET_REG16[[20..31]],load:0xdea->NXOXM_ET_REG29[[20..31]]
+in_port=4  actions=load:0xeef->NXM_NX_REG0[[0..11]],load:0xeef->NXOXM_ET_REG16[[0..11]],load:0xeef->NXOXM_ET_REG29[[0..11]]
+in_port=5  actions=move:NXM_NX_REG0[[]]->NXM_NX_REG1[[]],move:NXOXM_ET_REG16[[]]->NXOXM_ET_REG17[[]],move:NXOXM_ET_REG29[[]]->NXOXM_ET_REG30[[]]
+in_port=6  actions=load:0x22222222->NXM_NX_REG2[[]],load:0x22222222->NXOXM_ET_REG18[[]],load:0x22222222->NXOXM_ET_REG31[[]]
+in_port=7  actions=move:NXM_NX_REG1[[20..31]]->NXM_NX_REG2[[0..11]],move:NXOXM_ET_REG17[[20..31]]->NXOXM_ET_REG18[[0..11]],move:NXOXM_ET_REG30[[20..31]]->NXOXM_ET_REG31[[0..11]]
+in_port=8  actions=move:NXM_NX_REG1[[0..11]]->NXM_NX_REG2[[20..31]],move:NXOXM_ET_REG17[[0..11]]->NXOXM_ET_REG18[[20..31]],move:NXOXM_ET_REG30[[0..11]]->NXOXM_ET_REG31[[20..31]]
 
-dnl Sanilty check all registers
-in_port=12 actions=load:0x10->NXM_NX_REG0[[]],load:0x11->NXM_NX_REG1[[]],load:0x12->NXM_NX_REG2[[]]
-in_port=13 actions=load:0x13->NXM_NX_REG3[[]],load:0x14->NXM_NX_REG4[[]],load:0x15->NXM_NX_REG5[[]]
-in_port=14 actions=load:0x16->NXM_NX_REG6[[]],load:0x17->NXM_NX_REG7[[]]
-in_port=15,reg0=0x10,reg1=0x11,reg2=0x12,reg3=0x13,reg4=0x14,reg5=0x15,reg6=0x16,reg7=0x17 actions=output:33
+in_port=9,reg0=0xdeadbeef,reg16=0xdeadbeef,reg29=0xdeadbeef  actions=output:20
+in_port=10,reg1=0xdeadbeef,reg17=0xdeadbeef,reg30=0xdeadbeef actions=output:21
+in_port=11,reg2=0xeef22dea,reg18=0xeef22dea,reg31=0xeef22dea actions=output:22
+
+dnl Sanity check registers 0-15
+in_port=12 actions=load:0x100->NXM_NX_REG0[[]],load:0x101->NXM_NX_REG1[[]],load:0x102->NXM_NX_REG2[[]]
+in_port=13 actions=load:0x103->NXM_NX_REG3[[]],load:0x104->NXM_NX_REG4[[]],load:0x105->NXM_NX_REG5[[]]
+in_port=14 actions=load:0x106->NXM_NX_REG6[[]],load:0x107->NXM_NX_REG7[[]],load:0x108->NXM_NX_REG8[[]]
+in_port=15 actions=load:0x109->NXM_NX_REG9[[]],load:0x110->NXM_NX_REG10[[]],load:0x111->NXM_NX_REG11[[]]
+in_port=16 actions=load:0x112->NXM_NX_REG12[[]],load:0x113->NXM_NX_REG13[[]],load:0x114->NXM_NX_REG14[[]]
+in_port=17 actions=load:0x115->NXM_NX_REG15[[]]
+in_port=18,reg0=0x100,reg1=0x101,reg2=0x102,reg3=0x103,reg4=0x104,reg5=0x105,reg6=0x106,reg7=0x107,reg8=0x108,reg9=0x109,reg10=0x110,reg11=0x111,reg12=0x112,reg13=0x113,reg14=0x114,reg15=0x115 actions=output:33
+
+dnl Sanity check registers 16-31
+in_port=22 actions=load:0x116->NXOXM_ET_REG16[[]],load:0x117->NXOXM_ET_REG17[[]],load:0x118->NXOXM_ET_REG18[[]]
+in_port=23 actions=load:0x119->NXOXM_ET_REG19[[]],load:0x120->NXOXM_ET_REG20[[]],load:0x121->NXOXM_ET_REG21[[]]
+in_port=24 actions=load:0x122->NXOXM_ET_REG22[[]],load:0x123->NXOXM_ET_REG23[[]],load:0x124->NXOXM_ET_REG24[[]]
+in_port=25 actions=load:0x125->NXOXM_ET_REG25[[]],load:0x126->NXOXM_ET_REG26[[]],load:0x127->NXOXM_ET_REG27[[]]
+in_port=26 actions=load:0x128->NXOXM_ET_REG28[[]],load:0x129->NXOXM_ET_REG29[[]],load:0x130->NXOXM_ET_REG30[[]]
+in_port=27 actions=load:0x131->NXOXM_ET_REG31[[]]
+in_port=28,reg16=0x116,reg17=0x117,reg18=0x118,reg19=0x119,reg20=0x120,reg21=0x121,reg22=0x122,reg23=0x123,reg24=0x124,reg25=0x125,reg26=0x126,reg27=0x127,reg28=0x128,reg29=0x129,reg30=0x130,reg31=0x131 actions=output:34
 
 ])
 AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
 AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(90),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=1,tos=0,ttl=128,frag=no),icmp(type=8,code=0)'], [0], [stdout])
 AT_CHECK([tail -1 stdout], [0],
-  [Datapath actions: 20,21,22,33
+  [Datapath actions: 20,21,22,33,34
 ])
 OVS_VSWITCHD_STOP
 AT_CLEANUP
@@ -1387,8 +1756,10 @@ AT_SETUP([ofproto-dpif - extended registers])
 OVS_VSWITCHD_START
 add_of_ports br0 1 2 3
 AT_DATA([flows.txt], [dnl
-table=0     actions=load:0xfedcba9876543210->OXM_OF_PKT_REG1[[]],resubmit(,1)
-table=1,reg2=0xfedcba98,reg3=0x76543210   actions=2
+table=0     actions=load:0xfedcba9876543210->OXM_OF_PKT_REG1[[]],resubmit(,2)
+table=2     actions=load:0xfedcba9876543210->OXM_OF_PKT_REG15[[]],resubmit(,3)
+table=3,reg2=0xfedcba98,reg3=0x76543210    actions=resubmit(,4)
+table=4,reg30=0xfedcba98,reg31=0x76543210  actions=2
 
 # These low-priority rules shouldn't match.  They're here only to make really
 # sure that the test fails if either of the above rules fails to match.
@@ -1409,7 +1780,9 @@ OVS_VSWITCHD_START
 add_of_ports br0 1 2 3
 AT_DATA([flows.txt], [dnl
 table=0 actions=load:0x0123456789abcdeffedcba9876543210->NXM_NX_XXREG1[[]],resubmit(,1)
-table=1,reg4=0x01234567,reg5=0x89abcdef,reg6=0xfedcba98,reg7=0x76543210   actions=2
+table=1 actions=load:0x0123456789abcdeffedcba9876543210->NXOXM_ET_XXREG7[[]],resubmit(,2)
+table=2,reg4=0x01234567,reg5=0x89abcdef,reg6=0xfedcba98,reg7=0x76543210       actions=resubmit(,3)
+table=3,reg28=0x01234567,reg29=0x89abcdef,reg30=0xfedcba98,reg31=0x76543210   actions=2
 
 # These low-priority rules shouldn't match.  They're here only to make really
 # sure that the test fails if either of the above rules fails to match.
@@ -1442,7 +1815,8 @@ OVS_VSWITCHD_START
 add_of_ports br0 1 2 3
 AT_DATA([flows.txt], [dnl
 table=0     actions=move:OXM_OF_ETH_SRC[[0..47]]->OXM_OF_PKT_REG0[[0..47]],goto_table(1)
-table=1,xreg0=0x0000505400000005   actions=2
+table=1,xreg0=0x0000505400000005   actions=move:OXM_OF_ETH_DST[[0..47]]->OXM_OF_PKT_REG15[[0..47]],goto_table(2)
+table=2,xreg15=0x0000505400000007  actions=2
 
 # These low-priority rules shouldn't match.  They're here only to make really
 # sure that the test fails if either of the above rules fails to match.
@@ -5148,6 +5522,199 @@ recirc_id(0),in_port(90),packet_type(ns=0,id=0),eth_type(0x0800),ipv4(proto=6,fr
 OVS_VSWITCHD_STOP
 AT_CLEANUP
 
+dnl GEN_IP_FRAGS(prefix, dl_src, dl_dst, nw_src, nw_dst, tp_src, tp_dst, frag_len)
+dnl Generates 63 IP/TCP fragment in files: ${prefix}_0 to ${prefix}_62.
+dnl IP ID is fixed (0x1234), IP checksum is not computed (0xdead).
+m4_define([GEN_IP_FRAGS],
+  [prefix="$1"
+   flow_base="dl_src=$2,dl_dst=$3,ip,nw_src=$4,nw_dst=$5,nw_proto=6,nw_ttl=64"
+   flow_first="${flow_base},tp_src=$6,tp_dst=$7,tcp_flags=syn,nw_frag=first"
+   flow_later="${flow_base},,nw_frag=later"
+   frag_len=$8
+
+   AT_CHECK([ovs-ofctl compose-packet --bare "${flow_first}"], [0], [stdout])
+   hdr=$(cat stdout)
+   ip_len=$(printf '%04x' $((20 + frag_len)))
+   payload=$(printf '%0*d' $(( (frag_len - 20) * 2 )) 0)
+   AT_CHECK([echo ${hdr}${payload} \
+             | sed "s/^\(.\{32\}\).\{12\}\(.\{4\}\).\{4\}/\1${ip_len}12342000\2dead/"],
+            [0], [stdout])
+   AT_CHECK([mv stdout ${prefix}_0])
+
+   AT_CHECK([ovs-ofctl compose-packet --bare "${flow_later}"], [0], [stdout])
+   hdr=$(cat stdout)
+   ip_len=$(printf '%04x' $((20 + frag_len)))
+   payload=$(printf '%0*d' $(( frag_len * 2 )) 0)
+   for i in $(seq 1 61); do
+       frag_off=$(printf '%04x' $((0x2000 + i * frag_len / 8)))
+       AT_CHECK([echo ${hdr}${payload} \
+                 | sed "s/^\(.\{32\}\).\{12\}\(.\{4\}\).\{4\}/\1${ip_len}1234${frag_off}\2dead/"],
+                [0], [stdout])
+       AT_CHECK([mv stdout ${prefix}_$i])
+   done
+
+   ip_len=$(printf '%04x' $((40 + frag_len / 2)))
+   payload=$(printf '%0*d' $((frag_len + 40)) 0)
+   frag_off=$(printf '%04x' $((62 * frag_len / 8)))
+   AT_CHECK([echo ${hdr}${payload} \
+             | sed "s/^\(.\{32\}\).\{12\}\(.\{4\}\).\{4\}/\1${ip_len}1234${frag_off}\2dead/"],
+            [0], [stdout])
+   AT_CHECK([mv stdout ${prefix}_62])
+])
+
+AT_SETUP([ofproto-dpif - fragment handling - reassembly])
+OVS_VSWITCHD_START
+add_of_ports br0 1 2 3 90
+AT_CHECK([ovs-vsctl set Interface p90 options:ol_ip_rx_csum_set_good=true])
+AT_CHECK([ovs-vsctl set Interface p1 options:ol_ip_rx_csum_set_good=true])
+
+AT_DATA([flows.txt], [dnl
+dnl Expand flow mask.
+table=0 in_port=90,dl_src=55:55:55:55:55:55, actions=drop
+table=0 in_port=90,ip,nw_src=10.0.0.1, actions=drop
+table=0 in_port=1,dl_src=55:55:55:55:55:55, actions=drop
+table=0 in_port=1,ip,nw_src=10.0.0.2, actions=drop
+table=0 in_port=90,ip,tcp actions=ct(commit, table=1, zone=10)
+table=0 in_port=1,ip,tcp actions=ct(commit, table=2, zone=20)
+table=1 tcp actions=2
+table=2 tcp actions=3
+])
+AT_CHECK([ovs-ofctl -O OpenFlow11 replace-flows br0 flows.txt])
+
+dnl Test frag expiry.
+AT_CHECK([ovs-appctl netdev-dummy/receive p90 "0021853763af 0026b98cb0f9 0800 4500 0014 0001 8192 40 06 3316 ac11370d ac11370b"])
+ovs-appctl time/warp 10000
+AT_CHECK([ovs-appctl netdev-dummy/receive p90 "0021853763af 0026b98cb0f9 0800 4500 0014 0001 8192 40 06 3316 ac11370d ac11370b"])
+
+dnl Test that no packets flow.
+AT_CHECK([ovs-appctl dpctl/dump-flows filter=in_port\(90\) | sed s'/recirc(.*)/recirc(X)/'], [0], [dnl
+flow-dump from the main thread:
+recirc_id(0),in_port(90),packet_type(ns=0,id=0),eth(src=00:26:b9:8c:b0:f9),eth_type(0x0800),ipv4(src=172.17.55.13/128.0.0.0,proto=6,frag=later), packets:0, bytes:0, used:never, actions:ct(commit,zone=10),recirc(X)
+])
+
+dnl Expire second frag.
+ovs-appctl time/warp 10000
+
+dnl Test frag purge
+AT_CHECK([ovs-appctl netdev-dummy/receive p90 "0021853763af 0026b98cb0f9 0800 4500 0014 0002 8192 40 06 3315 ac11370d ac11370b"])
+ovs-appctl time/warp 33000
+AT_CHECK([ovs-appctl netdev-dummy/receive p90 "0021853763af 0026b98cb0f9 0800 4500 0014 0003 8192 40 06 3314 ac11370d ac11370b"])
+
+dnl Test that no packets flow.
+AT_CHECK([ovs-appctl dpctl/dump-flows filter=in_port\(90\) | sed s'/recirc(.*)/recirc(X)/'], [0], [dnl
+flow-dump from the main thread:
+recirc_id(0),in_port(90),packet_type(ns=0,id=0),eth(src=00:26:b9:8c:b0:f9),eth_type(0x0800),ipv4(src=172.17.55.13/128.0.0.0,proto=6,frag=later), packets:0, bytes:0, used:never, actions:ct(commit,zone=10),recirc(X)
+])
+
+dnl Purge second frag
+ovs-appctl time/warp 33000
+
+dnl Make sure all four packets are counted properly in the coverage.
+AT_CHECK([ovs-appctl coverage/show | grep -c "^ipf.*total: 2"], [0], [2
+])
+
+zero1208=$(printf '%0*d' 2416 0)
+dnl Test that reassembled packets flow.
+AT_CHECK([ovs-appctl netdev-dummy/receive p90 "0021853763af 0026b98cb0f9 0800 4500 04c4 0002 2000 40 06 8ff7 ac11370d ac11370b dnl
+0000 0001 00000000 00000000 50 10 8000 604c 0000 dnl
+$zero1208"])
+AT_CHECK([ovs-appctl netdev-dummy/receive p90 "0021853763af 0026b98cb0f9 0800 4500 04c4 0002 0096 40 06 af61 ac11370d ac11370b dnl
+$zero1208"])
+
+AT_CHECK([ovs-appctl dpctl/dump-flows | sed 's/recirc[[^)]]*)/recirc()/g' | strip_used | sort], [0], [dnl
+flow-dump from the main thread:
+recirc(),in_port(90),packet_type(ns=0,id=0),eth(src=00:26:b9:8c:b0:f9),eth_type(0x0800),ipv4(src=172.17.55.13/128.0.0.0,proto=6,frag=first), packets:0, bytes:0, used:never, actions:ct(commit,zone=10),recirc()
+recirc(),in_port(90),packet_type(ns=0,id=0),eth(src=00:26:b9:8c:b0:f9),eth_type(0x0800),ipv4(src=172.17.55.13/128.0.0.0,proto=6,frag=later), packets:0, bytes:0, used:never, actions:ct(commit,zone=10),recirc()
+recirc(),in_port(90),packet_type(ns=0,id=0),eth_type(0x0800),ipv4(proto=6,frag=first), packets:0, bytes:0, used:never, actions:2
+recirc(),in_port(90),packet_type(ns=0,id=0),eth_type(0x0800),ipv4(proto=6,frag=later), packets:0, bytes:0, used:never, actions:2
+])
+
+dnl Clear ipf state.
+ovs-appctl time/warp 33000
+
+dnl Send a lot of small frags to trigger dynamic batch.
+AT_CHECK([ovs-appctl dpctl/ipf-set-min-frag v4 420], [], [dnl
+setting minimum fragment size successful
+])
+
+dnl First zone.
+GEN_IP_FRAGS([p90], [22:22:22:22:22:22], [11:11:11:11:11:11], [2.2.2.2], [1.1.1.1], [2], [1], [448])
+
+for i in $(seq 0 61); do
+    AT_CHECK([ovs-appctl netdev-dummy/receive p90 "$(cat p90_$i)"])
+done
+OVS_CHECK_BATCH_GROW([0])
+CHECK_COVERAGE([dpif_netdev_recirc_big_batch], [0])
+AT_CHECK([ovs-appctl netdev-dummy/receive p90 "$(cat p90_62)"])
+OVS_CHECK_BATCH_GROW([2])
+CHECK_COVERAGE([dpif_netdev_recirc_big_batch], [1])
+
+dnl Second zone.
+GEN_IP_FRAGS([p1], [11:11:11:11:11:11], [22:22:22:22:22:22], [1.1.1.1], [2.2.2.2], [1], [2], [448])
+for i in $(seq 0 61); do
+    AT_CHECK([ovs-appctl netdev-dummy/receive p1 "$(cat p1_$i)"])
+done
+OVS_CHECK_BATCH_GROW([2])
+CHECK_COVERAGE([dpif_netdev_recirc_big_batch], [1])
+AT_CHECK([ovs-appctl netdev-dummy/receive p1 "$(cat p1_62)"])
+OVS_CHECK_BATCH_GROW([4])
+CHECK_COVERAGE([dpif_netdev_recirc_big_batch], [2])
+
+dnl Bump the remaining queued packets
+AT_CHECK([ovs-appctl netdev-dummy/receive p90 "0021853763af 0026b98cb0f9 0800 4500 04c4 0002 0096 40 06 af61 ac11370d ac11370b dnl
+$zero1208"])
+AT_CHECK([ovs-appctl netdev-dummy/receive p1 "0021853763af 0026b98cb0f9 0800 4500 04c4 0002 0096 40 06 af61 ac11370d ac11370b dnl
+$zero1208"])
+
+AT_CHECK([ovs-appctl dpctl/dump-flows | sed 's/recirc[[^)]]*)/recirc()/g' | sed 's/used.*, / /' | sort], [0], [dnl
+flow-dump from the main thread:
+recirc(),in_port(1),packet_type(ns=0,id=0),eth(src=00:26:b9:8c:b0:f9),eth_type(0x0800),ipv4(src=172.17.55.13/128.0.0.0,proto=6,frag=later), packets:0, bytes:0,  actions:ct(commit,zone=20),recirc()
+recirc(),in_port(1),packet_type(ns=0,id=0),eth(src=11:11:11:11:11:11),eth_type(0x0800),ipv4(src=1.1.1.1/248.0.0.0,proto=6,frag=first), packets:0, bytes:0,  actions:ct(commit,zone=20),recirc()
+recirc(),in_port(1),packet_type(ns=0,id=0),eth(src=11:11:11:11:11:11),eth_type(0x0800),ipv4(src=1.1.1.1/248.0.0.0,proto=6,frag=later), packets:61, bytes:29198,  actions:ct(commit,zone=20),recirc()
+recirc(),in_port(1),packet_type(ns=0,id=0),eth_type(0x0800),ipv4(proto=6,frag=first), packets:0, bytes:0,  actions:3
+recirc(),in_port(1),packet_type(ns=0,id=0),eth_type(0x0800),ipv4(proto=6,frag=later), packets:61, bytes:29198,  actions:3
+recirc(),in_port(90),packet_type(ns=0,id=0),eth(src=00:26:b9:8c:b0:f9),eth_type(0x0800),ipv4(src=172.17.55.13/128.0.0.0,proto=6,frag=later), packets:0, bytes:0,  actions:ct(commit,zone=10),recirc()
+recirc(),in_port(90),packet_type(ns=0,id=0),eth(src=22:22:22:22:22:22),eth_type(0x0800),ipv4(src=2.2.2.2/248.0.0.0,proto=6,frag=first), packets:0, bytes:0,  actions:ct(commit,zone=10),recirc()
+recirc(),in_port(90),packet_type(ns=0,id=0),eth(src=22:22:22:22:22:22),eth_type(0x0800),ipv4(src=2.2.2.2/248.0.0.0,proto=6,frag=later), packets:61, bytes:29198,  actions:ct(commit,zone=10),recirc()
+recirc(),in_port(90),packet_type(ns=0,id=0),eth_type(0x0800),ipv4(proto=6,frag=first), packets:0, bytes:0,  actions:2
+recirc(),in_port(90),packet_type(ns=0,id=0),eth_type(0x0800),ipv4(proto=6,frag=later), packets:61, bytes:29198,  actions:2
+])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - fragment handling - reassembly no recirculation])
+OVS_VSWITCHD_START
+add_of_ports br0 1 2
+AT_CHECK([ovs-vsctl set Interface p1 options:ol_ip_rx_csum_set_good=true])
+
+AT_DATA([flows.txt], [dnl
+dnl Expand flow mask.
+table=0 in_port=1,dl_src=55:55:55:55:55:55, actions=drop
+table=0 in_port=1,ip,nw_src=10.0.0.2, actions=drop
+table=0 in_port=1,ip,tcp actions=ct(commit, zone=10),output:2
+])
+AT_CHECK([ovs-ofctl -O OpenFlow11 replace-flows br0 flows.txt])
+
+dnl Send a lot of small frags to trigger dynamic batch.
+AT_CHECK([ovs-appctl dpctl/ipf-set-min-frag v4 420], [], [dnl
+setting minimum fragment size successful
+])
+
+GEN_IP_FRAGS([p1], [11:11:11:11:11:11], [22:22:22:22:22:22], [1.1.1.1], [2.2.2.2], [1], [2], [448])
+
+for i in $(seq 0 61); do
+    AT_CHECK([ovs-appctl netdev-dummy/receive p1 "$(cat p1_$i)"])
+done
+OVS_CHECK_BATCH_GROW([0])
+CHECK_COVERAGE([dpif_netdev_output_grow_queues], [0])
+AT_CHECK([ovs-appctl netdev-dummy/receive p1 "$(cat p1_62)"])
+OVS_CHECK_BATCH_GROW([2])
+CHECK_COVERAGE([dpif_netdev_output_grow_queues], [1])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
 AT_SETUP([ofproto-dpif - handling of malformed TCP packets])
 OVS_VSWITCHD_START
 add_of_ports br0 1 90
@@ -5220,6 +5787,240 @@ AT_CHECK([tail -1 stdout], [0],
 OVS_VSWITCHD_STOP
 AT_CLEANUP
 
+AT_SETUP([ofproto-dpif - mirroring, filter])
+AT_KEYWORDS([mirror mirrors mirroring])
+OVS_VSWITCHD_START
+add_of_ports br0 1 2 3
+AT_CHECK([ovs-vsctl \
+          set Bridge br0 mirrors=@m -- \
+          --id=@p3 get Port p3 -- \
+          --id=@m create Mirror name=mymirror select_all=true output_port=@p3 filter="icmp"], [0], [ignore])
+
+icmp_flow="eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=1,tos=0,ttl=128,frag=no),icmp(type=8,code=0)"
+tcp_flow1="eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=128,frag=no),tcp(dst=443)"
+tcp_flow2="eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=128,frag=no),tcp(dst=80)"
+
+AT_CHECK([ovs-ofctl del-flows br0])
+AT_CHECK([ovs-ofctl add-flow br0 'actions=normal' ])
+
+dnl Add non-matching flows, then change the mirror to match one of the flows,
+dnl then add a matching flow.
+AT_CHECK([ovs-appctl netdev-dummy/receive p1 $icmp_flow])
+AT_CHECK([ovs-appctl netdev-dummy/receive p1 $tcp_flow1])
+AT_CHECK([ovs-vsctl set mirror mymirror filter="tcp"], [0])
+AT_CHECK([ovs-appctl revalidator/wait])
+AT_CHECK([ovs-appctl netdev-dummy/receive p1 $tcp_flow2])
+AT_CHECK([ovs-appctl dpif/dump-flows --names br0 | strip_ufid | strip_used | sort], [0], [dnl
+recirc_id(0),in_port(p1),packet_type(ns=0,id=0),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),dnl
+eth_type(0x0800),ipv4(proto=1,frag=no), packets:0, bytes:0, used:never, actions:br0,p2
+recirc_id(0),in_port(p1),packet_type(ns=0,id=0),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),dnl
+eth_type(0x0800),ipv4(proto=6,frag=no), packets:1, bytes:118, used:0.0s, actions:p3,br0,p2
+])
+AT_CHECK([ovs-appctl dpctl/dump-flows --names | strip_ufid | strip_used | sort], [0], [dnl
+flow-dump from the main thread:
+recirc_id(0),in_port(p1),packet_type(ns=0,id=0),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),dnl
+eth_type(0x0800),ipv4(proto=1,frag=no), packets:0, bytes:0, used:never, actions:br0,p2
+recirc_id(0),in_port(p1),packet_type(ns=0,id=0),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),dnl
+eth_type(0x0800),ipv4(proto=6,frag=no), packets:1, bytes:118, used:0.0s, actions:p3,br0,p2
+])
+
+AT_CHECK([ovs-ofctl del-flows br0])
+AT_CHECK([ovs-ofctl add-flow br0 "in_port=1 actions=output:2"])
+AT_CHECK([ovs-ofctl add-flow br0 "in_port=2 actions=output:1"])
+
+dnl Add mirrored flow after non-mirrored flow.
+AT_CHECK([ovs-vsctl set mirror mymirror filter="icmp"], [0])
+AT_CHECK([ovs-appctl netdev-dummy/receive p1 $tcp_flow1])
+AT_CHECK([ovs-appctl netdev-dummy/receive p1 $icmp_flow])
+AT_CHECK([ovs-appctl dpif/dump-flows --names br0 | strip_ufid | strip_used | sort], [0], [dnl
+recirc_id(0),in_port(p1),packet_type(ns=0,id=0),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),dnl
+eth_type(0x0800),ipv4(proto=1,frag=no), packets:1, bytes:106, used:0.0s, actions:p3,p2
+recirc_id(0),in_port(p1),packet_type(ns=0,id=0),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),dnl
+eth_type(0x0800),ipv4(proto=6,frag=no), packets:2, bytes:236, used:0.0s, actions:p2
+])
+
+dnl Check one direction, only icmp should mirror.
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(1),$icmp_flow"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 3,2
+])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(1),$tcp_flow1"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 2
+])
+
+dnl Check other direction, only icmp should mirror.
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(2),$icmp_flow"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 3,1
+])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(2),$tcp_flow1"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 1
+])
+
+dnl Change filter to tcp, only tcp should mirror.
+AT_CHECK([ovs-vsctl set mirror mymirror filter="tcp"], [0])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(1),$icmp_flow"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 2
+])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(1),$tcp_flow1"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 3,2
+])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(2),$icmp_flow"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 1
+])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(2),$tcp_flow1"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 3,1
+])
+
+dnl Invalid filter. Nothing should mirror, error should be logged.
+AT_CHECK([ovs-vsctl set mirror mymirror filter="invalid"], [0])
+dnl Setting an in_port is also invalid.
+AT_CHECK([ovs-vsctl set mirror mymirror filter="\"in_port=p1\""], [0])
+
+dnl Each of the above two lines should produce two log messages.
+OVS_WAIT_UNTIL([test $(grep -Ec "filter is invalid|mirror mymirror configuration is invalid" ovs-vswitchd.log) -eq 4])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(1),$icmp_flow"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 2
+])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(1),$tcp_flow1"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 2
+])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(2),$icmp_flow"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 1
+])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(2),$tcp_flow1"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 1
+])
+
+dnl Check more complex filter cases with partially overlapping default wildcards.
+AT_CHECK([ovs-vsctl set mirror mymirror filter="\"tcp,tcp_dst=80\""], [0])
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(1),$tcp_flow1"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 2
+])
+
+dnl Change port number.
+AT_CHECK([ovs-appctl dpif-dummy/change-port-number ovs-dummy p1 8])
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(8),$tcp_flow2"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 3,2
+])
+
+dnl Empty filter, all traffic should mirror.
+AT_CHECK([ovs-vsctl clear mirror mymirror filter], [0])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(8),$icmp_flow"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 3,2
+])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(8),$tcp_flow1"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 3,2
+])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(2),$icmp_flow"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 3,8
+])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(2),$tcp_flow1"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 3,8
+])
+
+OVS_VSWITCHD_STOP(["/filter is invalid: invalid: unknown field invalid/d
+/filter is invalid due to in_port field/d
+/mirror mymirror configuration is invalid/d"])
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - mirroring, filter with wildcards])
+AT_KEYWORDS([mirror mirrors mirroring])
+OVS_VSWITCHD_START
+add_of_ports br0 1 2 3
+AT_CHECK([ovs-vsctl \
+          set Bridge br0 mirrors=@m -- \
+          --id=@p3 get Port p3 -- \
+          --id=@m create Mirror name=mymirror select_all=true output_port=@p3 \
+          filter="\"ip,nw_src=192.168.0.0/24\""], [0], [ignore])
+
+AT_CHECK([ovs-ofctl add-flow br0 "in_port=1 actions=output:2"])
+
+match_flow="eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=128,frag=no),tcp(dst=80)"
+nomatch_flow="eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=10.0.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=128,frag=no),tcp(dst=80)"
+
+dnl A masked filter should be accepted and only matching flows mirrored.
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(1),$match_flow"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 3,2
+])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(1),$nomatch_flow"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 2
+])
+
+dnl A masked L4 port filter should compose with the wildcards too.
+AT_CHECK([ovs-vsctl set mirror mymirror filter="\"tcp,tcp_dst=0x0050/0xfff0\""], [0])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(1),$match_flow"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 3,2
+])
+
+nomatch_port_flow="eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=128,frag=no),tcp(dst=443)"
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(1),$nomatch_port_flow"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 2
+])
+
+dnl Missing prerequisites, missing values and duplicate fields are still
+dnl rejected.
+AT_CHECK([ovs-vsctl set mirror mymirror filter="\"nw_src=192.168.0.0/24\""], [0])
+AT_CHECK([ovs-vsctl set mirror mymirror \
+          filter="\"ip,nw_src=192.168.0.0/24,nw_src=10.0.0.0/8\""], [0])
+AT_CHECK([ovs-vsctl set mirror mymirror filter="\"ip,ipv6\""], [0])
+AT_CHECK([ovs-vsctl set mirror mymirror filter="\"ip,nw_src\""], [0])
+
+dnl Each of the above four lines should produce two log messages.
+OVS_WAIT_UNTIL([test $(grep -Ec "filter is invalid|mirror mymirror configuration is invalid" ovs-vswitchd.log) -eq 8])
+AT_CHECK([grep -c "prerequisites not met for setting nw_src" ovs-vswitchd.log], [0], [1
+])
+AT_CHECK([grep -c "field nw_src set multiple times" ovs-vswitchd.log], [0], [1
+])
+AT_CHECK([grep -c "Ethernet type set multiple times" ovs-vswitchd.log], [0], [1
+])
+AT_CHECK([grep -c "bad value for nw_src" ovs-vswitchd.log], [0], [1
+])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "in_port(1),$match_flow"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 2
+])
+
+OVS_VSWITCHD_STOP(["/filter is invalid: /d
+/mirror mymirror configuration is invalid/d"])
+AT_CLEANUP
 
 AT_SETUP([ofproto-dpif - mirroring, select_all])
 AT_KEYWORDS([mirror mirrors mirroring])
@@ -5278,6 +6079,33 @@ AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "$flow"], [0], [stdout])
 AT_CHECK_UNQUOTED([tail -1 stdout], [0],
   [Datapath actions: 1
 ])
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - mirroring, metadata modification])
+AT_KEYWORDS([mirror mirrors mirroring])
+OVS_VSWITCHD_START
+add_of_ports br0 1 2 3
+AT_CHECK([ovs-vsctl set Bridge br0 mirrors=@m -- \
+            --id=@p3 get Port p3 -- \
+            --id=@m create Mirror name=mymirror select_all=true output_port=@p3],
+         [0], [ignore])
+
+AT_DATA([flows.txt], [dnl
+in_port=1 actions=load:0x00->NXM_OF_IN_PORT[[]],output:2
+])
+AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
+
+dnl Metadata modified, duplicate packet shouldn't be delivered to mirror.
+m4_define([ICMP_FLOW], [m4_join([,],
+  [in_port(1),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800)],
+  [ipv4(src=192.168.0.1,dst=192.168.0.2,proto=1,tos=0,ttl=128,frag=no)],
+  [icmp(type=8,code=0)])])
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy "ICMP_FLOW"], [0], [stdout])
+AT_CHECK_UNQUOTED([tail -1 stdout], [0],
+  [Datapath actions: 3,2
+])
+
 OVS_VSWITCHD_STOP
 AT_CLEANUP
 
@@ -5755,6 +6583,45 @@ AT_CHECK([tail -1 stdout | grep -E "trunc\(200\),2,trunc\(300\),3,100|trunc\(300
 OVS_VSWITCHD_STOP
 AT_CLEANUP
 
+AT_SETUP([ofproto-dpif - mirroring on balance-tcp bonding with dp_hash])
+AT_KEYWORDS([mirror mirrors mirroring])
+OVS_VSWITCHD_START(
+  [add-bond br0 bond0 p1 p2 bond_mode=balance-tcp lacp=active \
+       other-config:lacp-time=fast other-config:bond-rebalance-interval=0 -- \
+   set interface p1 type=dummy options:pstream=punix:$OVS_RUNDIR/p1.sock ofport_request=1 -- \
+   set interface p2 type=dummy options:pstream=punix:$OVS_RUNDIR/p2.sock ofport_request=2 -- \
+   add-br br1 -- \
+   set bridge br1 other-config:hwaddr=aa:66:aa:66:00:00 -- \
+   set bridge br1 datapath-type=dummy other-config:datapath-id=1234 \
+       fail-mode=standalone -- \
+   add-bond br1 bond1 p3 p4 bond_mode=balance-tcp lacp=active \
+       other-config:lacp-time=fast other-config:bond-rebalance-interval=0 -- \
+   set interface p3 type=dummy options:stream=unix:$OVS_RUNDIR/p1.sock ofport_request=3 -- \
+   set interface p4 type=dummy options:stream=unix:$OVS_RUNDIR/p2.sock ofport_request=4
+])
+
+# Waits for all ifaces enabled.
+OVS_WAIT_UNTIL([test $(ovs-appctl bond/show | grep -c "may_enable: true") -ge 4])
+
+add_of_ports br1 5 6
+AT_CHECK([ovs-vsctl \
+            set Bridge br1 mirrors=@m --\
+            --id=@bond1 get Port bond1 -- --id=@p6 get Port p6 --\
+            --id=@m create Mirror name=mymirror \
+                select_dst_port=@bond1 select_src_port=@bond1 output_port=@p6],
+          [0], [ignore])
+
+# Sends a packet to trigger recirculation.
+AT_CHECK([ovs-appctl netdev-dummy/receive p5 \
+    "in_port(5),eth(src=50:54:00:00:00:05,dst=50:54:00:00:01:00),eth_type(0x0800),ipv4(src=10.0.0.2,dst=10.0.0.1)"])
+
+AT_CHECK([ovs-appctl dpctl/dump-flows --names | grep 'in_port(p5)' | \
+          sed 's/.*actions://' | grep -c p6 | tr -d '\n'], [0], [1])
+
+OVS_VSWITCHD_STOP()
+AT_CLEANUP
+
+
 # This test verifies that the table ID is preserved across recirculation
 # when a resubmit action requires it (because the action is relative to
 # the current table rather than specifying a table).
@@ -5927,6 +6794,41 @@ OVS_WAIT_UNTIL([ovs-pcap p1-tx.pcap | grep -q "$packet"])
 OVS_VSWITCHD_STOP
 AT_CLEANUP
 
+AT_SETUP([ofproto-dpif - evict recirculated OFPP_NONE flows on input port removal])
+AT_KEYWORDS([recirc revalidator])
+OVS_VSWITCHD_START
+add_of_ports br0 1 2
+
+m4_define([PKT], [m4_join([,],
+    [in_port(1)],
+    [eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a)],
+    [eth_type(0x0800)],
+    [ipv4(src=192.168.0.2,dst=192.168.0.1,proto=6,tos=0,ttl=64,frag=no)])])
+
+AT_DATA([flows.txt], [dnl
+table=0,in_port=1,tcp actions=load:0xffff->NXM_OF_IN_PORT[[]],ct(zone=1,table=1)
+table=1,tcp actions=output:2
+])
+AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
+
+dnl A few packets so both datapath flows get hits.
+for i in 1 2 3; do
+    AT_CHECK([ovs-appctl netdev-dummy/receive p1 'PKT'])
+done
+
+AT_CHECK([ovs-appctl dpctl/dump-flows | strip_used | strip_stats | sort], [0], [dnl
+flow-dump from the main thread:
+recirc_id(0),in_port(1),packet_type(ns=0,id=0),eth_type(0x0800),ipv4(proto=6,frag=no), packets:0, bytes:0, used:0.0s, actions:ct(zone=1),recirc(0x1)
+recirc_id(0x1),in_port(1),packet_type(ns=0,id=0),eth_type(0x0800),ipv4(proto=6,frag=no), packets:0, bytes:0, used:0.0s, actions:2
+])
+
+AT_CHECK([ovs-vsctl del-port br0 p1])
+AT_CHECK([ovs-appctl revalidator/wait])
+AT_CHECK([ovs-appctl dpctl/dump-flows])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
 AT_SETUP([ofproto-dpif - debug_slow action])
 OVS_VSWITCHD_START
 add_of_ports br0 1 2 3
@@ -5944,6 +6846,42 @@ This flow is handled by the userspace slow path because it:
 OVS_VSWITCHD_STOP
 AT_CLEANUP
 
+AT_SETUP([ofproto-dpif - meter with slow-path action])
+
+OVS_VSWITCHD_START
+
+AT_CHECK([ovs-ofctl -O OpenFlow15 add-meter br0 \
+  'meter=1 pktps burst stats bands=type=drop rate=100 burst_size=100'])
+
+add_of_ports --pcap br0 1 2
+
+AT_CHECK([ovs-appctl vlog/set dpif:dbg])
+
+eth="eth_src=00:00:00:00:00:ec,eth_dst=ff:ff:ff:ff:ff:ff,arp"
+arp="arp_tpa=192.168.0.1,arp_spa=192.168.0.100,arp_op=1"
+packet=$(ovs-ofctl compose-packet --bare "$eth,$arp")
+
+AT_CHECK([ovs-ofctl -O OpenFlow15 add-flow br0 \
+  "table=1,eth_type=0x0806,actions=meter:1,clone(set_field:2->arp_op,output(port=p2,max_len=128)),output:p1"])
+
+AT_CHECK([ovs-ofctl -O OpenFlow15 packet-out br0 CONTROLLER \
+  "meter:1,resubmit(,1)" "$packet"])
+
+dnl Verify the orinigal packet is received on port 1.
+OVS_WAIT_UNTIL([test $(ovs-pcap p1-tx.pcap | grep -c "$packet") -eq 1])
+
+dnl Verify the modified packet is received on port 2.
+arp="arp_tpa=192.168.0.1,arp_spa=192.168.0.100,arp_op=2"
+packet=$(ovs-ofctl compose-packet --bare "$eth,$arp")
+OVS_WAIT_UNTIL([test $(ovs-pcap p2-tx.pcap | grep -c "$packet") -eq 1])
+
+dnl Make sure all meters, and outputs datapath actions get executed.
+OVS_WAIT_UNTIL([grep "sub-execute meter(0),meter(0),2 on packet arp" \
+                  ovs-vswitchd.log])
+OVS_WAIT_UNTIL([grep "sub-execute 1 on packet arp" ovs-vswitchd.log])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP
 
 dnl CHECK_CONTINUATION(TITLE, N_PORTS0, N_PORTS1, ACTIONS0, ACTIONS1, [EXTRA_SETUP])
 dnl
@@ -6171,9 +7109,8 @@ ovs-ofctl monitor br0 resume --detach --no-chdir \
 AT_CHECK([ovs-appctl netdev-dummy/receive p1 "$flow"], [0], [stdout])
 
 # Check flow stats
-AT_CHECK([ovs-ofctl dump-flows br0], [0], [stdout])
-AT_CHECK([strip_xids < stdout | sed -n 's/duration=[[0-9]]*\.[[0-9]]*s/duration=0.0s/p' | sed -n 's/idle_age=[[0-9]]*/idle_age=0/p' | grep 'table=2'], [0], [dnl
- cookie=0x0, duration=0.0s, table=2, n_packets=1, n_bytes=106, idle_age=0, reg1=0x1 actions=output:2
+AT_CHECK([ovs-ofctl dump-flows br0 | ofctl_strip | grep 'table=2'], [0], [dnl
+ table=2, n_packets=1, n_bytes=106, reg1=0x1 actions=output:2
 ])
 
 # The packet should be received by port 2
@@ -6206,9 +7143,8 @@ ovs-ofctl monitor br0 resume --detach --no-chdir \
 AT_CHECK([ovs-appctl netdev-dummy/receive p1 "$flow"], [0], [stdout])
 
 # Check flow stats
-AT_CHECK([ovs-ofctl dump-flows br0], [0], [stdout])
-AT_CHECK([strip_xids < stdout | sed -n 's/duration=[[0-9]]*\.[[0-9]]*s/duration=0.0s/p' | sed -n 's/idle_age=[[0-9]]*/idle_age=0/p' | grep 'table=2'], [0], [dnl
- cookie=0x0, duration=0.0s, table=2, n_packets=1, n_bytes=106, idle_age=0, ct_state=+new+trk,icmp,in_port=1 actions=output:2
+AT_CHECK([ovs-ofctl dump-flows br0 | ofctl_strip | grep 'table=2'], [0], [dnl
+ table=2, n_packets=1, n_bytes=106, ct_state=+new+trk,icmp,in_port=1 actions=output:2
 ])
 
 # The packet should be received by port 2
@@ -6298,9 +7234,8 @@ ovs-ofctl monitor br1 resume --detach --no-chdir --pidfile=ovs-ofctl.pid 2> ofct
 AT_CHECK([ovs-appctl netdev-dummy/receive p0 "$flow"], [0], [stdout])
 
 # Check flow stats
-AT_CHECK([ovs-ofctl dump-flows br1], [0], [stdout])
-AT_CHECK([strip_xids < stdout | sed -n 's/duration=[[0-9]]*\.[[0-9]]*s/duration=0.0s/p' | sed -n 's/idle_age=[[0-9]]*/idle_age=0/p' | grep 'table=3' | grep -v 'commit'], [0], [dnl
- cookie=0x0, duration=0.0s, table=3, n_packets=1, n_bytes=106, idle_age=0, icmp,in_port=1 actions=output:2
+AT_CHECK([ovs-ofctl dump-flows br1 | ofctl_strip | grep 'table=3' | grep -v 'commit'], [0], [dnl
+ table=3, n_packets=1, n_bytes=106, icmp,in_port=1 actions=output:2
 ])
 
 # The packet should be received by port 1
@@ -6401,21 +7336,21 @@ br_flow="arp,in_port=3,vlan_tci=0x0000,dl_src=50:54:00:00:00:05,dl_dst=ff:ff:ff:
 AT_CHECK([ovs-appctl ofproto/trace "$odp_flow"], [0], [stdout])
 # Check for no MAC learning entry
 AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/[[0-9]]\{1,\}$/?/'], [0], [dnl
- port  VLAN  MAC                Age
+ Port  VLAN  MAC                Age
 ])
 
 # Test command: ofproto/trace br_name br_flow
 AT_CHECK([ovs-appctl ofproto/trace br0 "$br_flow"], [0], [stdout])
 # Check for no MAC learning entry
 AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/[[0-9]]\{1,\}$/?/'], [0], [dnl
- port  VLAN  MAC                Age
+ Port  VLAN  MAC                Age
 ])
 
 # Test command: ofproto/trace odp_flow -generate
 AT_CHECK([ovs-appctl ofproto/trace "$odp_flow" -generate], [0], [stdout])
 # Check for the MAC learning entry
 AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/[[0-9]]\{1,\}$/?/'], [0], [dnl
- port  VLAN  MAC                Age
+ Port  VLAN  MAC                Age
     3     0  50:54:00:00:00:05    ?
 ])
 
@@ -6425,7 +7360,7 @@ AT_CHECK([ovs-appctl ofproto/trace ovs-dummy \
   -generate], [0], [stdout])
 # Check for both MAC learning entries
 AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/[[0-9]]\{1,\}$/?/'], [0], [dnl
- port  VLAN  MAC                Age
+ Port  VLAN  MAC                Age
     3     0  50:54:00:00:00:05    ?
     1     0  50:54:00:00:00:06    ?
 ])
@@ -6436,7 +7371,7 @@ AT_CHECK([ovs-appctl ofproto/trace br0 \
   -generate], [0], [stdout])
 # Check for both MAC learning entries.
 AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/[[0-9]]\{1,\}$/?/'], [0], [dnl
- port  VLAN  MAC                Age
+ Port  VLAN  MAC                Age
     3     0  50:54:00:00:00:05    ?
     1     0  50:54:00:00:00:06    ?
     2     0  50:54:00:00:00:07    ?
@@ -6715,6 +7650,12 @@ add_of_ports br0 1 2 3
 
 arp='eth_type(0x0806),arp(sip=192.168.0.1,tip=192.168.0.2,op=1,sha=50:54:00:00:00:05,tha=00:00:00:00:00:00)'
 
+dnl Check json output for an empty FDB.
+AT_CHECK([ovs-appctl --format json --pretty fdb/show br0], [0], [dnl
+[{
+  "br0": []}]
+])
+
 # Trace an ARP packet arriving on p3, to create a MAC learning entry.
 OFPROTO_TRACE(
   [ovs-dummy],
@@ -6724,7 +7665,7 @@ OFPROTO_TRACE(
 
 # Check for the MAC learning entry.
 AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/[[0-9]]\{1,\}$/?/'], [0], [dnl
- port  VLAN  MAC                Age
+ Port  VLAN  MAC                Age
     3     0  50:54:00:00:00:05    ?
 ])
 
@@ -6738,9 +7679,26 @@ OFPROTO_TRACE(
 
 # Check for both MAC learning entries.
 AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/[[0-9]]\{1,\}$/?/'], [0], [dnl
- port  VLAN  MAC                Age
+ Port  VLAN  MAC                Age
     3     0  50:54:00:00:00:05    ?
     1     0  50:54:00:00:00:06    ?
+])
+
+dnl Check json output.
+AT_CHECK([ovs-appctl --format json --pretty fdb/show br0 \
+          | sed 's/"age": [[0-9]]*/"age": ?/g'], [0], [dnl
+[{
+  "br0": [
+    {
+      "age": ?,
+      "mac": "50:54:00:00:00:05",
+      "port": 3,
+      "vlan": 0},
+    {
+      "age": ?,
+      "mac": "50:54:00:00:00:06",
+      "port": 1,
+      "vlan": 0}]}]
 ])
 
 # Trace a packet arrival that updates the first learned MAC entry.
@@ -6752,7 +7710,7 @@ OFPROTO_TRACE(
 
 # Check that the MAC learning entry was updated.
 AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/[[0-9]]\{1,\}$/?/'], [0], [dnl
- port  VLAN  MAC                Age
+ Port  VLAN  MAC                Age
     1     0  50:54:00:00:00:06    ?
     2     0  50:54:00:00:00:05    ?
 ])
@@ -6778,7 +7736,7 @@ OFPROTO_TRACE(
 
 # Check that the MAC learning entries were added.
 AT_CHECK_UNQUOTED([ovs-appctl fdb/show br1 | sed 's/[[0-9]]\{1,\}$/?/'], [0], [dnl
- port  VLAN  MAC                Age
+ Port  VLAN  MAC                Age
     4     0  50:54:00:00:00:06    ?
     5     0  50:54:00:00:00:07    ?
 ])
@@ -6787,12 +7745,102 @@ AT_CHECK_UNQUOTED([ovs-appctl fdb/show br1 | sed 's/[[0-9]]\{1,\}$/?/'], [0], [d
 # that the MAC learning entry for the same MAC was also deleted from br1.
 AT_CHECK([ovs-vsctl del-port p1])
 AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/[[0-9]]\{1,\}$/?/'], [0], [dnl
- port  VLAN  MAC                Age
+ Port  VLAN  MAC                Age
     2     0  50:54:00:00:00:05    ?
 ])
 AT_CHECK_UNQUOTED([ovs-appctl fdb/show br1 | sed 's/[[0-9]]\{1,\}$/?/'], [0], [dnl
- port  VLAN  MAC                Age
+ Port  VLAN  MAC                Age
     5     0  50:54:00:00:00:07    ?
+])
+
+# Test fdb/show with multiple bridges.  A "Bridge" column groups each
+# bridge's entries, printing the name only on the bridge's first row.
+AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 br1 | sed 's/[[0-9]]\{1,\}$/?/'], [0], [dnl
+ Bridge  Port  VLAN  MAC                Age
+ br0        2     0  50:54:00:00:00:05    ?
+ br1        5     0  50:54:00:00:00:07    ?
+])
+
+# Test fdb/show without arguments: show all bridges.
+AT_CHECK_UNQUOTED([ovs-appctl fdb/show | sed 's/[[0-9]]\{1,\}$/?/' | sort], [0], [dnl
+ Bridge  Port  VLAN  MAC                Age
+ br0        2     0  50:54:00:00:00:05    ?
+ br1        5     0  50:54:00:00:00:07    ?
+])
+
+dnl Check json output with multiple bridges: keyed by bridge name.
+AT_CHECK([ovs-appctl --format json --pretty fdb/show br0 br1 \
+          | sed 's/"age": [[0-9]]*/"age": ?/g'], [0], [dnl
+[{
+  "br0": [
+    {
+      "age": ?,
+      "mac": "50:54:00:00:00:05",
+      "port": 2,
+      "vlan": 0}],
+  "br1": [
+    {
+      "age": ?,
+      "mac": "50:54:00:00:00:07",
+      "port": 5,
+      "vlan": 0}]}]
+])
+
+# Test fdb/show with a non-existent bridge mixed in: must reply with an
+# error and emit no partial output.
+AT_CHECK([ovs-appctl fdb/show br0 nonexistent], [2], [],
+  [no such bridge nonexistent
+ovs-appctl: ovs-vswitchd: server returned an error
+])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - fdb/show bridge column width])
+OVS_VSWITCHD_START
+AT_CHECK([ovs-vsctl -- add-br br-nexthop -- set bridge br-nexthop datapath-type=dummy])
+add_of_ports br0 1 3
+add_of_ports br-nexthop 2
+
+dnl br0 holds several MAC entries; br-nexthop holds one.
+AT_CHECK([ovs-appctl fdb/add br0 p1 0 50:54:00:00:00:05])
+AT_CHECK([ovs-appctl fdb/add br0 p3 0 50:54:00:00:00:06])
+AT_CHECK([ovs-appctl fdb/add br-nexthop p2 0 50:54:00:00:00:07])
+
+dnl The "Bridge" column widens to the longest bridge name shown.  A
+dnl bridge with several MAC entries prints its name only on the first
+dnl row; the remaining rows leave the column blank so the entries read
+dnl as one group.
+AT_CHECK([ovs-appctl fdb/show br0 br-nexthop], [0], [dnl
+ Bridge      Port  VLAN  MAC                Age
+ br0            1     0  50:54:00:00:00:05  static
+                3     0  50:54:00:00:00:06  static
+ br-nexthop     2     0  50:54:00:00:00:07  static
+])
+
+dnl A bridge with no entries still shows a name-only row so it stays
+dnl visible in a multi-bridge listing (matching JSON, which lists []).
+AT_CHECK([ovs-vsctl -- add-br br-empty -- set bridge br-empty datapath-type=dummy])
+AT_CHECK([ovs-appctl fdb/show br0 br-empty], [0], [dnl
+ Bridge    Port  VLAN  MAC                Age
+ br0          1     0  50:54:00:00:00:05  static
+              3     0  50:54:00:00:00:06  static
+ br-empty
+])
+AT_CHECK([ovs-appctl --format json --pretty fdb/show br0 br-empty], [0], [dnl
+[{
+  "br-empty": [],
+  "br0": [
+    {
+      "mac": "50:54:00:00:00:05",
+      "port": 1,
+      "static": true,
+      "vlan": 0},
+    {
+      "mac": "50:54:00:00:00:06",
+      "port": 3,
+      "static": true,
+      "vlan": 0}]}]
 ])
 
 OVS_VSWITCHD_STOP
@@ -6830,7 +7878,7 @@ AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/ *[[0-9]]\{1,\}$//' | sort],
     3     0  50:54:00:00:00:07
     3     0  50:54:00:00:00:08
     3     0  50:54:00:00:00:09
- port  VLAN  MAC                Age
+ Port  VLAN  MAC                Age
 ])
 
 # Trace another ARP packet on another MAC.
@@ -6853,7 +7901,7 @@ AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/[[0-9]]\{1,\}$/?/' | sort],
     3     0  50:54:00:00:00:08    ?
     3     0  50:54:00:00:00:09    ?
     3     0  50:54:00:00:00:10    ?
- port  VLAN  MAC                Age
+ Port  VLAN  MAC                Age
 ])
 OVS_VSWITCHD_STOP
 AT_CLEANUP
@@ -6888,7 +7936,7 @@ AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/ *[[0-9]]\{1,\}$//' | sort],
     4     0  50:54:00:00:00:07
     5     0  50:54:00:00:00:08
     5     0  50:54:00:00:00:09
- port  VLAN  MAC                Age
+ Port  VLAN  MAC                Age
 ])
 
 # Now trace 16 new MACs on another port.
@@ -6919,7 +7967,7 @@ AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/ *[[0-9]]\{1,\}$//' | sort],
     6     0  50:54:00:00:0d:ff
     6     0  50:54:00:00:0e:ff
     6     0  50:54:00:00:0f:ff
- port  VLAN  MAC                Age
+ Port  VLAN  MAC                Age
 ])
 OVS_VSWITCHD_STOP
 AT_CLEANUP
@@ -6927,8 +7975,7 @@ AT_CLEANUP
 # CHECK_SFLOW_SAMPLING_PACKET(LOOPBACK_ADDR)
 #
 # Test that sFlow samples packets correctly using IPv4/IPv6 sFlow collector
-m4_define([CHECK_SFLOW_SAMPLING_PACKET],
-  [AT_XFAIL_IF([test "$IS_WIN32" = "yes"])
+m4_define([CHECK_SFLOW_SAMPLING_PACKET], [
   OVS_VSWITCHD_START([set Bridge br0 fail-mode=standalone])
 
   on_exit 'kill `cat test-sflow.pid`'
@@ -7344,11 +8391,38 @@ AT_CHECK([ovs-appctl fdb/add br0 p1 0 50:54:00:00:01:01])
 AT_CHECK([ovs-appctl fdb/add br0 p2 0 50:54:00:00:02:02])
 
 dnl Check initial fdb.
-AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/ *[[0-9]]\{1,\}$//' | grep -v port | sort], [0], [dnl
+AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/ *[[0-9]]\{1,\}$//' | grep -v Port | sort], [0], [dnl
     1     0  50:54:00:00:00:01
     1     0  50:54:00:00:01:01  static
     2     0  50:54:00:00:00:02
     2     0  50:54:00:00:02:02  static
+])
+
+dnl Check json output.
+AT_CHECK([ovs-appctl --format json --pretty fdb/show br0 \
+          | sed 's/"age": [[0-9]]*/"age": ?/g'], [0], [dnl
+[{
+  "br0": [
+    {
+      "age": ?,
+      "mac": "50:54:00:00:00:01",
+      "port": 1,
+      "vlan": 0},
+    {
+      "age": ?,
+      "mac": "50:54:00:00:00:02",
+      "port": 2,
+      "vlan": 0},
+    {
+      "mac": "50:54:00:00:01:01",
+      "port": 1,
+      "static": true,
+      "vlan": 0},
+    {
+      "mac": "50:54:00:00:02:02",
+      "port": 2,
+      "static": true,
+      "vlan": 0}]}]
 ])
 
 dnl Remove static mac entry.
@@ -7378,6 +8452,21 @@ AT_CHECK_UNQUOTED([ovs-appctl fdb/stats-show br0 | grep static], [0], [dnl
   Current static MAC entries in the table : 17
 ])
 
+dnl Check JSON output.
+AT_CHECK([ovs-appctl --format json --pretty fdb/stats-show br0], [0], [dnl
+{
+  "br0": {
+    "entries": {
+      "current": 17,
+      "maximum": 8192,
+      "static": 17},
+    "events": {
+      "evicted": 0,
+      "expired": 0,
+      "learned": 18,
+      "moved": 0}}}
+])
+
 OVS_VSWITCHD_STOP
 AT_CLEANUP
 
@@ -7394,7 +8483,7 @@ Overriding already existing dynamic entry on 1
 ])
 
 dnl Check fdb.
-AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/ *[[0-9]]\{1,\}$//' | grep -v port | sort], [0], [dnl
+AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/ *[[0-9]]\{1,\}$//' | grep -v Port | sort], [0], [dnl
     1     0  50:54:00:00:00:00  static
 ])
 
@@ -7404,7 +8493,7 @@ Overriding already existing static entry on 1
 ])
 
 dnl Check fdb.
-AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/ *[[0-9]]\{1,\}$//' | grep -v port | sort], [0], [dnl
+AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/ *[[0-9]]\{1,\}$//' | grep -v Port | sort], [0], [dnl
     2     0  50:54:00:00:00:00  static
 ])
 
@@ -7412,20 +8501,18 @@ dnl static-mac should not be converted to a dynamic one when a packet with same 
 dnl arrives on any port of the switch.
 dnl Packet arriving on p1.
 OFPROTO_TRACE([ovs-dummy], [in_port(1),eth(src=50:54:00:00:00:00)], [-generate], [100,2])
-AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/ *[[0-9]]\{1,\}$//' | grep -v port | sort], [0], [dnl
+AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/ *[[0-9]]\{1,\}$//' | grep -v Port | sort], [0], [dnl
     2     0  50:54:00:00:00:00  static
 ])
 
 dnl Packet arriving on p2.
 OFPROTO_TRACE([ovs-dummy], [in_port(2),eth(src=50:54:00:00:00:00)], [-generate], [100,1])
-AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/ *[[0-9]]\{1,\}$//' | grep -v port | sort], [0], [dnl
+AT_CHECK_UNQUOTED([ovs-appctl fdb/show br0 | sed 's/ *[[0-9]]\{1,\}$//' | grep -v Port | sort], [0], [dnl
     2     0  50:54:00:00:00:00  static
 ])
 
 dnl Check mac_move coverage counter mac_learning_static_none_move.
-AT_CHECK([ovs-appctl coverage/read-counter mac_learning_static_none_move], [0], [dnl
-1
-])
+CHECK_COVERAGE([mac_learning_static_none_move], [1])
 
 OVS_VSWITCHD_STOP
 AT_CLEANUP
@@ -7588,7 +8675,6 @@ AT_CLEANUP
 
 dnl Test sFlow LAG structures
 AT_SETUP([ofproto-dpif - sFlow packet sampling - LACP structures])
-AT_SKIP_IF([test "$IS_WIN32" = "yes"])
 OVS_VSWITCHD_START([dnl
                     add-bond br0 bond p1 p2 --                          \
                     set Port bond lacp=active bond-mode=active-backup   \
@@ -7645,7 +8731,6 @@ LACPCOUNTERS
 AT_CLEANUP
 
 AT_SETUP([ofproto-dpif - sFlow packet sampling - tunnel set])
-AT_XFAIL_IF([test "$IS_WIN32" = "yes"])
 OVS_VSWITCHD_START([set Bridge br0 fail-mode=standalone])
 
 dnl set up sFlow logging
@@ -7714,7 +8799,6 @@ OVS_VSWITCHD_STOP(["/failed to get flags for network device 127.0.0.1/d"])
 AT_CLEANUP
 
 AT_SETUP([ofproto-dpif - sFlow packet sampling - tunnel push])
-AT_XFAIL_IF([test "$IS_WIN32" = "yes"])
 
 OVS_VSWITCHD_START([add-port br0 p0 -- set Interface p0 type=dummy ofport_request=1 options:ifindex=1010])
 
@@ -7748,8 +8832,9 @@ AT_CHECK([ovs-appctl netdev-dummy/ip4addr br0 1.1.2.88/24], [0], [OK
 ])
 AT_CHECK([ovs-ofctl add-flow br0 action=normal])
 dnl Checking that a local route for added IP was successfully installed.
-AT_CHECK([ovs-appctl ovs/route/show | grep Cached], [0], [dnl
-Cached: 1.1.2.0/24 dev br0 SRC 1.1.2.88 local
+AT_CHECK([ovs-appctl ovs/route/show | grep Cached | sort], [0], [dnl
+Cached: 1.1.2.0/24 dev br0 SRC 1.1.2.88
+Cached: 1.1.2.88/32 dev br0 SRC 1.1.2.88 local
 ])
 
 dnl Prime ARP Cache for 1.1.2.92
@@ -7766,8 +8851,10 @@ AT_CHECK([ovs-appctl netdev-dummy/ip4addr br0 192.168.1.1/16], [0], [OK
 ])
 dnl Checking that a local route for added IP was successfully installed.
 AT_CHECK([ovs-appctl ovs/route/show | grep Cached | sort], [0], [dnl
-Cached: 1.1.2.0/24 dev br0 SRC 1.1.2.88 local
-Cached: 192.168.0.0/16 dev br0 SRC 192.168.1.1 local
+Cached: 1.1.2.0/24 dev br0 SRC 1.1.2.88
+Cached: 1.1.2.88/32 dev br0 SRC 1.1.2.88 local
+Cached: 192.168.0.0/16 dev br0 SRC 192.168.1.1
+Cached: 192.168.1.1/32 dev br0 SRC 192.168.1.1 local
 ])
 
 dnl add rule for int-br to force packet onto tunnel. There is no ifindex
@@ -7821,7 +8908,6 @@ OVS_VSWITCHD_STOP(["/failed to get flags for network device 127.0.0.1/d"])
 AT_CLEANUP
 
 AT_SETUP([ofproto-dpif - sFlow packet sampling - MPLS])
-AT_XFAIL_IF([test "$IS_WIN32" = "yes"])
 OVS_VSWITCHD_START
 AT_CHECK([ovs-appctl vlog/set dpif:dbg dpif_netdev:dbg])
 add_of_ports br0 1 2
@@ -8055,27 +9141,19 @@ dnl datapath level.
 AT_SETUP([ofproto-dpif - Bridge IPFIX sanity check])
 OVS_VSWITCHD_START
 dnl first revalidation triggered by add interface
-AT_CHECK([ovs-appctl coverage/read-counter rev_reconfigure], [0], [dnl
-1
-])
+CHECK_COVERAGE([rev_reconfigure], [1])
 
 add_of_ports br0 1 2 3
-AT_CHECK([ovs-appctl coverage/read-counter rev_reconfigure], [0], [dnl
-2
-])
+CHECK_COVERAGE([rev_reconfigure], [2])
 
 dnl Sample every packet using bridge-based sampling.
 AT_CHECK([ovs-vsctl -- set bridge br0 ipfix=@fix -- \
                     --id=@fix create ipfix targets=\"127.0.0.1:4739\" \
                               sampling=2], [0], [ignore])
-AT_CHECK([ovs-appctl coverage/read-counter rev_reconfigure], [0], [dnl
-3
-])
+CHECK_COVERAGE([rev_reconfigure], [3])
 
 AT_CHECK([ovs-vsctl set ipfix `ovs-vsctl get bridge br0 ipfix` sampling=1], [0])
-AT_CHECK([ovs-appctl coverage/read-counter rev_reconfigure], [0], [dnl
-4
-])
+CHECK_COVERAGE([rev_reconfigure], [4])
 dnl Send some packets that should be sampled.
 for i in `seq 1 3`; do
     AT_CHECK([ovs-appctl netdev-dummy/receive p1 'in_port(1),eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a),eth_type(0x0800)'])
@@ -8236,7 +9314,7 @@ AT_SETUP([ofproto-dpif - Flow IPFIX sanity check - tunnel set])
 OVS_VSWITCHD_START([add-port br0 p1 -- set Interface p1 type=gre \
                     options:remote_ip=1.1.1.1 options:local_ip=2.2.2.2 \
                     options:key=5 ofport_request=1\
-                    -- add-port br0 p2 -- set Interface p2 type=stt \
+                    -- add-port br0 p2 -- set Interface p2 type=geneve \
                     options:remote_ip=1.1.1.2 options:local_ip=2.2.2.3 \
                     options:key=6 ofport_request=2\
                     -- add-port br0 p3 -- set Interface p3 type=dummy \
@@ -8294,7 +9372,7 @@ AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(3),eth(src=50:54:00:00:00:
 dnl Make sure flow sample action in datapath is behind set tunnel
 dnl action at egress point of tunnel port.
 AT_CHECK([tail -1 stdout], [0], [dnl
-Datapath actions: set(tunnel(tun_id=0x5,src=2.2.2.2,dst=1.1.1.1,tos=0x1,ttl=64,flags(df|key))),userspace(pid=0,flow_sample(probability=65535,collector_set_id=1,obs_domain_id=0,obs_point_id=0,output_port=1),tunnel_out_port=1),1,set(tunnel(tun_id=0x6,src=2.2.2.3,dst=1.1.1.2,tos=0x1,ttl=64,tp_dst=7471,flags(df|key))),userspace(pid=0,flow_sample(probability=65535,collector_set_id=1,obs_domain_id=0,obs_point_id=0,output_port=7471),tunnel_out_port=7471),7471
+Datapath actions: set(tunnel(tun_id=0x5,src=2.2.2.2,dst=1.1.1.1,tos=0x1,ttl=64,flags(df|key))),userspace(pid=0,flow_sample(probability=65535,collector_set_id=1,obs_domain_id=0,obs_point_id=0,output_port=1),tunnel_out_port=1),1,set(tunnel(tun_id=0x6,src=2.2.2.3,dst=1.1.1.2,tos=0x1,ttl=64,tp_dst=6081,flags(df|key))),userspace(pid=0,flow_sample(probability=65535,collector_set_id=1,obs_domain_id=0,obs_point_id=0,output_port=6081),tunnel_out_port=6081),6081
 ])
 
 dnl Remove the flow which contains sample action.
@@ -8304,71 +9382,303 @@ AT_CHECK([ovs-vsctl destroy Flow_Sample_Collector_Set 1], [0], [ignore])
 OVS_VSWITCHD_STOP
 AT_CLEANUP
 
+AT_SETUP([ofproto-dpif - Flow IPFIX sanity check - from field])
+OVS_VSWITCHD_START
+add_of_ports br0 1 2 3
+
+AT_CHECK([ovs-vsctl -- --id=@br0 get Bridge br0 \
+                    -- --id=@ipfix create IPFIX targets=\"127.0.0.1:5500\" \
+                    -- --id=@cs create Flow_Sample_Collector_Set id=0 \
+                         bridge=@br0 ipfix=@ipfix],
+         [0], [ignore])
+
+m4_define([SAMPLE_ACTION],
+    [sample(probability=65535,collector_set_id=1,obs_domain_id=NXM_OF_IN_PORT,obs_point_id=$1)]dnl
+)
+
+dnl Store in_port in obs_domain_id and dp_hash in the obs_point_id.
+AT_DATA([flows.txt], [dnl
+priority=100,arp,action=normal
+priority=10,in_port=1,ip actions=SAMPLE_ACTION(NXM_NX_DP_HASH),2
+priority=10,in_port=2,ip actions=SAMPLE_ACTION(NXM_NX_CT_LABEL[[[0..31]]]),1
+priority=10,in_port=3,ip actions=SAMPLE_ACTION(NXM_NX_CT_LABEL[[[10..14]]]),1
+])
+AT_CHECK([ovs-ofctl add-flows br0 flows.txt], [0], [ignore])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy \
+    "in_port(1),dp_hash(45),eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a),eth_type(0x0800),\
+     ipv4(src=10.10.10.2,dst=10.10.10.1,proto=1,tos=1,ttl=128,frag=no),icmp(type=8,code=0)"], [0], [stdout])
+
+AT_CHECK([tail -2 stdout], [0], [dnl
+Megaflow: recirc_id=0,dp_hash=0x2d,eth,ip,in_port=1,nw_frag=no
+Datapath actions: userspace(pid=0,flow_sample(probability=65535,collector_set_id=1,obs_domain_id=1,obs_point_id=45,output_port=4294967295)),2
+])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy \
+    "in_port(2),ct_label(0x1234567890abcdef1234567890abcdef),\
+     eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a),eth_type(0x0800),\
+     ipv4(src=10.10.10.2,dst=10.10.10.1,proto=1,tos=1,ttl=128,frag=no),icmp(type=8,code=0)"], [0], [stdout])
+
+AT_CHECK([tail -2 stdout], [0], [dnl
+Megaflow: recirc_id=0,ct_label=0x90abcdef/0xffffffff,eth,ip,in_port=2,nw_frag=no
+Datapath actions: userspace(pid=0,flow_sample(probability=65535,collector_set_id=1,obs_domain_id=2,obs_point_id=2427178479,output_port=4294967295)),1
+])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy \
+    "in_port(3),ct_label(0x1234567890abcdef1234567890abcdef),\
+     eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a),eth_type(0x0800),\
+     ipv4(src=10.10.10.2,dst=10.10.10.1,proto=1,tos=1,ttl=128,frag=no),icmp(type=8,code=0)"], [0], [stdout])
+
+AT_CHECK([tail -2 stdout], [0], [dnl
+Megaflow: recirc_id=0,ct_label=0x4c00/0x7c00,eth,ip,in_port=3,nw_frag=no
+Datapath actions: userspace(pid=0,flow_sample(probability=65535,collector_set_id=1,obs_domain_id=3,obs_point_id=19,output_port=4294967295)),1
+])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
 AT_SETUP([ofproto-dpif - clone action])
 OVS_VSWITCHD_START
 add_of_ports br0 1 2 3 4
 
-dnl Reversible open flow clone actions, no datapath clone action should be generated.
+AT_CHECK([ovs-ofctl -O OpenFlow13 add-meter br0 \
+              'meter=1 pktps bands=type=drop rate=100'])
+
+m4_define([TRACE_PKT], [m4_join([,],
+    [in_port(1)],
+    [eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a)],
+    [eth_type(0x0800)],
+    [ipv4(src=10.10.10.2,dst=10.10.10.1,proto=1,tos=0,ttl=64,frag=no)],
+    [icmp(type=8,code=0)])])
+
+m4_define([TRACE_PKT_VLAN], [m4_join([,],
+    [in_port(1)],
+    [eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a)],
+    [eth_type(0x8100)],
+    [vlan(vid=100,pcp=0)],
+    [encap(eth_type(0x0800)],
+    [ipv4(src=10.10.10.2,dst=10.10.10.1,proto=1,tos=0,ttl=64,frag=no)],
+    [icmp(type=8,code=0))])])
+
+m4_define([CHECK_CLONE_ACTION], [
+    AT_CHECK([ovs-ofctl --bundle replace-flows br0 $1])
+    AT_CHECK([ovs-appctl ofproto/trace ovs-dummy '$2'], [0], [stdout])
+    AT_CHECK([grep Datapath stdout | sed 's/recirc(.*)/recirc(X)/'], [0], [$3])
+])
+
+dnl Reversible clone actions - not wrapped.
 AT_DATA([flows.txt], [dnl
-in_port=1, ip, actions=clone(set_field:192.168.3.3->ip_src),clone(set_field:192.168.4.4->ip_dst,output:2),clone(mod_dl_src:80:81:81:81:81:81,set_field:192.168.5.5->ip_dst,output:3),output:4
+in_port=1,ip,actions=clone(set_field:192.168.3.3->ip_src),clone(set_field:192.168.4.4->ip_dst,output:2),clone(mod_dl_src:80:81:81:81:81:81,set_field:192.168.5.5->ip_dst,output:3),output:4
 ])
-AT_CHECK([ovs-ofctl add-flows br0 flows.txt], [0], [ignore])
-
-AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(1),eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a),eth_type(0x0800),ipv4(src=10.10.10.2,dst=10.10.10.1,proto=1,tos=1,ttl=128,frag=no),icmp(type=8,code=0)'], [0], [stdout])
-
-AT_CHECK([tail -1 stdout], [0], [dnl
-Datapath actions: set(ipv4(dst=192.168.4.4)),2,set(eth(src=80:81:81:81:81:81)),set(ipv4(dst=192.168.5.5)),3,set(eth(src=50:54:00:00:00:09)),set(ipv4(dst=10.10.10.1)),4
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
+Datapath actions: set(ipv4(dst=192.168.4.4)),2,set(ipv4(dst=10.10.10.1)),set(eth(src=80:81:81:81:81:81)),set(ipv4(dst=192.168.5.5)),3,set(eth(src=50:54:00:00:00:09)),set(ipv4(dst=10.10.10.1)),4
 ])
 
-dnl Test flow xlate openflow clone action without using datapath clone action.
-AT_CHECK([ovs-appctl dpif/set-dp-features br0 clone false], [0], [ignore])
-
-AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(1),eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a),eth_type(0x0800),ipv4(src=10.10.10.2,dst=10.10.10.1,proto=1,tos=1,ttl=128,frag=no),icmp(type=8,code=0)'], [0], [stdout])
-
-AT_CHECK([tail -1 stdout], [0], [dnl
-Datapath actions: set(ipv4(dst=192.168.4.4)),2,set(eth(src=80:81:81:81:81:81)),set(ipv4(dst=192.168.5.5)),3,set(eth(src=50:54:00:00:00:09)),set(ipv4(dst=10.10.10.1)),4
-])
-
-AT_CHECK([ovs-appctl dpif/set-dp-features br0 sample_nesting 2], [0], [ignore])
-AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(1),eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a),eth_type(0x0800),ipv4(src=10.10.10.2,dst=10.10.10.1,proto=1,tos=1,ttl=128,frag=no),icmp(type=8,code=0)'], [0], [stdout])
-
-AT_CHECK([tail -1 stdout], [0], [dnl
-Datapath actions: set(ipv4(dst=192.168.4.4)),2,set(eth(src=80:81:81:81:81:81)),set(ipv4(dst=192.168.5.5)),3,set(eth(src=50:54:00:00:00:09)),set(ipv4(dst=10.10.10.1)),4
-])
-
-dnl Mixing reversible and irreversible open flow clone actions. Datapath clone action
-dnl should be generated when necessary.
-
-dnl Restore the datapath support level.
-AT_CHECK([ovs-appctl dpif/set-dp-features br0 clone true], [0], [])
-AT_CHECK([ovs-appctl dpif/set-dp-features br0 sample_nesting 10], [0], [])
-
+dnl Mixed reversible and irreversible clone actions - ct(commit) wrapped.
 AT_DATA([flows.txt], [dnl
-in_port=1, ip, actions=clone(set_field:192.168.3.3->ip_src),clone(set_field:192.168.4.4->ip_dst,output:2),clone(ct(commit),output:3),output:4
+in_port=1,ip,actions=clone(set_field:192.168.3.3->ip_src),clone(set_field:192.168.4.4->ip_dst,output:2),clone(ct(commit),output:3),output:4
 ])
-AT_CHECK([ovs-ofctl add-flows br0 flows.txt], [0], [ignore])
-
-AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(1),eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a),eth_type(0x0800),ipv4(src=10.10.10.2,dst=10.10.10.1,proto=1,tos=1,ttl=128,frag=no),icmp(type=8,code=0)'], [0], [stdout])
-
-AT_CHECK([tail -1 stdout], [0], [dnl
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
 Datapath actions: set(ipv4(dst=192.168.4.4)),2,set(ipv4(dst=10.10.10.1)),clone(ct(commit),3),4
 ])
 
-AT_CHECK([ovs-appctl dpif/set-dp-features br0 clone false], [0], [ignore])
-
-AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(1),eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a),eth_type(0x0800),ipv4(src=10.10.10.2,dst=10.10.10.1,proto=1,tos=1,ttl=128,frag=no),icmp(type=8,code=0)'], [0], [stdout])
-
-AT_CHECK([tail -1 stdout], [0], [dnl
+dnl Same, with sample() action fallback.
+AT_CHECK([ovs-appctl dpif/set-dp-features br0 clone false])
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
 Datapath actions: set(ipv4(dst=192.168.4.4)),2,set(ipv4(dst=10.10.10.1)),sample(sample=100.0%,actions(ct(commit),3)),4
 ])
 
-AT_CHECK([ovs-appctl dpif/set-dp-features br0 sample_nesting 2], [0], [ignore])
-AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(1),eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a),eth_type(0x0800),ipv4(src=10.10.10.2,dst=10.10.10.1,proto=1,tos=1,ttl=128,frag=no),icmp(type=8,code=0)'], [0], [stdout])
-
-AT_CHECK([tail -1 stdout], [0], [dnl
+dnl Same, with no clone or sample support - non-reversible actions discarded.
+AT_CHECK([ovs-appctl dpif/set-dp-features br0 sample_nesting 2])
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
 Datapath actions: set(ipv4(dst=192.168.4.4)),2,set(ipv4(dst=10.10.10.1)),4
 ])
 AT_CHECK([grep "Failed to compose clone action" stdout], [0], [ignore])
+
+dnl Direct ct_clear inside clone - wrapped; outer ct_clear still emitted.
+AT_CHECK([ovs-appctl dpif/set-dp-features br0 clone true])
+AT_CHECK([ovs-appctl dpif/set-dp-features br0 sample_nesting 10])
+AT_DATA([flows.txt], [dnl
+table=0,in_port=1,ip,actions=ct(table=1)
+table=1,in_port=1,actions=clone(ct_clear,output:2),ct_clear,output:3
+])
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
+Datapath actions: ct,recirc(X)
+Datapath actions: clone(ct_clear,2),ct_clear,3
+])
+
+dnl clone(resubmit) reaching ct_clear on tracked packet - wrapped.
+AT_DATA([flows.txt], [dnl
+table=0,in_port=1,ip,actions=ct(table=1)
+table=1,in_port=1,ip,actions=clone(resubmit(,10)),ct_clear,output:3
+table=10,ip,actions=ct_clear,output:2
+])
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
+Datapath actions: ct,recirc(X)
+Datapath actions: clone(ct_clear,2),ct_clear,3
+])
+
+dnl clone(resubmit) reaching ct(commit) - wrapped.
+AT_DATA([flows.txt], [dnl
+in_port=1,ip,actions=clone(resubmit(,10)),output:3
+table=10,ip,actions=ct(commit),output:2
+])
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
+Datapath actions: clone(ct(commit),2),3
+])
+
+dnl clone(resubmit) reaching only reversible actions - not wrapped.
+AT_DATA([flows.txt], [dnl
+in_port=1,ip,actions=clone(resubmit(,10)),output:3
+table=10,ip,actions=set_field:192.168.1.1->ip_dst,output:2
+])
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
+Datapath actions: set(ipv4(dst=192.168.1.1)),2,set(ipv4(dst=10.10.10.1)),3
+])
+
+dnl clone(resubmit) reaching meter - wrapped.
+AT_DATA([flows.txt], [dnl
+in_port=1,ip,actions=clone(resubmit(,10)),output:3
+table=10,ip,actions=meter:1,output:2
+])
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
+Datapath actions: clone(meter(0),2),3
+])
+
+dnl Non-reversible clone as last action - not wrapped.
+AT_DATA([flows.txt], [dnl
+in_port=1,ip,actions=clone(ct(commit),output:2)
+])
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
+Datapath actions: ct(commit),2
+])
+
+dnl Nested clone: inner non-reversible wrapped, outer not wrapped.
+AT_DATA([flows.txt], [dnl
+in_port=1,ip,actions=clone(clone(ct(commit),output:2),output:3),output:4
+])
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
+Datapath actions: clone(ct(commit),2),3,4
+])
+
+dnl clone(group) with non-reversible bucket - wrapped.
+AT_CHECK([ovs-ofctl -O OpenFlow13 add-group br0 \
+              'group_id=1,type=all,bucket=actions=resubmit(,10),bucket=actions=resubmit(,11)'])
+AT_DATA([flows.txt], [dnl
+in_port=1,ip,actions=clone(group:1),output:4
+table=10,ip,actions=ct(commit),output:2
+table=11,ip,actions=set_field:192.168.1.1->ip_dst,output:3
+])
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
+Datapath actions: clone(ct(commit),2,set(ipv4(dst=192.168.1.1)),3),4
+])
+
+dnl clone(group) with all reversible buckets - not wrapped.
+AT_DATA([flows.txt], [dnl
+in_port=1,ip,actions=clone(group:1),output:4
+table=10,ip,actions=set_field:192.168.2.2->ip_dst,output:2
+table=11,ip,actions=set_field:192.168.1.1->ip_dst,output:3
+])
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
+Datapath actions: set(ipv4(dst=192.168.2.2)),2,set(ipv4(dst=192.168.1.1)),3,set(ipv4(dst=10.10.10.1)),4
+])
+
+dnl clone() with check_pkt_larger, non-reversible branch - wrapped.
+AT_DATA([flows.txt], [dnl
+in_port=1,ip,actions=clone(check_pkt_larger(200)->NXM_NX_REG0[[0]],resubmit(,10)),output:3
+table=10,priority=200,reg0=0x1/0x1,ip,actions=ct(commit),output:2
+table=10,priority=100,ip,actions=output:4
+])
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
+Datapath actions: clone(check_pkt_len(size=200,gt(ct(commit),2),le(4))),3
+])
+
+dnl clone() with check_pkt_larger, only reversible branches - not wrapped.
+AT_DATA([flows.txt], [dnl
+in_port=1,ip,actions=clone(check_pkt_larger(200)->NXM_NX_REG0[[0]],resubmit(,10)),output:3
+table=10,priority=200,reg0=0x1/0x1,ip,actions=set_field:192.168.1.1->ip_dst,output:2
+table=10,priority=100,ip,actions=output:4
+])
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
+Datapath actions: check_pkt_len(size=200,gt(set(ipv4(dst=192.168.1.1)),2),le(4)),3
+])
+
+dnl Pending SET before reversible clone - commit splits SET actions.
+AT_DATA([flows.txt], [dnl
+in_port=1,ip,actions=set_field:192.168.1.1->ip_src,clone(set_field:192.168.2.2->ip_dst,output:2),output:3
+])
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
+Datapath actions: set(ipv4(src=192.168.1.1)),set(ipv4(dst=192.168.2.2)),2,set(ipv4(dst=10.10.10.1)),3
+])
+
+dnl Pending SET before non-reversible clone - commit before wrap.
+AT_DATA([flows.txt], [dnl
+in_port=1,ip,actions=set_field:192.168.1.1->ip_src,clone(ct(commit),output:2),output:3
+])
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
+Datapath actions: set(ipv4(src=192.168.1.1)),clone(ct(commit),2),3
+])
+
+dnl No pending changes before clone - commit is a no-op.
+AT_DATA([flows.txt], [dnl
+in_port=1,ip,actions=clone(set_field:192.168.2.2->ip_dst,output:2),output:3
+])
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
+Datapath actions: set(ipv4(dst=192.168.2.2)),2,set(ipv4(dst=10.10.10.1)),3
+])
+
+dnl VLAN push inside clone - not wrapped.
+AT_DATA([flows.txt], [dnl
+in_port=1,ip,actions=clone(mod_vlan_vid:100,output:2),output:3
+])
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
+Datapath actions: push_vlan(vid=100,pcp=0),2,pop_vlan,3
+])
+
+dnl VLAN pop inside clone - not wrapped.
+AT_DATA([flows.txt], [dnl
+in_port=1,ip,vlan_tci=0x1000/0x1000,actions=clone(strip_vlan,output:2),output:3
+])
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT_VLAN], [dnl
+Datapath actions: pop_vlan,2,push_vlan(vid=100,pcp=0),3
+])
+
+dnl VLAN push + ct(commit) inside clone - wrapped.
+AT_DATA([flows.txt], [dnl
+in_port=1,ip,actions=clone(mod_vlan_vid:100,ct(commit),output:2),output:3
+])
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
+Datapath actions: clone(push_vlan(vid=100,pcp=0),ct(commit),2),3
+])
+
+dnl MPLS push inside clone - not wrapped.
+AT_DATA([flows.txt], [dnl
+in_port=1,ip,actions=clone(push_mpls:0x8847,output:2),output:3
+])
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
+Datapath actions: push_mpls(label=0,tc=0,ttl=64,bos=1,eth_type=0x8847),2,pop_mpls(eth_type=0x800),3
+])
+
+dnl MPLS encap inside clone is non-reversible (add_mpls) - wrapped.
+AT_DATA([flows.txt], [dnl
+in_port=1,ip,actions=clone(encap(mpls),encap(ethernet),set_field:00:00:00:00:00:02->dl_dst,set_field:00:00:00:00:00:01->dl_src,output:2),output:3
+])
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
+Datapath actions: clone(add_mpls(label=0,tc=0,ttl=64,bos=1,eth_type=0x8847),push_eth(src=00:00:00:00:00:01,dst=00:00:00:00:00:02),2),3
+])
+
+dnl 4 nested clones via resubmit: levels 1 and 3 wrapped (ct),
+dnl levels 2 and 4 not wrapped (set+output).
+AT_DATA([flows.txt], [dnl
+table=0,in_port=1,ip,actions=clone(resubmit(,1)),output:4
+table=1,ip,actions=ct(commit),clone(resubmit(,2)),output:3
+table=2,ip,actions=set_field:192.168.1.1->ip_dst,clone(resubmit(,3)),output:2
+table=3,ip,actions=ct(commit),clone(resubmit(,4)),output:3
+table=4,ip,actions=set_field:192.168.2.2->ip_dst,output:2
+])
+CHECK_CLONE_ACTION([flows.txt], [TRACE_PKT], [dnl
+Datapath actions: clone(ct(commit),set(ipv4(dst=192.168.1.1)),clone(ct(commit),set(ipv4(dst=192.168.2.2)),2,set(ipv4(dst=192.168.1.1)),3),2,set(ipv4(dst=10.10.10.1)),3),4
+])
 
 OVS_VSWITCHD_STOP
 AT_CLEANUP
@@ -8437,10 +9747,9 @@ done
 
 AT_CHECK([ovs-appctl time/warp 1000], [0], [ignore])
 AT_CHECK([ovs-appctl revalidator/purge], [0])
-AT_CHECK([ovs-ofctl dump-flows br0], [0], [stdout])
-AT_CHECK([strip_xids < stdout | sed -n 's/duration=[[0-9]]*\.[[0-9]]*s/duration=0.0s/p' | sort], [0], [dnl
- cookie=0x0, duration=0.0s, table=0, n_packets=0, n_bytes=0, idle_age=1, icmp actions=NORMAL
- cookie=0x0, duration=0.0s, table=0, n_packets=10, n_bytes=1180, idle_age=1, ip actions=NORMAL
+AT_CHECK([ovs-ofctl dump-flows br0 | ofctl_strip | grep actions= | sort], [0], [dnl
+ icmp actions=NORMAL
+ n_packets=10, n_bytes=1180, ip actions=NORMAL
 ])
 OVS_VSWITCHD_STOP
 AT_CLEANUP
@@ -8719,10 +10028,9 @@ ovs-appctl time/warp 100
 AT_CHECK([ovs-vsctl set Open_vSwitch . other-config:n-revalidator-threads=2])
 ovs-appctl time/warp 1000
 
-AT_CHECK([ovs-ofctl dump-flows br0], [0], [stdout])
-AT_CHECK([strip_xids < stdout | sed -n 's/duration=[[0-9]]*\.[[0-9]]*s/duration=0.0s/p' | sort], [0], [dnl
- cookie=0x0, duration=0.0s, table=0, n_packets=0, n_bytes=0, idle_age=1, icmp actions=NORMAL
- cookie=0x0, duration=0.0s, table=0, n_packets=10, n_bytes=1180, idle_age=1, ip actions=NORMAL
+AT_CHECK([ovs-ofctl dump-flows br0 | ofctl_strip | grep actions= | sort], [0], [dnl
+ icmp actions=NORMAL
+ n_packets=10, n_bytes=1180, ip actions=NORMAL
 ])
 OVS_VSWITCHD_STOP
 AT_CLEANUP
@@ -8879,6 +10187,46 @@ dummy@ovs-dummy: hit:0 missed:0
     br1 65534/101: (dummy-internal)
     p3 3/3: (dummy)
 ])
+
+AT_CHECK([ovs-appctl --format json --pretty dpif/show], [0], [dnl
+[{
+  "dummy@ovs-dummy": {
+    "bridges": {
+      "br0": {
+        "br0": {
+          "ofport": "65534",
+          "port_no": "100",
+          "type": "dummy-internal"},
+        "p1": {
+          "config": {
+            "n_rxq": "1",
+            "n_txq": "1",
+            "numa_id": "0"},
+          "ofport": "1",
+          "port_no": "1",
+          "type": "dummy-pmd"},
+        "p2": {
+          "config": {
+            "n_rxq": "1",
+            "n_txq": "1",
+            "numa_id": "0"},
+          "ofport": "2",
+          "port_no": "2",
+          "type": "dummy-pmd"}},
+      "br1": {
+        "br1": {
+          "ofport": "65534",
+          "port_no": "101",
+          "type": "dummy-internal"},
+        "p3": {
+          "ofport": "3",
+          "port_no": "3",
+          "type": "dummy"}}},
+    "stats": {
+      "hit": "0",
+      "missed": "0"}}}]
+])
+
 OVS_VSWITCHD_STOP
 AT_CLEANUP
 
@@ -9030,6 +10378,7 @@ AT_CHECK([ovs-appctl upcall/disable-ufid], [0], [Datapath dumping tersely using 
 ], [])
 AT_CHECK([ovs-appctl time/stop])
 AT_CHECK([ovs-appctl vlog/set dpif:dbg dpif_netdev:dbg])
+AT_CHECK([ovs-appctl vlog/disable-rate-limit dpif])
 
 AT_CHECK([ovs-ofctl add-flow br0 actions=LOCAL,output:1,output:2])
 AT_CHECK([ovs-ofctl add-flow br1 actions=LOCAL,output:1,output:3])
@@ -9159,65 +10508,317 @@ OVS_VSWITCHD_STOP
 AT_CLEANUP
 
 
-AT_SETUP([ofproto-dpif - patch ports - meter (clone)])
-
+AT_SETUP([ofproto-dpif - patch ports - clone])
 OVS_VSWITCHD_START(
-  [add-port br0 p0 -- set Interface p0 type=dummy ofport_request=1 -- \
-   add-port br0 p1 -- set Interface p1 type=patch \
-                                       options:peer=p2 ofport_request=2 -- \
-   add-br br1 -- \
+  [add-br br1 -- \
    set bridge br1 other-config:hwaddr=aa:66:aa:66:00:00 -- \
    set bridge br1 datapath-type=dummy other-config:datapath-id=1234 \
                   fail-mode=secure -- \
-   add-port br1 p2 -- set Interface p2 type=patch \
-                                       options:peer=p1 -- \
-   add-port br1 p3 -- set Interface p3 type=dummy ofport_request=3])
+   add-port br0 pbr0 -- set Interface pbr0 type=patch \
+                         options:peer=pbr1 ofport_request=5 -- \
+   add-port br1 pbr1 -- set Interface pbr1 type=patch \
+                         options:peer=pbr0 ofport_request=6])
 
-AT_CHECK([ovs-ofctl -O OpenFlow13 add-meter br1 'meter=1 pktps stats bands=type=drop rate=2'])
-AT_CHECK([ovs-ofctl del-flows br0])
-AT_CHECK([ovs-ofctl -O OpenFlow13 add-flow br0 in_port=local,ip,actions=2,1])
-AT_CHECK([ovs-ofctl -O OpenFlow13 add-flow br1 in_port=1,ip,actions=meter:1,3])
+add_of_ports br0 1 4
+add_of_ports br1 3
 
-AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(100),eth(src=f8:bc:12:44:34:b6,dst=f8:bc:12:46:58:e0),eth_type(0x0800),ipv4(src=10.1.1.22,dst=10.0.0.3,proto=6,tos=0,ttl=64,frag=no),tcp(src=53295,dst=8080)'], [0], [stdout])
-AT_CHECK([tail -1 stdout], [0],
-  [Datapath actions: clone(meter(0),3),1
+m4_define([TRACE_PKT], [m4_join([,],
+    [in_port(1)],
+    [eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a)],
+    [eth_type(0x0800)],
+    [ipv4(src=10.10.10.2,dst=10.10.10.1,proto=1,tos=0,ttl=64,frag=no)],
+    [icmp(type=8,code=0)])])
+
+m4_define([CHECK_CLONE_ACTION], [
+    AT_CHECK([ovs-ofctl --bundle replace-flows br0 $1])
+    AT_CHECK([ovs-ofctl --bundle replace-flows br1 $2])
+    AT_CHECK([ovs-appctl ofproto/trace ovs-dummy '$3' --ct-next 'trk,est'], [0], [stdout])
+    AT_CHECK([grep Datapath stdout | sed 's/recirc(.*)/recirc(X)/'], [0], [$4])
+])
+
+dnl Meter on peer bridge - wrapped.
+AT_CHECK([ovs-ofctl -O OpenFlow13 add-meter br1 \
+              'meter=1 pktps stats bands=type=drop rate=2'])
+AT_DATA([flows-br0.txt], [dnl
+in_port=p1,ip,actions=pbr0,output:p4
+])
+AT_DATA([flows-br1.txt], [dnl
+in_port=pbr1,ip,actions=meter:1,output:p3
+])
+CHECK_CLONE_ACTION([flows-br0.txt], [flows-br1.txt], [TRACE_PKT], [dnl
+Datapath actions: clone(meter(0),3),4
+])
+
+dnl CT on peer bridge as last action - not wrapped (trailing clone unwrapped).
+AT_DATA([flows-br0.txt], [dnl
+priority=10,ip,action=push:NXM_OF_IN_PORT[],resubmit(,65),pop:NXM_OF_IN_PORT[]
+table=65,priority=10,ip,in_port=p1,action=pbr0
+])
+AT_DATA([flows-br1.txt], [dnl
+priority=100,in_port=pbr1,ip,ct_state=-trk,action=ct(table=0,zone=1)
+priority=100,in_port=pbr1,ip,ct_state=+trk+est,ct_zone=1,action=p3
+])
+CHECK_CLONE_ACTION([flows-br0.txt], [flows-br1.txt], [TRACE_PKT], [dnl
+Datapath actions: ct(zone=1),recirc(X)
+Datapath actions: 3
+])
+
+dnl Non-reversible through resubmit on peer - wrapped.
+AT_DATA([flows-br0.txt], [dnl
+in_port=p1,ip,actions=pbr0,output:p4
+])
+AT_DATA([flows-br1.txt], [dnl
+in_port=pbr1,ip,actions=resubmit(,1)
+table=1,ip,actions=ct(commit),output:p3
+])
+CHECK_CLONE_ACTION([flows-br0.txt], [flows-br1.txt], [TRACE_PKT], [dnl
+Datapath actions: clone(ct(commit),3),4
+])
+
+dnl Only reversible actions on peer - not wrapped.
+AT_DATA([flows-br1.txt], [dnl
+in_port=pbr1,ip,actions=set_field:192.168.1.1->ip_dst,output:p3
+])
+CHECK_CLONE_ACTION([flows-br0.txt], [flows-br1.txt], [TRACE_PKT], [dnl
+Datapath actions: set(ipv4(dst=192.168.1.1)),3,set(ipv4(dst=10.10.10.1)),4
+])
+
+dnl NORMAL with ct on peer, more actions after patch port - wrapped.
+AT_DATA([flows-br0.txt], [dnl
+in_port=p1,ip,actions=pbr0,output:p4
+])
+AT_DATA([flows-br1.txt], [dnl
+in_port=pbr1,ip,actions=ct(commit),normal
+])
+CHECK_CLONE_ACTION([flows-br0.txt], [flows-br1.txt], [TRACE_PKT], [dnl
+Datapath actions: clone(ct(commit),101,3),4
+])
+
+dnl NORMAL with ct on peer, patch port is the last action - not wrapped.
+AT_DATA([flows-br0.txt], [dnl
+in_port=p1,ip,actions=pbr0
+])
+CHECK_CLONE_ACTION([flows-br0.txt], [flows-br1.txt], [TRACE_PKT], [dnl
+Datapath actions: ct(commit),101,3
 ])
 
 OVS_VSWITCHD_STOP
 AT_CLEANUP
 
-AT_SETUP([ofproto-dpif - patch ports - no additional clone])
-OVS_VSWITCHD_START(
-  [add-port br0 p0 -- set Interface p0 type=dummy ofport_request=1 -- dnl
-   add-port br0 p1 -- set Interface p1 type=patch dnl
-                                       options:peer=p2 ofport_request=2 -- dnl
-   add-br br1 -- dnl
-   set bridge br1 other-config:hwaddr=aa:66:aa:66:00:00 -- dnl
-   set bridge br1 datapath-type=dummy other-config:datapath-id=1234 dnl
-                  fail-mode=secure -- dnl
-   add-port br1 p2 -- set Interface p2 type=patch dnl
-                                       options:peer=p1 -- dnl
-   add-port br1 p3 -- set Interface p3 type=dummy ofport_request=3])
+AT_SETUP([ofproto-dpif - offload - ovs-appctl dpif/offload/])
+AT_KEYWORDS([dpif-offload])
+OVS_VSWITCHD_START([add-br br1 -- set bridge br1 datapath-type=dummy])
 
-AT_DATA([flows-br0.txt], [dnl
-priority=10,tcp,action=push:NXM_OF_IN_PORT[],resubmit(,65),pop:NXM_OF_IN_PORT[]
-table=65,priority=10,ip,in_port=p0,action=p1
+AT_CHECK([ovs-appctl dpif/offload/show | sort_dpif_offload_show], [0], [dnl
+Globally enabled: false
+Datapaths:
+dummy@ovs-dummy:
+  dummy
+    rx_offload_partial   : 0
+    rx_offload_full      : 0
+    rx_offload_miss      : 0
+    rx_offload_pipe_abort: 0
+    rx_offload_partial   : 0
+    rx_offload_full      : 0
+    rx_offload_miss      : 0
+    rx_offload_pipe_abort: 0
+    rx_offload_partial   : 0
+    rx_offload_full      : 0
+    rx_offload_miss      : 0
+    rx_offload_pipe_abort: 0
+  dummy_x
+  - br0: port_no: 100
+  - br1: port_no: 101
+  - ovs-dummy: port_no: 0
 ])
 
-AT_DATA([flows-br1.txt], [dnl
-priority=100,in_port=p2,tcp,ct_state=-trk,action=ct(table=0,zone=1)
-priority=100,in_port=p2,tcp,ct_state=+trk+est,ct_zone=1,action=p3
+AT_CHECK([ovs-appctl --format json --pretty dpif/offload/show], [0], [dnl
+{
+  "dummy@ovs-dummy": {
+    "priority": [[
+      "dummy",
+      "dummy_x"]],
+    "providers": {
+      "dummy": {
+        "ports": {
+          "br0": {
+            "port_no": 100,
+            "rx_offload_full": 0,
+            "rx_offload_miss": 0,
+            "rx_offload_partial": 0,
+            "rx_offload_pipe_abort": 0},
+          "br1": {
+            "port_no": 101,
+            "rx_offload_full": 0,
+            "rx_offload_miss": 0,
+            "rx_offload_partial": 0,
+            "rx_offload_pipe_abort": 0},
+          "ovs-dummy": {
+            "port_no": 0,
+            "rx_offload_full": 0,
+            "rx_offload_miss": 0,
+            "rx_offload_partial": 0,
+            "rx_offload_pipe_abort": 0}}},
+      "dummy_x": {
+        }}},
+  "enabled": false}
 ])
 
-AT_CHECK([ovs-ofctl --bundle add-flows br0 flows-br0.txt])
-AT_CHECK([ovs-ofctl --bundle add-flows br1 flows-br1.txt])
+OVS_VSWITCHD_STOP
+AT_CLEANUP
 
-AT_CHECK([ovs-appctl ofproto/trace br0 in_port=p0,tcp --ct-next 'trk,est' | dnl
-          grep  "Datapath actions:" | grep -q clone],
-         [1], [], [],
-         [ovs-appctl ofproto/trace br0 in_port=p0,tcp --ct-next 'trk,est'])
+AT_SETUP([ofproto-dpif - offload - priority order - warning])
+AT_KEYWORDS([dpif-offload])
+OVS_VSWITCHD_START([add-br br1 -- set bridge br1 datapath-type=dummy], [], [],
+  [], [-- set Open_vSwitch . other_config:hw-offload-priority=none,dummy])
 
-OVS_TRAFFIC_VSWITCHD_STOP
+OVS_WAIT_UNTIL(
+  [grep "hw-offload-priority configuration has an unknown type; none" \
+        ovs-vswitchd.log])
+
+OVS_VSWITCHD_STOP(
+  ["/hw-offload-priority configuration has an unknown type;/d"])
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - offload - priority order])
+AT_KEYWORDS([dpif-offload])
+OVS_VSWITCHD_START([add-br br1 -- set bridge br1 datapath-type=dummy], [], [],
+  [], [-- set Open_vSwitch . other_config:hw-offload-priority=dummy_x,dummy])
+
+AT_CHECK([ovs-appctl dpif/offload/show | sort_dpif_offload_show], [0], [dnl
+Globally enabled: false
+Datapaths:
+dummy@ovs-dummy:
+  dummy_x
+    rx_offload_partial   : 0
+    rx_offload_full      : 0
+    rx_offload_miss      : 0
+    rx_offload_pipe_abort: 0
+    rx_offload_partial   : 0
+    rx_offload_full      : 0
+    rx_offload_miss      : 0
+    rx_offload_pipe_abort: 0
+    rx_offload_partial   : 0
+    rx_offload_full      : 0
+    rx_offload_miss      : 0
+    rx_offload_pipe_abort: 0
+  dummy
+  - br0: port_no: 100
+  - br1: port_no: 101
+  - ovs-dummy: port_no: 0
+])
+
+AT_CHECK([ovs-appctl --format json --pretty dpif/offload/show], [0], [dnl
+{
+  "dummy@ovs-dummy": {
+    "priority": [[
+      "dummy_x",
+      "dummy"]],
+    "providers": {
+      "dummy": {
+        },
+      "dummy_x": {
+        "ports": {
+          "br0": {
+            "port_no": 100,
+            "rx_offload_full": 0,
+            "rx_offload_miss": 0,
+            "rx_offload_partial": 0,
+            "rx_offload_pipe_abort": 0},
+          "br1": {
+            "port_no": 101,
+            "rx_offload_full": 0,
+            "rx_offload_miss": 0,
+            "rx_offload_partial": 0,
+            "rx_offload_pipe_abort": 0},
+          "ovs-dummy": {
+            "port_no": 0,
+            "rx_offload_full": 0,
+            "rx_offload_miss": 0,
+            "rx_offload_partial": 0,
+            "rx_offload_pipe_abort": 0}}}}},
+  "enabled": false}
+])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - offload - port priority order])
+AT_KEYWORDS([dpif-offload])
+OVS_VSWITCHD_START([add-port br0 p1 -- \
+  set Interface p1 type=dummy ofport_request=1 -- \
+  set Interface p1 other_config:hw-offload-priority=dummy_x,dummy -- \
+  add-port br0 p2 -- \
+  set Interface p2 type=dummy ofport_request=2 -- \
+  set Interface p2 other_config:hw-offload-priority=none -- \
+  add-port br0 p3 -- \
+  set Interface p3 type=dummy ofport_request=3 -- \
+  set Interface p3 other_config:hw-offload-priority=dummy_x -- \
+  add-port br0 p4 -- \
+  set Interface p4 type=dummy ofport_request=4 -- \
+  set Interface p4 other_config:hw-offload-priority=dummy])
+
+AT_CHECK([ovs-appctl --format json --pretty dpif/offload/show], [0], [dnl
+{
+  "dummy@ovs-dummy": {
+    "priority": [[
+      "dummy",
+      "dummy_x"]],
+    "providers": {
+      "dummy": {
+        "ports": {
+          "br0": {
+            "port_no": 100,
+            "rx_offload_full": 0,
+            "rx_offload_miss": 0,
+            "rx_offload_partial": 0,
+            "rx_offload_pipe_abort": 0},
+          "ovs-dummy": {
+            "port_no": 0,
+            "rx_offload_full": 0,
+            "rx_offload_miss": 0,
+            "rx_offload_partial": 0,
+            "rx_offload_pipe_abort": 0},
+          "p4": {
+            "port_no": 4,
+            "rx_offload_full": 0,
+            "rx_offload_miss": 0,
+            "rx_offload_partial": 0,
+            "rx_offload_pipe_abort": 0}}},
+      "dummy_x": {
+        "ports": {
+          "p1": {
+            "port_no": 1,
+            "rx_offload_full": 0,
+            "rx_offload_miss": 0,
+            "rx_offload_partial": 0,
+            "rx_offload_pipe_abort": 0},
+          "p3": {
+            "port_no": 3,
+            "rx_offload_full": 0,
+            "rx_offload_miss": 0,
+            "rx_offload_partial": 0,
+            "rx_offload_pipe_abort": 0}}}}},
+  "enabled": false}
+])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - offload - ovs-appctl dpctl/offload-stats-show])
+AT_KEYWORDS([dpif-offload])
+OVS_VSWITCHD_START([add-br br1 -- set bridge br1 datapath-type=dummy], [], [],
+  [], [-- set Open_vSwitch . other_config:hw-offload=true])
+
+AT_CHECK([ovs-appctl dpctl/offload-stats-show], [0], [dnl
+HW Offload stats:
+  dummy[[dummy@ovs-dummy]]:
+    Offloaded port count:      3
+  dummy_x[[dummy@ovs-dummy]]:
+    Offloaded port count:      0
+])
+
+OVS_VSWITCHD_STOP
 AT_CLEANUP
 
 dnl ----------------------------------------------------------------------
@@ -9472,6 +11073,45 @@ AT_CHECK([filter_flow_install < ovs-vswitchd.log | strip_xout], [0], [dnl
 recirc_id(0),in_port(7),packet_type(ns=0,id=0),eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a),eth_type(0x0800),ipv4(frag=no), actions: <del>
 recirc_id(0),in_port(7),packet_type(ns=0,id=0),eth(src=50:54:00:00:00:0b,dst=50:54:00:00:00:0c),eth_type(0x0800),ipv4(frag=no), actions: <del>
 ])
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - bond rebalance interval reconfiguration])
+OVS_VSWITCHD_START
+
+AT_CHECK([ovs-appctl time/stop])
+AT_CHECK([ovs-vsctl add-bond br0 bond0 p1 p2 bond_mode=balance-slb \
+          other-config:bond-rebalance-interval=60000 -- \
+          set interface p1 type=dummy ofport_request=1 -- \
+          set interface p2 type=dummy ofport_request=2])
+
+# TEST_NEXT_REBALANCE([num])
+# Test the next rebalance value is equal to a number.
+m4_define([TEST_NEXT_REBALANCE_EQ], [
+  AT_CHECK([ovs-appctl bond/show bond0 | grep 'next rebalance:'], [0], [stdout])
+  AT_CHECK([cat stdout], [0], [next rebalance: $1 ms
+])])
+
+
+TEST_NEXT_REBALANCE_EQ([60000])
+AT_CHECK([ovs-appctl time/warp 50000], [0], [ignore])
+TEST_NEXT_REBALANCE_EQ([10000])
+
+# Decreasing the rebalance interval to something lower than the
+# already-consumed interval should make the next rebalance value negative,
+# i.e: balance will happen ASAP.
+AT_CHECK([ovs-vsctl set Port bond0 other-config:bond-rebalance-interval=10000])
+TEST_NEXT_REBALANCE_EQ([-40000])
+AT_CHECK([ovs-appctl time/warp 1], [0], [ignore])
+TEST_NEXT_REBALANCE_EQ([10000])
+
+AT_CHECK([ovs-appctl time/warp 5000], [0], [ignore])
+TEST_NEXT_REBALANCE_EQ([5000])
+
+# Increasing the rebalance interval should offset the already consumed
+# interval.
+AT_CHECK([ovs-vsctl set Port bond0 other-config:bond-rebalance-interval=60000])
+TEST_NEXT_REBALANCE_EQ([55000])
 OVS_VSWITCHD_STOP
 AT_CLEANUP
 
@@ -9745,6 +11385,7 @@ m4_define([OFPROTO_DPIF_MEGAFLOW_DISABLED],
   [AT_SETUP([ofproto-dpif megaflow - disabled$1])
    OVS_VSWITCHD_START([], [], [], [m4_if([$1], [], [], [--dummy-numa="0,0,0,0,1,1,1,1"])])
    AT_CHECK([ovs-appctl vlog/set dpif:dbg dpif_netdev:dbg])
+   AT_CHECK([ovs-appctl vlog/disable-rate-limit dpif])
    func=`printf '%s_' "$1" | cut -c 4-`
    add_${func}of_ports br0 1 2
    AT_DATA([flows.txt], [dnl
@@ -10777,6 +12418,89 @@ AT_CHECK([ovs-appctl dpctl/dump-conntrack | sort], [], [dnl
 udp,orig=(src=10.1.1.2,dst=10.1.1.1,sport=2,dport=1),reply=(src=10.1.1.1,dst=10.1.1.2,sport=1,dport=2)
 udp,orig=(src=10.1.1.2,dst=10.1.1.1,sport=4,dport=3),reply=(src=10.1.1.1,dst=10.1.1.2,sport=3,dport=4)
 ])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - conntrack - related nat])
+OVS_VSWITCHD_START
+
+add_of_ports --pcap br0 1 2
+
+AT_DATA([flows.txt], [dnl
+table=0,priority=100,arp,action=normal
+table=0,priority=10,ip,in_port=1,udp,action=ct(commit,table=1,nat(dst=1.2.3.4:10000-10000))
+table=0,priority=10,ip,in_port=2,action=ct(nat,table=1)
+table=0,priority=1,action=drop
+table=1,priority=10,in_port=1,ct_state=+trk,action=2
+table=1,priority=10,in_port=2,ct_state=+trk,action=1
+table=1,priority=1,action=drop
+])
+
+AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
+
+dnl 1. Send and UDP packet to port 5555.
+packet1=c6f94ecb72dbe64c473528c9080045000021317040004011b138ac100001ac100002a28e15b3000d20966369616f0a
+AT_CHECK([ovs-ofctl -O OpenFlow13 packet-out br0 "in_port=1 packet=$packet1 actions=resubmit(,0)"])
+
+dnl 2. Send an fragmented ICMP related reply from 1.2.3.4:10000.
+packet2=e64c473528c9c6f94ecb72db080045c000382e87000040019b6701020304ac1000010303ad2d000000004500001c317020004011794aac10000101020304a28e2710000d8623
+AT_CHECK([ovs-ofctl -O OpenFlow13 packet-out br0 "in_port=2 packet=$packet2 actions=resubmit(,0)"])
+
+dnl 3. Check that the inner packet is translated.
+packet3=e64c473528c9c6f94ecb72db080045c000382e8700004001f35aac100002ac1000010303553a000000004500001c317020004011d13dac100001ac100002a28e15b3000def73
+OVS_WAIT_UNTIL([ovs-pcap p1-tx.pcap | grep -q "$packet3"])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - conntrack - fragmentation nat])
+OVS_VSWITCHD_START
+
+add_of_ports --pcap br0 1 2
+
+AT_DATA([flows.txt], [dnl
+table=0,priority=10,ip,in_port=1,udp,action=ct(commit,table=1,nat(dst=1.2.3.4))
+table=1,priority=10,ip,in_port=1,udp,action=2
+])
+
+AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
+
+dnl Set min frag size.
+AT_CHECK([ovs-appctl dpctl/ipf-set-min-frag v4 400], [], [dnl
+setting minimum fragment size successful
+])
+
+dnl First UDP fragment.
+AT_CHECK(dnl
+[ovs-ofctl -O OpenFlow13 packet-out br0 "in_port=1 packet=]dnl
+[c6f94ecb72dbe64c473528c9080045000204317020004011cf55ac100001ac100002a28e15b3]dnl
+[01fc31d741414141414141414141414141414141414141414141414141414141414141414141]dnl
+[4141414141414141414141414141414141414141414141414141414141414141414141414141]dnl
+[4141414141414141414141414141414141414141414141414141414141414141414141414141]dnl
+[4141414141414141414141414141414141414141414141414141414141414141414141414141]dnl
+[4141414141414141414141414141414141414141414141414141414141414141414141414141]dnl
+[4141414141414141414141414141414141414141414141414141414141414141414141414141]dnl
+[4141414141414141414141414141414141414141414141414141414141414141414141414141]dnl
+[4141414141414141414141414141414141414141414141414141414141414141414141414141]dnl
+[4141414141414141414141414141414141414141414141414141414141414141414141414141]dnl
+[4141414141414141414141414141414141414141414141414141414141414141414141414141]dnl
+[4141414141414141414141414141414141414141414141414141414141414141414141414141]dnl
+[4141414141414141414141414141414141414141414141414141414141414141414141414141]dnl
+[414141414141414141414141414141414141414141414141414141414141414141414141]dnl
+[ actions=resubmit(,0)"])
+
+dnl Second UDP fragment.
+AT_CHECK(dnl
+[ovs-ofctl -O OpenFlow13 packet-out br0 "in_port=1 packet=]dnl
+[c6f94ecb72dbe64c473528c90800450000203170003e4011f0fbac100001ac10000241414141]dnl
+[4141414141414141]dnl
+[ actions=resubmit(,0)"])
+
+dnl Validate that both IP headers now have the correct IP address and
+dnl the UDP header has the correct checksum.
+OVS_WAIT_UNTIL([ovs-pcap p2-tx.pcap | grep -q "450002043170200040117762ac10000101020304a28e15b301fcd9e3"])
+OVS_WAIT_UNTIL([ovs-pcap p2-tx.pcap | grep -q "450000203170003e40119908ac10000101020304"])
 
 OVS_VSWITCHD_STOP
 AT_CLEANUP
@@ -12021,7 +13745,7 @@ table=1,in_port=1,priority=0,ip actions=clone(set_field:192.168.3.3->ip_src),clo
 AT_CHECK([ovs-ofctl --protocols=OpenFlow10 add-flows br0 flows.txt])
 AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(1),eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a),eth_type(0x0800),ipv4(src=10.10.10.2,dst=10.10.10.1,proto=1,tos=1,ttl=128,frag=no),icmp(type=8,code=0)'], [0], [stdout])
 AT_CHECK([tail -1 stdout], [0], [dnl
-Datapath actions: check_pkt_len(size=200,gt(set(ipv4(dst=192.168.4.4)),2,set(eth(src=80:81:81:81:81:81)),set(ipv4(dst=192.168.5.5)),3,set(eth(src=50:54:00:00:00:09)),set(ipv4(dst=10.10.10.1)),4),le(set(ipv4(dst=192.168.4.4)),2,set(ipv4(dst=10.10.10.1)),clone(ct(commit),3),4))
+Datapath actions: check_pkt_len(size=200,gt(set(ipv4(dst=192.168.4.4)),2,set(ipv4(dst=10.10.10.1)),set(eth(src=80:81:81:81:81:81)),set(ipv4(dst=192.168.5.5)),3,set(eth(src=50:54:00:00:00:09)),set(ipv4(dst=10.10.10.1)),4),le(set(ipv4(dst=192.168.4.4)),2,set(ipv4(dst=10.10.10.1)),clone(ct(commit),3),4))
 ])
 
 AT_DATA([flows.txt], [dnl
@@ -12133,6 +13857,414 @@ AT_CHECK([ovs-appctl netdev-dummy/receive p1 "$flow" --len 200], [0], [stdout])
 OVS_WAIT_UNTIL([test 1 = `ovs-ofctl parse-pcap p2-tx.pcap \
 | grep dl_dst=82:82:82:82:82:82 | wc -l`])
 AT_CHECK([test 1 = `ovs-ofctl parse-pcap p2-tx.pcap | wc -l`])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - Local sampling - not supported])
+OVS_VSWITCHD_START
+add_of_ports br0 1 2
+
+AT_CHECK([ovs-vsctl -- --id=@br0 get Bridge br0 \
+                    -- create Flow_Sample_Collector_Set id=1 bridge=@br0 \
+                       local-group-id=10 \
+                    -- create Flow_Sample_Collector_Set id=2 bridge=@br0 \
+                       local-group-id=12],
+         [0], [ignore])
+
+m4_define([NOT_SUPPORTED_WARN], [dnl
+ignoring local sampling configuration: not supported by this datapath])
+
+AT_CHECK([grep -q "NOT_SUPPORTED_WARN" ovs-vswitchd.log ])
+
+AT_DATA([flows.txt], [dnl
+in_port=1 actions=sample(probability=32767,obs_domain_id=100,obs_point_id=200),2
+])
+
+AT_CHECK([ovs-ofctl --protocols=OpenFlow10 add-flows br0 flows.txt])
+
+m4_define([TRACE_PKT], [m4_join([,],
+    [in_port(1)],
+    [eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a),eth_type(0x0800)],
+    [ipv4(src=10.10.10.2,dst=10.10.10.1,proto=1,tos=1,ttl=128,frag=no)],
+    [icmp(type=8,code=0)])])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'TRACE_PKT'], [0], [stdout])
+AT_CHECK([tail -1 stdout], [0], [dnl
+Datapath actions: 2
+])
+
+OVS_VSWITCHD_STOP(["/NOT_SUPPORTED_WARN/d"])
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - Local sampling - sanity check])
+OVS_VSWITCHD_START
+add_of_ports br0 1 2 3
+
+dnl Enabling an usupported feature is dangerous but we are not sending traffic.
+AT_CHECK([ovs-appctl dpif/set-dp-features --force br0 psample true], [0], [ignore])
+
+AT_CHECK([ovs-vsctl -- --id=@br0 get Bridge br0 \
+                    -- create Flow_Sample_Collector_Set id=1 bridge=@br0 \
+                       local-group-id=42],
+         [0], [ignore])
+
+AT_DATA([flows.txt], [dnl
+in_port=1, actions=sample(probability=32767,collector_set_id=1,obs_domain_id=100,obs_point_id=200),3
+in_port=2, actions=sample(probability=32767,collector_set_id=20,obs_domain_id=100,obs_point_id=200),3
+])
+
+AT_CHECK([ovs-ofctl --protocols=OpenFlow10 add-flows br0 flows.txt])
+
+m4_define([TRACE_PKT], [m4_join([,],
+    [eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a),eth_type(0x0800)],
+    [ipv4(src=10.10.10.2,dst=10.10.10.1,proto=1,tos=1,ttl=128,frag=no)],
+    [icmp(type=8,code=0)])])
+
+dnl collector_set_id does not match.
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(2) TRACE_PKT'], [0], [stdout])
+AT_CHECK([tail -1 stdout], [0], [dnl
+Datapath actions: 3
+])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(1) TRACE_PKT'], [0], [stdout])
+AT_CHECK([tail -1 stdout], [0], [dnl
+Datapath actions: sample(sample=50.0%,actions(psample(group=42,cookie=0x64000000c8))),3
+])
+
+OVS_VSWITCHD_STOP("/Enabling an unsupported feature is very dangerous/d")
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - Local sampling - with IPFIX])
+OVS_VSWITCHD_START
+add_of_ports br0 1 2
+
+dnl Enabling an usupported feature is dangerous but we are not sending traffic.
+AT_CHECK([ovs-appctl dpif/set-dp-features --force br0 psample true], [0], [ignore])
+
+AT_CHECK([ovs-vsctl -- --id=@br0 get Bridge br0 \
+                    -- --id=@i create ipfix targets=\"127.0.0.1:4739\" \
+                    -- create Flow_Sample_Collector_Set ipfix=@i id=1 \
+                       bridge=@br0 local-group-id=42],
+         [0], [ignore])
+
+AT_DATA([flows.txt], [dnl
+in_port=1, actions=sample(probability=32767,collector_set_id=1,obs_domain_id=100,obs_point_id=200),2
+])
+
+AT_CHECK([ovs-ofctl --protocols=OpenFlow10 add-flows br0 flows.txt])
+
+m4_define([TRACE_PKT], [m4_join([,],
+    [eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a),eth_type(0x0800)],
+    [ipv4(src=10.10.10.2,dst=10.10.10.1,proto=1,tos=1,ttl=128,frag=no)],
+    [icmp(type=8,code=0)])])
+
+m4_define([EXPECTED_ACT], [m4_join([],
+    [sample(sample=50.0%,actions(],
+    [psample(group=42,cookie=0x64000000c8),],
+    [userspace(pid=0,],
+    [flow_sample(probability=32767,collector_set_id=1,obs_domain_id=100,obs_point_id=200,output_port=4294967295)],
+    [))),],
+    [2],
+)])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(1) TRACE_PKT'], [0], [stdout])
+AT_CHECK([tail -1 stdout], [0], [dnl
+Datapath actions: EXPECTED_ACT
+])
+
+OVS_VSWITCHD_STOP("/Enabling an unsupported feature is very dangerous/d")
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - Local sampling - with metered IPFIX])
+OVS_VSWITCHD_START
+add_of_ports br0 1 2
+
+dnl Enabling an usupported feature is dangerous but we are not sending traffic.
+AT_CHECK([ovs-appctl dpif/set-dp-features --force br0 psample true], [0], [ignore])
+
+AT_CHECK([ovs-vsctl -- --id=@br0 get Bridge br0 \
+                    -- --id=@i create ipfix targets=\"127.0.0.1:4739\" \
+                    -- create Flow_Sample_Collector_Set ipfix=@i id=1 \
+                       bridge=@br0 local-group-id=42],
+         [0], [ignore])
+
+AT_CHECK([ovs-ofctl -O OpenFlow13 add-meter br0 'meter=slowpath pktps stats bands=type=drop rate=2'])
+
+AT_DATA([flows.txt], [dnl
+in_port=1, actions=sample(probability=32767,collector_set_id=1,obs_domain_id=100,obs_point_id=200),2
+])
+
+AT_CHECK([ovs-ofctl --protocols=OpenFlow10 add-flows br0 flows.txt])
+
+m4_define([TRACE_PKT], [m4_join([,],
+    [eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a),eth_type(0x0800)],
+    [ipv4(src=10.10.10.2,dst=10.10.10.1,proto=1,tos=1,ttl=128,frag=no)],
+    [icmp(type=8,code=0)])])
+
+m4_define([EXPECTED_ACT], [m4_join([],
+    [sample(sample=50.0%,actions(],
+    [psample(group=42,cookie=0x64000000c8),],
+    [meter(0),],
+    [userspace(pid=0,],
+    [flow_sample(probability=32767,collector_set_id=1,obs_domain_id=100,obs_point_id=200,output_port=4294967295)],
+    [))),],
+    [2],
+)])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(1) TRACE_PKT'], [0], [stdout])
+AT_CHECK([tail -1 stdout], [0], [dnl
+Datapath actions: EXPECTED_ACT
+])
+
+OVS_VSWITCHD_STOP("/Enabling an unsupported feature is very dangerous/d")
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - Local sampling - drop])
+OVS_VSWITCHD_START
+add_of_ports br0 1 2
+
+AT_CHECK([ovs-appctl dpif/set-dp-features --force br0 psample true], [0], [ignore])
+
+AT_CHECK([ovs-vsctl -- --id=@br0 get Bridge br0 \
+                    -- create Flow_Sample_Collector_Set id=1 bridge=@br0 local-group-id=42],
+         [0], [ignore])
+
+AT_CHECK([ovs-ofctl -O OpenFlow13 add-meter br0 'meter=slowpath pktps stats bands=type=drop rate=2'])
+
+AT_DATA([flows.txt], [dnl
+in_port=1, actions=sample(probability=32767,collector_set_id=1,obs_domain_id=100,obs_point_id=200)
+in_port=2, actions=sample(probability=65535,collector_set_id=1,obs_domain_id=100,obs_point_id=200)
+])
+
+AT_CHECK([ovs-ofctl --protocols=OpenFlow10 add-flows br0 flows.txt])
+
+m4_define([TRACE_PKT], [m4_join([,],
+    [eth(src=50:54:00:00:00:09,dst=50:54:00:00:00:0a),eth_type(0x0800)],
+    [ipv4(src=10.10.10.2,dst=10.10.10.1,proto=1,tos=1,ttl=128,frag=no)],
+    [icmp(type=8,code=0)])])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(1) TRACE_PKT'], [0], [stdout])
+AT_CHECK([tail -1 stdout], [0], [dnl
+Datapath actions: sample(sample=50.0%,actions(psample(group=42,cookie=0x64000000c8)))
+])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(2) TRACE_PKT'], [0], [stdout])
+AT_CHECK([tail -1 stdout], [0], [dnl
+Datapath actions: psample(group=42,cookie=0x64000000c8)
+])
+
+AT_CHECK([ovs-vsctl set Open_vSwitch . other-config:explicit-sampled-drops=true])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(1) TRACE_PKT'], [0], [stdout])
+AT_CHECK([tail -1 stdout], [0], [dnl
+Datapath actions: sample(sample=50.0%,actions(psample(group=42,cookie=0x64000000c8))),drop
+])
+
+AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(2) TRACE_PKT'], [0], [stdout])
+AT_CHECK([tail -1 stdout], [0], [dnl
+Datapath actions: psample(group=42,cookie=0x64000000c8),drop
+])
+
+OVS_VSWITCHD_STOP("/Enabling an unsupported feature is very dangerous/d")
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - Cleanup missing datapath flows])
+
+OVS_VSWITCHD_START
+add_of_ports br0 1 2
+
+m4_define([ICMP_PKT], [m4_join([,],
+    [eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800)],
+    [ipv4(src=10.10.10.2,dst=10.10.10.1,proto=1,tos=1,ttl=128,frag=no)],
+    [icmp(type=8,code=0)])])
+
+AT_CHECK([ovs-ofctl del-flows br0])
+AT_CHECK([ovs-ofctl add-flow br0 'actions=normal' ])
+
+AT_CHECK([ovs-appctl netdev-dummy/receive p1 'ICMP_PKT'])
+
+AT_CHECK([ovs-appctl dpctl/dump-flows --names | strip_used | strip_stats | dnl
+          strip_duration | strip_dp_hash | sort], [0], [dnl
+flow-dump from the main thread:
+recirc_id(0),in_port(p1),packet_type(ns=0,id=0),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(frag=no), packets:0, bytes:0, used:never, actions:br0,p2
+])
+
+dnl Make sure the ukey exists.
+AT_CHECK([ovs-appctl upcall/show | grep '(keys' | awk '{print $3}' | \
+            grep -q '1)'], [0])
+
+dnl Delete all datapath flows, and make sure they are gone.
+AT_CHECK([ovs-appctl dpctl/del-flows])
+AT_CHECK([ovs-appctl dpctl/dump-flows --names ], [0], [])
+
+dnl Move forward in time and make sure we have at least 4 * 500ms.
+AT_CHECK([ovs-appctl time/warp 3000 300], [0], [ignore])
+
+dnl Make sure no more ukeys exists.
+AT_CHECK([ovs-appctl upcall/show | grep '(keys' | awk '{print $3}' | \
+            grep -qv '0)'], [1])
+
+dnl Verify coverage counter was hit.
+CHECK_COVERAGE([revalidate_missing_dp_flow], [1])
+
+OVS_VSWITCHD_STOP(["/failed to flow_del (No such file or directory)/d"])
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - bundle floodable flag after STP disabled])
+AT_KEYWORDS([stp bundle floodable])
+OVS_VSWITCHD_START
+
+AT_CHECK([ovs-vsctl set bridge br0 stp_enable=true])
+add_of_ports br0 1 2
+
+AT_CHECK([ovs-ofctl add-flow br0 action=NORMAL])
+
+AT_CHECK([ovs-appctl time/stop])
+
+# Give time for STP to synchronize.
+AT_CHECK([ovs-appctl time/warp 30000 3000], [0], [ignore])
+
+dnl Verify we are in forwarding state.
+AT_CHECK([ovs-appctl stp/show br0 | grep "p1.*forwarding"], [0], [ignore])
+
+AT_CHECK([ovs-vsctl set bridge br0 stp_enable=false])
+AT_CHECK([ovs-appctl stp/show])
+
+dnl Send a broadcast packet on p2, verify it floods to p1.
+AT_CHECK([ovs-appctl ofproto/trace br0 \
+          'in_port=p2,eth_src=00:00:00:00:00:01,eth_dst=ff:ff:ff:ff:ff:ff' \
+          -generate],
+         [0], [stdout])
+
+AT_CHECK([tail -1 stdout], [0], [dnl
+Datapath actions: 100,1
+])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - bundle floodable flag after RSTP disabled])
+AT_KEYWORDS([rstp bundle floodable])
+OVS_VSWITCHD_START
+
+AT_CHECK([ovs-vsctl set bridge br0 rstp_enable=true])
+add_of_ports br0 1 2
+
+AT_CHECK([ovs-ofctl add-flow br0 action=NORMAL])
+
+AT_CHECK([ovs-appctl time/stop])
+
+# Give time for RSTP to synchronize.
+AT_CHECK([ovs-appctl time/warp 5000 500], [0], [ignore])
+
+dnl Verify we are in forwarding state.
+AT_CHECK([ovs-appctl rstp/show br0 | grep "p1.*Designated"], [0], [ignore])
+
+AT_CHECK([ovs-vsctl set bridge br0 rstp_enable=false])
+AT_CHECK([ovs-appctl rstp/show])
+
+dnl Send a broadcast packet on p2, verify it floods to p1.
+AT_CHECK([ovs-appctl ofproto/trace br0 \
+          'in_port=p2,eth_src=00:00:00:00:00:01,eth_dst=ff:ff:ff:ff:ff:ff' \
+          -generate],
+         [0], [stdout])
+
+AT_CHECK([tail -1 stdout], [0], [dnl
+Datapath actions: 100,1
+])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - bundle floodable flag on internal port - STP])
+AT_KEYWORDS([stp bundle floodable])
+OVS_VSWITCHD_START
+
+add_of_ports br0 1 2 3
+AT_CHECK([ovs-vsctl set interface p1 type=internal])
+
+AT_CHECK([ovs-vsctl set bridge br0 stp_enable=true])
+AT_CHECK([ovs-ofctl add-flow br0 action=NORMAL])
+
+AT_CHECK([ovs-appctl time/stop])
+
+# Give time for STP to synchronize.
+AT_CHECK([ovs-appctl time/warp 30000 3000], [0], [ignore])
+
+dnl Verify we are in forwarding state.
+AT_CHECK([ovs-appctl stp/show br0 | grep "p2.*forwarding"], [0], [ignore])
+AT_CHECK([ovs-appctl stp/show br0 | grep "p3.*forwarding"], [0], [ignore])
+
+dnl Send a broadcast packet on p2, verify it floods to the bridge port, the
+dnl internal p1 and the dummy p3.
+AT_CHECK([ovs-appctl ofproto/trace br0 \
+          'in_port=p2,eth_src=00:00:00:00:00:01,eth_dst=ff:ff:ff:ff:ff:ff' \
+          -generate --names], [0], [stdout])
+AT_CHECK([tail -1 stdout | sed 's/Datapath actions: //' \
+            | tr "," "\n" | sort | tr "\n" ","], [0], [br0,p1,p3,])
+
+dnl Delete p3 to trigger reconfiguration.
+AT_CHECK([ovs-vsctl del-port p3])
+
+dnl Verify we are still in forwarding state.
+AT_CHECK([ovs-appctl time/warp 30000 3000], [0], [ignore])
+AT_CHECK([ovs-appctl stp/show br0 | grep "p2.*forwarding"], [0], [ignore])
+
+dnl Send a broadcast packet on p2, verify it still floods to both the bridge
+dnl port and the p1.
+AT_CHECK([ovs-appctl ofproto/trace br0 \
+          'in_port=p2,eth_src=00:00:00:00:00:01,eth_dst=ff:ff:ff:ff:ff:ff' \
+          -generate --names], [0], [stdout])
+AT_CHECK([tail -1 stdout], [0], [dnl
+Datapath actions: br0,p1
+])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - bundle floodable flag on internal port - RSTP])
+AT_KEYWORDS([rstp bundle floodable])
+OVS_VSWITCHD_START
+
+add_of_ports br0 1 2 3
+AT_CHECK([ovs-vsctl set interface p1 type=internal])
+
+AT_CHECK([ovs-vsctl set bridge br0 rstp_enable=true])
+AT_CHECK([ovs-ofctl add-flow br0 action=NORMAL])
+
+AT_CHECK([ovs-appctl time/stop])
+
+# Give time for RSTP to synchronize.
+AT_CHECK([ovs-appctl time/warp 5000 500], [0], [ignore])
+
+dnl Verify we are in forwarding state.
+AT_CHECK([ovs-appctl rstp/show br0 | grep "p2.*Designated"], [0], [ignore])
+AT_CHECK([ovs-appctl rstp/show br0 | grep "p3.*Designated"], [0], [ignore])
+
+dnl Send a broadcast packet on p2, verify it floods to the bridge port, the
+dnl internal p1 and the dummy p3.
+AT_CHECK([ovs-appctl ofproto/trace br0 \
+          'in_port=p2,eth_src=00:00:00:00:00:01,eth_dst=ff:ff:ff:ff:ff:ff' \
+          -generate --names], [0], [stdout])
+AT_CHECK([tail -1 stdout | sed 's/Datapath actions: //' \
+            | tr "," "\n" | sort | tr "\n" ","], [0], [br0,p1,p3,])
+
+dnl Delete p3 to trigger reconfiguration.
+AT_CHECK([ovs-vsctl del-port p3])
+
+dnl Verify we are still in forwarding state.
+AT_CHECK([ovs-appctl time/warp 5000 500], [0], [ignore])
+AT_CHECK([ovs-appctl rstp/show br0 | grep "p2.*Designated"], [0], [ignore])
+
+dnl Send a broadcast packet on p2, verify it still floods to both the bridge
+dnl port and the p1.
+AT_CHECK([ovs-appctl ofproto/trace br0 \
+          'in_port=p2,eth_src=00:00:00:00:00:01,eth_dst=ff:ff:ff:ff:ff:ff' \
+          -generate --names], [0], [stdout])
+AT_CHECK([tail -1 stdout], [0], [dnl
+Datapath actions: br0,p1
+])
 
 OVS_VSWITCHD_STOP
 AT_CLEANUP

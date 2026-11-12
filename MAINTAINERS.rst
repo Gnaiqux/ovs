@@ -42,21 +42,19 @@ This is the current list of active Open vSwitch committers:
    * - Name
      - Email
    * - Aaron Conole
-     - aconole@redhat.com
+     - aconole@ovn.org
    * - Alin Serdean
      - aserdean@ovn.org
    * - Ansis Atteka
      - ansisatteka@gmail.com
    * - Eelco Chaudron
-     - echaudro@redhat.com
+     - echaudron@ovn.org
    * - Ian Stokes
      - istokes@ovn.org
    * - Ilya Maximets
      - i.maximets@ovn.org
    * - Kevin Traynor
      - ktraynor@redhat.com
-   * - Russell Bryant
-     - russell@ovn.org
    * - Simon Horman
      - horms@ovn.org
    * - William Tu
@@ -93,6 +91,8 @@ More information about Emeritus Committers can be found here:
      - jpettit@ovn.org
    * - Pravin B Shelar
      - pshelar@ovn.org
+   * - Russell Bryant
+     - russell@ovn.org
    * - Thomas Graf
      - tgraf@tgraf.ch
    * - YAMAMOTO Takashi

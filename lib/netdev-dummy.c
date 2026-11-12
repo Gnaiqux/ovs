@@ -24,7 +24,6 @@
 #include "dp-packet.h"
 #include "dpif-netdev.h"
 #include "flow.h"
-#include "netdev-offload-provider.h"
 #include "netdev-provider.h"
 #include "netdev-vport.h"
 #include "odp-util.h"
@@ -141,8 +140,6 @@ struct netdev_dummy {
     struct ovs_list addrs OVS_GUARDED;
     struct ovs_list rxes OVS_GUARDED; /* List of child "netdev_rxq_dummy"s. */
 
-    struct hmap offloaded_flows OVS_GUARDED;
-
     /* The following properties are for dummy-pmd and they cannot be changed
      * when a device is running, so we remember the request and update them
      * next time netdev_dummy_reconfigure() is called. */
@@ -150,10 +147,38 @@ struct netdev_dummy {
     int requested_n_rxq OVS_GUARDED;
     int requested_numa_id OVS_GUARDED;
 
-    /* Enable netdev IP csum offload. */
-    bool ol_ip_csum OVS_GUARDED;
-    /* Flag RX packet with good csum. */
-    bool ol_ip_csum_set_good OVS_GUARDED;
+    /* Force IP Rx csum good. */
+    bool ol_ip_rx_csum_set_good OVS_GUARDED;
+    /* Force IP Rx csum bad. */
+    bool ol_ip_rx_csum_set_bad OVS_GUARDED;
+    /* Force IP Rx csum partial. */
+    bool ol_ip_rx_csum_set_partial OVS_GUARDED;
+    /* Announce netdev IP Tx csum offload. */
+    bool ol_ip_tx_csum OVS_GUARDED;
+    /* Disable IP Tx csum offload. */
+    bool ol_ip_tx_csum_disabled OVS_GUARDED;
+
+    /* Force L4 Rx csum good. */
+    bool ol_l4_rx_csum_set_good OVS_GUARDED;
+    /* Force L4 Rx csum bad. */
+    bool ol_l4_rx_csum_set_bad OVS_GUARDED;
+    /* Force L4 Rx csum partial. */
+    bool ol_l4_rx_csum_set_partial OVS_GUARDED;
+    /* Announce netdev L4 Tx csum offload. */
+    bool ol_l4_tx_csum OVS_GUARDED;
+    /* Disable L4 Tx csum offload. */
+    bool ol_l4_tx_csum_disabled OVS_GUARDED;
+
+    /* Announce netdev outer IP Tx csum offload. */
+    bool ol_out_ip_tx_csum OVS_GUARDED;
+    /* Disable outer IP Tx csum offload. */
+    bool ol_out_ip_tx_csum_disabled OVS_GUARDED;
+
+    /* Announce netdev outer UDP Tx csum offload. */
+    bool ol_out_udp_tx_csum OVS_GUARDED;
+    /* Disable outer UDP Tx csum offload. */
+    bool ol_out_udp_tx_csum_disabled OVS_GUARDED;
+
     /* Set the segment size for netdev TSO support. */
     int ol_tso_segsz OVS_GUARDED;
 };
@@ -185,8 +210,8 @@ static void dummy_packet_stream_close(struct dummy_packet_stream *);
 static void pkt_list_delete(struct ovs_list *);
 static void addr_list_delete(struct ovs_list *);
 
-static bool
-is_dummy_class(const struct netdev_class *class)
+bool
+is_dummy_netdev_class(const struct netdev_class *class)
 {
     return class->construct == netdev_dummy_construct;
 }
@@ -194,14 +219,14 @@ is_dummy_class(const struct netdev_class *class)
 static struct netdev_dummy *
 netdev_dummy_cast(const struct netdev *netdev)
 {
-    ovs_assert(is_dummy_class(netdev_get_class(netdev)));
+    ovs_assert(is_dummy_netdev_class(netdev_get_class(netdev)));
     return CONTAINER_OF(netdev, struct netdev_dummy, up);
 }
 
 static struct netdev_rxq_dummy *
 netdev_rxq_dummy_cast(const struct netdev_rxq *rx)
 {
-    ovs_assert(is_dummy_class(netdev_get_class(rx->netdev)));
+    ovs_assert(is_dummy_netdev_class(netdev_get_class(rx->netdev)));
     return CONTAINER_OF(rx, struct netdev_rxq_dummy, up);
 }
 
@@ -670,6 +695,7 @@ netdev_dummy_run(const struct netdev_class *netdev_class)
         ovs_mutex_lock(&dev->mutex);
         dummy_packet_conn_run(dev);
         ovs_mutex_unlock(&dev->mutex);
+        dummy_netdev_hw_offload_run(&dev->up);
     }
     ovs_mutex_unlock(&dummy_list_mutex);
 }
@@ -736,7 +762,6 @@ netdev_dummy_construct(struct netdev *netdev_)
 
     ovs_list_init(&netdev->rxes);
     ovs_list_init(&netdev->addrs);
-    hmap_init(&netdev->offloaded_flows);
     ovs_mutex_unlock(&netdev->mutex);
 
     ovs_mutex_lock(&dummy_list_mutex);
@@ -750,7 +775,6 @@ static void
 netdev_dummy_destruct(struct netdev *netdev_)
 {
     struct netdev_dummy *netdev = netdev_dummy_cast(netdev_);
-    struct offloaded_flow *off_flow;
 
     ovs_mutex_lock(&dummy_list_mutex);
     ovs_list_remove(&netdev->list_node);
@@ -768,10 +792,6 @@ netdev_dummy_destruct(struct netdev *netdev_)
     dummy_packet_conn_close(&netdev->conn);
     netdev->conn.type = NONE;
 
-    HMAP_FOR_EACH_POP (off_flow, node, &netdev->offloaded_flows) {
-        free(off_flow);
-    }
-    hmap_destroy(&netdev->offloaded_flows);
     addr_list_delete(&netdev->addrs);
 
     ovs_mutex_unlock(&netdev->mutex);
@@ -802,12 +822,50 @@ netdev_dummy_get_config(const struct netdev *dev, struct smap *args)
     /* pcap, rxq_pcap and tx_pcap cannot be recovered because filenames have
      * been discarded after opening file descriptors */
 
-    if (netdev->ol_ip_csum) {
-        smap_add_format(args, "ol_ip_csum", "%s", "true");
+    if (netdev->ol_ip_rx_csum_set_good) {
+        smap_add_format(args, "ol_ip_rx_csum_set_good", "%s", "true");
+    }
+    if (netdev->ol_ip_rx_csum_set_bad) {
+        smap_add_format(args, "ol_ip_rx_csum_set_bad", "%s", "true");
+    }
+    if (netdev->ol_ip_rx_csum_set_partial) {
+        smap_add_format(args, "ol_ip_rx_csum_set_partial", "%s", "true");
+    }
+    if (netdev->ol_ip_tx_csum) {
+        smap_add_format(args, "ol_ip_tx_csum", "%s", "true");
+        if (netdev->ol_ip_tx_csum_disabled) {
+            smap_add_format(args, "ol_ip_tx_csum_disabled", "%s", "true");
+        }
     }
 
-    if (netdev->ol_ip_csum_set_good) {
-        smap_add_format(args, "ol_ip_csum_set_good", "%s", "true");
+    if (netdev->ol_l4_rx_csum_set_good) {
+        smap_add_format(args, "ol_l4_rx_csum_set_good", "%s", "true");
+    }
+    if (netdev->ol_l4_rx_csum_set_bad) {
+        smap_add_format(args, "ol_l4_rx_csum_set_bad", "%s", "true");
+    }
+    if (netdev->ol_l4_rx_csum_set_partial) {
+        smap_add_format(args, "ol_l4_rx_csum_set_partial", "%s", "true");
+    }
+    if (netdev->ol_l4_tx_csum) {
+        smap_add_format(args, "ol_l4_tx_csum", "%s", "true");
+        if (netdev->ol_l4_tx_csum_disabled) {
+            smap_add_format(args, "ol_l4_tx_csum_disabled", "%s", "true");
+        }
+    }
+
+    if (netdev->ol_out_ip_tx_csum) {
+        smap_add_format(args, "ol_out_ip_tx_csum", "%s", "true");
+        if (netdev->ol_out_ip_tx_csum_disabled) {
+            smap_add_format(args, "ol_out_ip_tx_csum_disabled", "%s", "true");
+        }
+    }
+
+    if (netdev->ol_out_udp_tx_csum) {
+        smap_add_format(args, "ol_out_udp_tx_csum", "%s", "true");
+        if (netdev->ol_out_udp_tx_csum_disabled) {
+            smap_add_format(args, "ol_out_udp_tx_csum_disabled", "%s", "true");
+        }
     }
 
     if (netdev->ol_tso_segsz && userspace_tso_enabled()) {
@@ -938,11 +996,60 @@ netdev_dummy_set_config(struct netdev *netdev_, const struct smap *args,
         }
     }
 
-    netdev->ol_ip_csum_set_good = smap_get_bool(args, "ol_ip_csum_set_good",
-                                                false);
-    netdev->ol_ip_csum = smap_get_bool(args, "ol_ip_csum", false);
-    if (netdev->ol_ip_csum) {
+    netdev->ol_ip_rx_csum_set_good =
+        smap_get_bool(args, "ol_ip_rx_csum_set_good", false);
+    netdev->ol_ip_rx_csum_set_bad =
+        smap_get_bool(args, "ol_ip_rx_csum_set_bad", false);
+    netdev->ol_ip_rx_csum_set_partial =
+        smap_get_bool(args, "ol_ip_rx_csum_set_partial", false);
+    netdev->ol_ip_tx_csum = smap_get_bool(args, "ol_ip_tx_csum", false);
+    if (netdev->ol_ip_tx_csum) {
         netdev_->ol_flags |= NETDEV_TX_OFFLOAD_IPV4_CKSUM;
+        netdev->ol_ip_tx_csum_disabled =
+            smap_get_bool(args, "ol_ip_tx_csum_disabled", false);
+    } else {
+        netdev_->ol_flags &= ~NETDEV_TX_OFFLOAD_IPV4_CKSUM;
+        netdev->ol_ip_tx_csum_disabled = true;
+    }
+
+    netdev->ol_l4_rx_csum_set_good =
+        smap_get_bool(args, "ol_l4_rx_csum_set_good", false);
+    netdev->ol_l4_rx_csum_set_bad =
+        smap_get_bool(args, "ol_l4_rx_csum_set_bad", false);
+    netdev->ol_l4_rx_csum_set_partial =
+        smap_get_bool(args, "ol_l4_rx_csum_set_partial", false);
+    netdev->ol_l4_tx_csum = smap_get_bool(args, "ol_l4_tx_csum", false);
+    if (netdev->ol_l4_tx_csum) {
+        netdev_->ol_flags |= NETDEV_TX_OFFLOAD_TCP_CKSUM;
+        netdev_->ol_flags |= NETDEV_TX_OFFLOAD_UDP_CKSUM;
+        netdev->ol_l4_tx_csum_disabled =
+            smap_get_bool(args, "ol_l4_tx_csum_disabled", false);
+    } else {
+        netdev_->ol_flags &= ~NETDEV_TX_OFFLOAD_TCP_CKSUM;
+        netdev_->ol_flags &= ~NETDEV_TX_OFFLOAD_UDP_CKSUM;
+        netdev->ol_l4_tx_csum_disabled = true;
+    }
+
+    netdev->ol_out_ip_tx_csum = smap_get_bool(args, "ol_out_ip_tx_csum",
+                                              false);
+    if (netdev->ol_out_ip_tx_csum) {
+        netdev_->ol_flags |= NETDEV_TX_OFFLOAD_OUTER_IP_CKSUM;
+        netdev->ol_out_ip_tx_csum_disabled =
+            smap_get_bool(args, "ol_out_ip_tx_csum_disabled", false);
+    } else {
+        netdev_->ol_flags &= ~NETDEV_TX_OFFLOAD_OUTER_IP_CKSUM;
+        netdev->ol_out_ip_tx_csum_disabled = true;
+    }
+
+    netdev->ol_out_udp_tx_csum = smap_get_bool(args, "ol_out_udp_tx_csum",
+                                               false);
+    if (netdev->ol_out_udp_tx_csum) {
+        netdev_->ol_flags |= NETDEV_TX_OFFLOAD_OUTER_UDP_CKSUM;
+        netdev->ol_out_udp_tx_csum_disabled =
+            smap_get_bool(args, "ol_out_udp_tx_csum_disabled", false);
+    } else {
+        netdev_->ol_flags &= ~NETDEV_TX_OFFLOAD_OUTER_UDP_CKSUM;
+        netdev->ol_out_udp_tx_csum_disabled = true;
     }
 
     if (userspace_tso_enabled()) {
@@ -1131,20 +1238,53 @@ netdev_dummy_rxq_recv(struct netdev_rxq *rxq_, struct dp_packet_batch *batch,
     netdev->rxq_stats[rxq_->queue_id].bytes += dp_packet_size(packet);
     netdev->custom_stats[0].value++;
     netdev->custom_stats[1].value++;
-    if (netdev->ol_ip_csum_set_good) {
-        /* The netdev hardware sets the flag when the packet has good csum. */
-        dp_packet_ol_set_ip_csum_good(packet);
+
+    if (netdev->ol_ip_rx_csum_set_good) {
+        dp_packet_ip_checksum_set_good(packet);
+    } else if (netdev->ol_ip_rx_csum_set_bad) {
+        dp_packet_ip_checksum_set_bad(packet);
+    } else if (netdev->ol_ip_rx_csum_set_partial) {
+        dp_packet_ip_checksum_set_partial(packet);
+    } else {
+        dp_packet_ip_checksum_set_unknown(packet);
+    }
+
+    if (netdev->ol_l4_rx_csum_set_good) {
+        dp_packet_l4_checksum_set_good(packet);
+    } else if (netdev->ol_l4_rx_csum_set_bad) {
+        dp_packet_l4_checksum_set_bad(packet);
+    } else if (netdev->ol_l4_rx_csum_set_partial) {
+        dp_packet_l4_checksum_set_partial(packet);
+    } else {
+        dp_packet_l4_checksum_set_unknown(packet);
     }
 
     if (userspace_tso_enabled() && netdev->ol_tso_segsz) {
         dp_packet_set_tso_segsz(packet, netdev->ol_tso_segsz);
-        dp_packet_hwol_set_tcp_seg(packet);
-        dp_packet_hwol_set_csum_tcp(packet);
+    }
+
+    if (VLOG_IS_DBG_ENABLED()) {
+        bool ip_csum_good;
+        bool l4_csum_good;
+        bool ip_csum_bad;
+        bool l4_csum_bad;
+
+        ip_csum_good = !!(packet->offloads & DP_PACKET_OL_IP_CKSUM_GOOD);
+        ip_csum_bad = !!(packet->offloads & DP_PACKET_OL_IP_CKSUM_BAD);
+        l4_csum_good = !!(packet->offloads & DP_PACKET_OL_L4_CKSUM_GOOD);
+        l4_csum_bad = !!(packet->offloads & DP_PACKET_OL_L4_CKSUM_BAD);
+        VLOG_DBG("Rx: packet with csum IP %s, L4 %s, segsz %"PRIu16,
+                 ip_csum_good ? (ip_csum_bad ? "partial" : "good")
+                              : (ip_csum_bad ? "bad" : "unknown"),
+                 l4_csum_good ? (l4_csum_bad ? "partial" : "good")
+                              : (l4_csum_bad ? "bad" : "unknown"),
+                 dp_packet_get_tso_segsz(packet));
     }
 
     ovs_mutex_unlock(&netdev->mutex);
 
-    dp_packet_batch_init_packet(batch, packet);
+    dp_packet_batch_reset(batch);
+    dp_packet_batch_add(batch, packet);
 
     if (qfill) {
         *qfill = -ENOTSUP;
@@ -1197,11 +1337,26 @@ netdev_dummy_send(struct netdev *netdev, int qid,
     DP_PACKET_BATCH_FOR_EACH(i, packet, batch) {
         const void *buffer = dp_packet_data(packet);
         size_t size = dp_packet_size(packet);
+        uint64_t flags;
         bool is_tso;
 
         ovs_mutex_lock(&dev->mutex);
+        flags = netdev->ol_flags;
+        if (!dev->ol_ip_tx_csum_disabled) {
+            flags &= ~NETDEV_TX_OFFLOAD_IPV4_CKSUM;
+        }
+        if (!dev->ol_l4_tx_csum_disabled) {
+            flags &= ~NETDEV_TX_OFFLOAD_TCP_CKSUM;
+            flags &= ~NETDEV_TX_OFFLOAD_UDP_CKSUM;
+        }
+        if (!dev->ol_out_ip_tx_csum_disabled) {
+            flags &= ~NETDEV_TX_OFFLOAD_OUTER_IP_CKSUM;
+        }
+        if (!dev->ol_out_udp_tx_csum_disabled) {
+            flags &= ~NETDEV_TX_OFFLOAD_OUTER_UDP_CKSUM;
+        }
         is_tso = userspace_tso_enabled() && dev->ol_tso_segsz &&
-                 dp_packet_hwol_is_tso(packet);
+                 dp_packet_get_tso_segsz(packet);
         ovs_mutex_unlock(&dev->mutex);
 
         if (!dp_packet_is_eth(packet)) {
@@ -1229,10 +1384,54 @@ netdev_dummy_send(struct netdev *netdev, int qid,
             }
         }
 
-        if (dp_packet_hwol_tx_ip_csum(packet) &&
-            !dp_packet_ip_checksum_good(packet)) {
-            dp_packet_ip_set_header_csum(packet, false);
-            dp_packet_ol_set_ip_csum_good(packet);
+        if (VLOG_IS_DBG_ENABLED()) {
+            bool inner_ip_csum_good;
+            bool inner_l4_csum_good;
+            bool inner_ip_csum_bad;
+            bool inner_l4_csum_bad;
+            const char *tunnel;
+            bool ip_csum_good;
+            bool l4_csum_good;
+            bool ip_csum_bad;
+            bool l4_csum_bad;
+
+            ip_csum_good = !!(packet->offloads & DP_PACKET_OL_IP_CKSUM_GOOD);
+            ip_csum_bad = !!(packet->offloads & DP_PACKET_OL_IP_CKSUM_BAD);
+            l4_csum_good = !!(packet->offloads & DP_PACKET_OL_L4_CKSUM_GOOD);
+            l4_csum_bad = !!(packet->offloads & DP_PACKET_OL_L4_CKSUM_BAD);
+            inner_ip_csum_good =
+                !!(packet->offloads & DP_PACKET_OL_INNER_IP_CKSUM_GOOD);
+            inner_ip_csum_bad =
+                !!(packet->offloads & DP_PACKET_OL_INNER_IP_CKSUM_BAD);
+            inner_l4_csum_good =
+                !!(packet->offloads & DP_PACKET_OL_INNER_L4_CKSUM_GOOD);
+            inner_l4_csum_bad =
+                !!(packet->offloads & DP_PACKET_OL_INNER_L4_CKSUM_BAD);
+            tunnel = !dp_packet_tunnel(packet)         ? "none"
+                     : dp_packet_tunnel_vxlan(packet)  ? "vxlan"
+                     : dp_packet_tunnel_geneve(packet) ? "geneve"
+                     : "gre";
+            VLOG_DBG("Tx: packet with csum IP %s, L4 %s, tunnel %s, "
+                     "inner csum IP %s, inner L4 %s, segsz %"PRIu16,
+                     ip_csum_good ? (ip_csum_bad ? "partial" : "good")
+                                  : (ip_csum_bad ? "bad" : "unknown"),
+                     l4_csum_good ? (l4_csum_bad ? "partial" : "good")
+                                  : (l4_csum_bad ? "bad" : "unknown"),
+                     tunnel,
+                     inner_ip_csum_good
+                         ? (inner_ip_csum_bad ? "partial" : "good")
+                         : (inner_ip_csum_bad ? "bad" : "unknown"),
+                     inner_l4_csum_good
+                         ? (inner_l4_csum_bad ? "partial" : "good")
+                         : (inner_l4_csum_bad ? "bad" : "unknown"),
+                     dp_packet_get_tso_segsz(packet));
+        }
+
+        if (dp_packet_ip_checksum_partial(packet)
+            || dp_packet_l4_checksum_partial(packet)
+            || dp_packet_inner_ip_checksum_partial(packet)
+            || dp_packet_inner_l4_checksum_partial(packet)) {
+            dp_packet_ol_send_prepare(packet, flags);
         }
 
         ovs_mutex_lock(&dev->mutex);
@@ -1546,129 +1745,6 @@ netdev_dummy_update_flags(struct netdev *netdev_,
     return error;
 }
 
-/* Flow offload API. */
-static uint32_t
-netdev_dummy_flow_hash(const ovs_u128 *ufid)
-{
-    return ufid->u32[0];
-}
-
-static struct offloaded_flow *
-find_offloaded_flow(const struct hmap *offloaded_flows, const ovs_u128 *ufid)
-{
-    uint32_t hash = netdev_dummy_flow_hash(ufid);
-    struct offloaded_flow *data;
-
-    HMAP_FOR_EACH_WITH_HASH (data, node, hash, offloaded_flows) {
-        if (ovs_u128_equals(*ufid, data->ufid)) {
-            return data;
-        }
-    }
-
-    return NULL;
-}
-
-static int
-netdev_dummy_flow_put(struct netdev *netdev, struct match *match,
-                      struct nlattr *actions OVS_UNUSED,
-                      size_t actions_len OVS_UNUSED,
-                      const ovs_u128 *ufid, struct offload_info *info,
-                      struct dpif_flow_stats *stats)
-{
-    struct netdev_dummy *dev = netdev_dummy_cast(netdev);
-    struct offloaded_flow *off_flow;
-    bool modify = true;
-
-    ovs_mutex_lock(&dev->mutex);
-
-    off_flow = find_offloaded_flow(&dev->offloaded_flows, ufid);
-    if (!off_flow) {
-        /* Create new offloaded flow. */
-        off_flow = xzalloc(sizeof *off_flow);
-        memcpy(&off_flow->ufid, ufid, sizeof *ufid);
-        hmap_insert(&dev->offloaded_flows, &off_flow->node,
-                    netdev_dummy_flow_hash(ufid));
-        modify = false;
-    }
-
-    off_flow->mark = info->flow_mark;
-    memcpy(&off_flow->match, match, sizeof *match);
-
-    /* As we have per-netdev 'offloaded_flows', we don't need to match
-     * the 'in_port' for received packets. This will also allow offloading for
-     * packets passed to 'receive' command without specifying the 'in_port'. */
-    off_flow->match.wc.masks.in_port.odp_port = 0;
-
-    ovs_mutex_unlock(&dev->mutex);
-
-    if (VLOG_IS_DBG_ENABLED()) {
-        struct ds ds = DS_EMPTY_INITIALIZER;
-
-        ds_put_format(&ds, "%s: flow put[%s]: ", netdev_get_name(netdev),
-                      modify ? "modify" : "create");
-        odp_format_ufid(ufid, &ds);
-        ds_put_cstr(&ds, " flow match: ");
-        match_format(match, NULL, &ds, OFP_DEFAULT_PRIORITY);
-        ds_put_format(&ds, ", mark: %"PRIu32, info->flow_mark);
-
-        VLOG_DBG("%s", ds_cstr(&ds));
-        ds_destroy(&ds);
-    }
-
-    if (stats) {
-        memset(stats, 0, sizeof *stats);
-    }
-    return 0;
-}
-
-static int
-netdev_dummy_flow_del(struct netdev *netdev, const ovs_u128 *ufid,
-                      struct dpif_flow_stats *stats)
-{
-    struct netdev_dummy *dev = netdev_dummy_cast(netdev);
-    struct offloaded_flow *off_flow;
-    const char *error = NULL;
-    uint32_t mark;
-
-    ovs_mutex_lock(&dev->mutex);
-
-    off_flow = find_offloaded_flow(&dev->offloaded_flows, ufid);
-    if (!off_flow) {
-        error = "No such flow.";
-        goto exit;
-    }
-
-    mark = off_flow->mark;
-    hmap_remove(&dev->offloaded_flows, &off_flow->node);
-    free(off_flow);
-
-exit:
-    ovs_mutex_unlock(&dev->mutex);
-
-    if (error || VLOG_IS_DBG_ENABLED()) {
-        struct ds ds = DS_EMPTY_INITIALIZER;
-
-        ds_put_format(&ds, "%s: ", netdev_get_name(netdev));
-        if (error) {
-            ds_put_cstr(&ds, "failed to ");
-        }
-        ds_put_cstr(&ds, "flow del: ");
-        odp_format_ufid(ufid, &ds);
-        if (error) {
-            ds_put_format(&ds, " error: %s", error);
-        } else {
-            ds_put_format(&ds, " mark: %"PRIu32, mark);
-        }
-        VLOG(error ? VLL_WARN : VLL_DBG, "%s", ds_cstr(&ds));
-        ds_destroy(&ds);
-    }
-
-    if (stats) {
-        memset(stats, 0, sizeof *stats);
-    }
-    return error ? -1 : 0;
-}
-
 #define NETDEV_DUMMY_CLASS_COMMON                       \
     .run = netdev_dummy_run,                            \
     .wait = netdev_dummy_wait,                          \
@@ -1718,19 +1794,6 @@ static const struct netdev_class dummy_pmd_class = {
     .type = "dummy-pmd",
     .is_pmd = true,
     .reconfigure = netdev_dummy_reconfigure
-};
-
-static int
-netdev_dummy_offloads_init_flow_api(struct netdev *netdev)
-{
-    return is_dummy_class(netdev->netdev_class) ? 0 : EOPNOTSUPP;
-}
-
-static const struct netdev_flow_api netdev_offload_dummy = {
-    .type = "dummy",
-    .flow_put = netdev_dummy_flow_put,
-    .flow_del = netdev_dummy_flow_del,
-    .init_flow_api = netdev_dummy_offloads_init_flow_api,
 };
 
 
@@ -1814,7 +1877,7 @@ eth_from_flow_str(const char *s, size_t packet_size,
 }
 
 static void
-netdev_dummy_queue_packet__(struct netdev_rxq_dummy *rx, struct dp_packet *packet)
+netdev_dummy_rxq_enqueue(struct netdev_rxq_dummy *rx, struct dp_packet *packet)
 {
     struct pkt_list_node *pkt_node = xmalloc(sizeof *pkt_node);
 
@@ -1825,65 +1888,62 @@ netdev_dummy_queue_packet__(struct netdev_rxq_dummy *rx, struct dp_packet *packe
 }
 
 static void
-netdev_dummy_queue_packet(struct netdev_dummy *dummy, struct dp_packet *packet,
-                          struct flow *flow, int queue_id)
+netdev_dummy_queue_packet__(struct netdev_dummy *dummy,
+                            struct dp_packet *packet, int queue_id)
     OVS_REQUIRES(dummy->mutex)
 {
-    struct netdev_rxq_dummy *rx, *prev;
-    struct offloaded_flow *data;
-    struct flow packet_flow;
+    struct netdev_rxq_dummy *rx, *prev = NULL;
 
-    if (dummy->rxq_pcap) {
-        ovs_pcap_write(dummy->rxq_pcap, packet);
-    }
-
-    if (!flow) {
-        flow = &packet_flow;
-        flow_extract(packet, flow);
-    }
-    HMAP_FOR_EACH (data, node, &dummy->offloaded_flows) {
-        if (flow_equal_except(flow, &data->match.flow, &data->match.wc)) {
-
-            dp_packet_set_flow_mark(packet, data->mark);
-
-            if (VLOG_IS_DBG_ENABLED()) {
-                struct ds ds = DS_EMPTY_INITIALIZER;
-
-                ds_put_format(&ds, "%s: packet: ",
-                              netdev_get_name(&dummy->up));
-                /* 'flow' does not contain proper port number here.
-                 * Let's just clear it as it wildcarded anyway. */
-                flow->in_port.ofp_port = 0;
-                flow_format(&ds, flow, NULL);
-
-                ds_put_cstr(&ds, " matches with flow: ");
-                odp_format_ufid(&data->ufid, &ds);
-                ds_put_cstr(&ds, " ");
-                match_format(&data->match, NULL, &ds, OFP_DEFAULT_PRIORITY);
-                ds_put_format(&ds, " with mark: %"PRIu32, data->mark);
-
-                VLOG_DBG("%s", ds_cstr(&ds));
-                ds_destroy(&ds);
-            }
-            break;
-        }
-    }
-
-    prev = NULL;
     LIST_FOR_EACH (rx, node, &dummy->rxes) {
         if (rx->up.queue_id == queue_id &&
             rx->recv_queue_len < NETDEV_DUMMY_MAX_QUEUE) {
             if (prev) {
-                netdev_dummy_queue_packet__(prev, dp_packet_clone(packet));
+                netdev_dummy_rxq_enqueue(prev, dp_packet_clone(packet));
             }
             prev = rx;
         }
     }
     if (prev) {
-        netdev_dummy_queue_packet__(prev, packet);
+        netdev_dummy_rxq_enqueue(prev, packet);
     } else {
         dp_packet_delete(packet);
     }
+}
+
+static void
+netdev_dummy_queue_packet(struct netdev_dummy *dummy, struct dp_packet *packet,
+                          struct flow *flow, int queue_id)
+    OVS_REQUIRES(dummy->mutex)
+{
+    if (dummy->rxq_pcap) {
+        ovs_pcap_write(dummy->rxq_pcap, packet);
+    }
+
+    if (dummy_netdev_simulate_offload(&dummy->up, packet,
+                                                   queue_id, flow)) {
+        /* Packet was stolen for full HW offload simulation. */
+        return;
+    }
+
+    netdev_dummy_queue_packet__(dummy, packet, queue_id);
+}
+
+void netdev_dummy_queue_simulate_offload_packet(const struct netdev *netdev,
+                                                struct dp_packet *packet,
+                                                int queue_id)
+{
+    struct netdev_dummy *dummy;
+
+    if (!netdev || !is_dummy_netdev_class(netdev->netdev_class)) {
+        dp_packet_delete(packet);
+        return;
+    }
+
+    dummy = netdev_dummy_cast(netdev);
+
+    ovs_mutex_lock(&dummy->mutex);
+    netdev_dummy_queue_packet__(dummy, packet, queue_id);
+    ovs_mutex_unlock(&dummy->mutex);
 }
 
 static void
@@ -1895,7 +1955,7 @@ netdev_dummy_receive(struct unixctl_conn *conn,
     int i, k = 1, rx_qid = 0;
 
     netdev = netdev_from_name(argv[k++]);
-    if (!netdev || !is_dummy_class(netdev->netdev_class)) {
+    if (!netdev || !is_dummy_netdev_class(netdev->netdev_class)) {
         unixctl_command_reply_error(conn, "no such dummy netdev");
         goto exit_netdev;
     }
@@ -1986,7 +2046,7 @@ netdev_dummy_set_admin_state(struct unixctl_conn *conn, int argc,
 
     if (argc > 2) {
         struct netdev *netdev = netdev_from_name(argv[1]);
-        if (netdev && is_dummy_class(netdev->netdev_class)) {
+        if (netdev && is_dummy_netdev_class(netdev->netdev_class)) {
             struct netdev_dummy *dummy_dev = netdev_dummy_cast(netdev);
 
             ovs_mutex_lock(&dummy_dev->mutex);
@@ -2048,7 +2108,7 @@ netdev_dummy_conn_state(struct unixctl_conn *conn, int argc,
         const char *dev_name = argv[1];
         struct netdev *netdev = netdev_from_name(dev_name);
 
-        if (netdev && is_dummy_class(netdev->netdev_class)) {
+        if (netdev && is_dummy_netdev_class(netdev->netdev_class)) {
             struct netdev_dummy *dummy_dev = netdev_dummy_cast(netdev);
 
             ovs_mutex_lock(&dummy_dev->mutex);
@@ -2083,7 +2143,7 @@ netdev_dummy_ip4addr(struct unixctl_conn *conn, int argc OVS_UNUSED,
 {
     struct netdev *netdev = netdev_from_name(argv[1]);
 
-    if (netdev && is_dummy_class(netdev->netdev_class)) {
+    if (netdev && is_dummy_netdev_class(netdev->netdev_class)) {
         struct in_addr ip, mask;
         struct in6_addr ip6;
         uint32_t plen;
@@ -2094,9 +2154,12 @@ netdev_dummy_ip4addr(struct unixctl_conn *conn, int argc OVS_UNUSED,
             mask.s_addr = be32_prefix_mask(plen);
             netdev_dummy_add_in4(netdev, ip, mask);
 
-            /* Insert local route entry for the new address. */
             in6_addr_set_mapped_ipv4(&ip6, ip.s_addr);
-            ovs_router_force_insert(0, &ip6, plen + 96, true, argv[1],
+            /* Insert local route entry for the new address. */
+            ovs_router_force_insert(CLS_LOCAL, 0, &ip6, 32 + 96, argv[1],
+                                    &in6addr_any, &ip6);
+            /* Insert network route entry for the new address. */
+            ovs_router_force_insert(CLS_MAIN, 0, &ip6, plen + 96, argv[1],
                                     &in6addr_any, &ip6);
 
             unixctl_command_reply(conn, "OK");
@@ -2117,7 +2180,7 @@ netdev_dummy_ip6addr(struct unixctl_conn *conn, int argc OVS_UNUSED,
 {
     struct netdev *netdev = netdev_from_name(argv[1]);
 
-    if (netdev && is_dummy_class(netdev->netdev_class)) {
+    if (netdev && is_dummy_netdev_class(netdev->netdev_class)) {
         struct in6_addr ip6;
         char *error;
         uint32_t plen;
@@ -2130,7 +2193,10 @@ netdev_dummy_ip6addr(struct unixctl_conn *conn, int argc OVS_UNUSED,
             netdev_dummy_add_in6(netdev, &ip6, &mask);
 
             /* Insert local route entry for the new address. */
-            ovs_router_force_insert(0, &ip6, plen, true, argv[1],
+            ovs_router_force_insert(CLS_LOCAL, 0, &ip6, 128, argv[1],
+                                    &in6addr_any, &ip6);
+            /* Insert network route entry for the new address. */
+            ovs_router_force_insert(CLS_MAIN, 0, &ip6, plen, argv[1],
                                     &in6addr_any, &ip6);
 
             unixctl_command_reply(conn, "OK");
@@ -2202,8 +2268,6 @@ netdev_dummy_register(enum dummy_level level)
     netdev_register_provider(&dummy_class);
     netdev_register_provider(&dummy_internal_class);
     netdev_register_provider(&dummy_pmd_class);
-
-    netdev_register_flow_api_provider(&netdev_offload_dummy);
 
     netdev_vport_tunnel_register();
 }

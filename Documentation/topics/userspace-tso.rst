@@ -27,8 +27,6 @@
 Userspace Datapath - TSO
 ========================
 
-**Note:** This feature is considered experimental.
-
 TCP Segmentation Offload (TSO) enables a network stack to delegate segmentation
 of an oversized TCP segment to the underlying physical NIC. Offload of frame
 segmentation achieves computational savings in the core, freeing up CPU cycles
@@ -46,7 +44,7 @@ datasheet for compatibility. Secondly, the NIC must have an associated DPDK
 Poll Mode Driver (PMD) which supports `TSO`. For a list of features per PMD,
 refer to the `DPDK documentation`__.
 
-__ https://doc.dpdk.org/guides-23.11/nics/overview.html
+__ https://doc.dpdk.org/guides-25.11/nics/overview.html
 
 Enabling TSO
 ~~~~~~~~~~~~
@@ -105,13 +103,39 @@ then started again. OvS will then report::
    $ ovs-vsctl get interface vhost0 status:userspace-tso
    ovs-vsctl: no key "userspace-tso" in Interface record "vhost0" column status
 
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Software segmentation fallback
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+In case a `TSO` packet is transmitted over a port that does not support
+segmentation, OvS userspace datapath segments the packet in software
+(see lib/dp-packet-gso.c).
+
+This case is common for port not supporting TSO at all.
+A coverage counter exists to reflect when the software fallback helper
+is called.::
+
+   $ ovs-appctl coverage/read-counter dp_packet_gso
+   178760
+
+Another possibility is when the `TSO` packet involves a header encapsulation
+requested by OvS.
+When the tunnel encapsulation is UDP based, and checksum on the tunnel header
+is requested but the transmitting port does not support this combination,
+OvS does some partial segmentation based on the segmentation size coming
+from the receiving port.
+A coverage counter exists to reflect when this optimisation is called.::
+
+   $ ovs-appctl coverage/read-counter dp_packet_partial_gso
+   1345
+
 ~~~~~~~~~~~
 Limitations
 ~~~~~~~~~~~
 
-The current OvS userspace `TSO` implementation supports flat and VLAN networks
-only (i.e. no support for `TSO` over tunneled connection [VxLAN, GRE, IPinIP,
-etc.]).
+The current OvS userspace `TSO` implementation supports flat, VLAN networks,
+and some tunneled connections.  Currently only VxLAN, Geneve and GRE tunnels
+are supported.
 
 The NIC driver must support and advertise checksum offload for TCP and UDP.
 However, SCTP is not mandatory because very few drivers advertised support
@@ -120,11 +144,11 @@ in Open vSwitch. Currently, if the NIC supports that, then the feature is
 enabled, otherwise TSO can still be enabled but SCTP packets sent to the NIC
 will be dropped.
 
-There is no software implementation of TSO, so all ports attached to the
-datapath must support TSO or packets using that feature will be dropped
-on ports without TSO support.  That also means guests using vhost-user
-in client mode will receive TSO packet regardless of TSO being enabled
-or disabled within the guest.
+There is a limited software implementation of TSO when tunnels are used which
+only supports VxLAN, Geneve, and GRE.  When these tunnels are used with TSO,
+not all ports attached to the datapath need to support hardware TSO.
+Guests using vhost-user in client mode will receive TSO packet regardless of
+TSO being enabled or disabled within the guest.
 
 All kernel devices that use the raw socket interface (veth, for example)
 require the kernel commit 9d2f67e43b73 ("net/packet: fix packet drop as of

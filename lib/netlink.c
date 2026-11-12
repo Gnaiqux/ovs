@@ -579,6 +579,17 @@ nl_msg_put_nested(struct ofpbuf *msg,
     nl_msg_end_nested(msg, offset);
 }
 
+/* Inserts a Netlink attribute header of the given 'type' at 'offset' in
+ * 'msg', enclosing 'size' bytes of existing data as its payload. */
+void
+nl_msg_wrap_nested(struct ofpbuf *msg, uint16_t type,
+                   size_t offset, size_t size)
+{
+    struct nlattr nla = { .nla_len = NLA_HDRLEN + size, .nla_type = type };
+
+    ofpbuf_insert(msg, offset, &nla, sizeof nla);
+}
+
 /* Reset message size to offset. */
 void
 nl_msg_reset_size(struct ofpbuf *msg, size_t offset)
@@ -819,6 +830,7 @@ min_attr_len(enum nl_attr_type type)
     case NL_A_IPV6: return 16;
     case NL_A_NESTED: return 0;
     case NL_A_LL_ADDR: return 6; /* ETH_ALEN */
+    case NL_A_RTA_VIA: return 2 + 4; /* struct rtvia + struct in_addr. */
     case N_NL_ATTR_TYPES: default: OVS_NOT_REACHED();
     }
 }
@@ -840,6 +852,7 @@ max_attr_len(enum nl_attr_type type)
     case NL_A_IPV6: return 16;
     case NL_A_NESTED: return SIZE_MAX;
     case NL_A_LL_ADDR: return 20; /* INFINIBAND_ALEN */
+    case NL_A_RTA_VIA: return 2 + 16; /* struct rtvia + struct in6_addr. */
     case N_NL_ATTR_TYPES: default: OVS_NOT_REACHED();
     }
 }

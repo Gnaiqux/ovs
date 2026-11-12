@@ -18,6 +18,7 @@ import email
 import getopt
 import os
 import re
+import subprocess
 import sys
 
 RETURN_CHECK_INITIAL_STATE = 0
@@ -28,105 +29,50 @@ __errors = 0
 __warnings = 0
 empty_return_check_state = 0
 print_file_name = None
+check_authors_file = False
 checking_file = False
 total_line = 0
 colors = False
 spellcheck = False
 quiet = False
 spell_check_dict = None
+missing_authors = []
+codespell_dictionaries = ['dictionary.txt', 'dictionary_code.txt']
+__codespell_dict_reset_once = True
 
 
 def open_spell_check_dict():
     import enchant
 
+    codespell_files = []
     try:
         import codespell_lib
         codespell_dir = os.path.dirname(codespell_lib.__file__)
-        codespell_file = os.path.join(codespell_dir, 'data', 'dictionary.txt')
-        if not os.path.exists(codespell_file):
-            codespell_file = ''
+        for fn in codespell_dictionaries:
+            fn = os.path.join(codespell_dir, 'data', fn)
+            if os.path.exists(fn):
+                codespell_files.append(fn)
     except:
-        codespell_file = ''
+        pass
 
     try:
-        extra_keywords = ['ovs', 'vswitch', 'vswitchd', 'ovs-vswitchd',
-                          'netdev', 'selinux', 'ovs-ctl', 'dpctl', 'ofctl',
-                          'openvswitch', 'dpdk', 'hugepage', 'hugepages',
-                          'pmd', 'upcall', 'vhost', 'rx', 'tx', 'vhostuser',
-                          'openflow', 'qsort', 'rxq', 'txq', 'perf', 'stats',
-                          'struct', 'int', 'char', 'bool', 'upcalls', 'nicira',
-                          'bitmask', 'ipv4', 'ipv6', 'tcp', 'tcp4', 'tcpv4',
-                          'udp', 'udp4', 'udpv4', 'icmp', 'icmp4', 'icmpv6',
-                          'vlan', 'vxlan', 'cksum', 'csum', 'checksum',
-                          'ofproto', 'numa', 'mempool', 'mempools', 'mbuf',
-                          'mbufs', 'hmap', 'cmap', 'smap', 'dhcpv4', 'dhcp',
-                          'dhcpv6', 'opts', 'metadata', 'geneve', 'mutex',
-                          'netdev', 'netdevs', 'subtable', 'virtio', 'qos',
-                          'policer', 'datapath', 'tunctl', 'attr', 'ethernet',
-                          'ether', 'defrag', 'defragment', 'loopback', 'sflow',
-                          'acl', 'initializer', 'recirc', 'xlated', 'unclosed',
-                          'netlink', 'msec', 'usec', 'nsec', 'ms', 'us', 'ns',
-                          'kilobits', 'kbps', 'kilobytes', 'megabytes', 'mbps',
-                          'gigabytes', 'gbps', 'megabits', 'gigabits', 'pkts',
-                          'tuple', 'miniflow', 'megaflow', 'conntrack',
-                          'vlans', 'vxlans', 'arg', 'tpid', 'xbundle',
-                          'xbundles', 'mbundle', 'mbundles', 'netflow',
-                          'localnet', 'odp', 'pre', 'dst', 'dest', 'src',
-                          'ethertype', 'cvlan', 'ips', 'msg', 'msgs',
-                          'liveness', 'userspace', 'eventmask', 'datapaths',
-                          'slowpath', 'fastpath', 'multicast', 'unicast',
-                          'revalidation', 'namespace', 'qdisc', 'uuid',
-                          'ofport', 'subnet', 'revalidation', 'revalidator',
-                          'revalidate', 'l2', 'l3', 'l4', 'openssl', 'mtu',
-                          'ifindex', 'enum', 'enums', 'http', 'https', 'num',
-                          'vconn', 'vconns', 'conn', 'nat', 'memset', 'memcmp',
-                          'strcmp', 'strcasecmp', 'tc', 'ufid', 'api',
-                          'ofpbuf', 'ofpbufs', 'hashmaps', 'hashmap', 'deref',
-                          'dereference', 'hw', 'prio', 'sendmmsg', 'sendmsg',
-                          'malloc', 'free', 'alloc', 'pid', 'ppid', 'pgid',
-                          'uid', 'gid', 'sid', 'utime', 'stime', 'cutime',
-                          'cstime', 'vsize', 'rss', 'rsslim', 'whcan', 'gtime',
-                          'eip', 'rip', 'cgtime', 'dbg', 'gw', 'sbrec', 'bfd',
-                          'sizeof', 'pmds', 'nic', 'nics', 'hwol', 'encap',
-                          'decap', 'tlv', 'tlvs', 'decapsulation', 'fd',
-                          'cacheline', 'xlate', 'skiplist', 'idl',
-                          'comparator', 'natting', 'alg', 'pasv', 'epasv',
-                          'wildcard', 'nated', 'amd64', 'x86_64',
-                          'recirculation', 'linux', 'afxdp', 'promisc', 'goto',
-                          'misconfigured', 'misconfiguration', 'checkpatch',
-                          'debian', 'travis', 'cirrus', 'appveyor', 'faq',
-                          'erspan', 'const', 'hotplug', 'addresssanitizer',
-                          'ovsdb', 'dpif', 'veth', 'rhel', 'jsonrpc', 'json',
-                          'syscall', 'lacp', 'ipf', 'skb', 'valgrind',
-                          'appctl', 'arp', 'asan', 'backport', 'backtrace',
-                          'chmod', 'ci', 'cpu', 'cpus', 'dnat', 'dns', 'dpcls',
-                          'eol', 'ethtool', 'fdb', 'freebsd', 'gcc', 'github',
-                          'glibc', 'gre', 'inlined', 'ip', 'ipfix', 'ipsec',
-                          'ixgbe', 'libbpf', 'libcrypto', 'libgcc',
-                          'libopenvswitch', 'libreswan', 'libssl', 'libxdp',
-                          'lldp', 'llvm', 'lockless', 'mcast', 'megaflows',
-                          'mfex', 'ncat', 'networkmanager', 'pcap', 'pedit',
-                          'pidfile', 'pps', 'rculist', 'rebalance', 'rebased'
-                          'recirculations', 'revalidators', 'rst', 'sed',
-                          'shrinked', 'snat', 'stderr', 'stdout', 'testpmd',
-                          'tftp', 'timeval', 'trie', 'tso', 'ubsan', 'ukey',
-                          'umask', 'unassociated', 'unixctl', 'uuid'
-                          'virtqueue', 'vms', 'vnet', 'vport', 'vports',
-                          'vtep', 'wc', 'wget', 'xenserver']
-
         global spell_check_dict
 
         spell_check_dict = enchant.Dict("en_US")
 
-        if codespell_file:
-            with open(codespell_file) as f:
+        for fn in codespell_files:
+            with open(fn) as f:
                 for line in f.readlines():
                     words = line.strip().split('>')[1].strip(', ').split(',')
                     for word in words:
                         spell_check_dict.add_to_session(word.strip())
 
-        for kw in extra_keywords:
-            spell_check_dict.add_to_session(kw)
+        check_dict_file = os.path.join(get_top_directory(), "utilities",
+                                       "checkpatch_dict.txt")
+        if os.path.exists(check_dict_file):
+            with open(check_dict_file, "r") as project_words:
+                for check_word in project_words:
+                    spell_check_dict.add_to_session(check_word.strip())
 
         return True
     except:
@@ -212,10 +158,12 @@ __regex_has_xxx_mark = re.compile(r'.*xxx.*', re.IGNORECASE)
 __regex_added_doc_rst = re.compile(
                     r'\ndiff .*Documentation/.*rst\nnew file mode')
 __regex_empty_return = re.compile(r'\s*return;')
-__regex_if_macros = re.compile(r'^ +(%s) \([\S]([\s\S]+[\S])*\) { +\\' %
+__regex_if_macros = re.compile(r'^ +(%s) \([\S](?:[\s\S]*?[\S])?\) { +\\' %
                                __parenthesized_constructs)
 __regex_nonascii_characters = re.compile("[^\u0000-\u007f]")
 __regex_efgrep = re.compile(r'.*[ef]grep.*$')
+__regex_static_inline_c_file = re.compile(r'^\s*static\s+inline')
+__regex_always_inline = re.compile(r'\s*ALWAYS_INLINE\s*')
 
 skip_leading_whitespace_check = False
 skip_trailing_whitespace_check = False
@@ -438,15 +386,32 @@ def filter_comments(current_line, keep=False):
     return sanitized_line
 
 
-def check_spelling(line, comment):
+NOT_COMMENT = 0
+C_COMMENT = 1
+PY_COMMENT = 2
+
+
+def check_spelling(line, comment_type):
     if not spell_check_dict or not spellcheck:
         return False
 
     is_name_tag = re.compile(r'^\s*([a-z-]+-by): (.*@.*)$', re.I | re.M | re.S)
     if line.startswith('Fixes: ') or is_name_tag.match(line):
         return False
+    if comment_type == NOT_COMMENT:
+        words = line
+    elif comment_type == C_COMMENT:
+        words = filter_comments(line, True)
+    elif comment_type == PY_COMMENT:
+        words = ""
+        matched = re.search(r'#([^!].*)$', line)
+        if matched:
+            words = matched.group(1)
+        else:
+            words = line.replace("'''", '').replace('"""', '').strip()
+    else:
+        return False
 
-    words = filter_comments(line, True) if comment else line
     words = words.replace(':', ' ').split(' ')
 
     flagged_words = []
@@ -653,7 +618,11 @@ checks = [
 
     {'regex': r'(\.c|\.h)(\.in)?$', 'match_name': None,
      'prereq': lambda x: has_comment(x),
-     'check': lambda x: check_spelling(x, True)},
+     'check': lambda x: check_spelling(x, comment_type=C_COMMENT)},
+
+    {'regex': r'\.py(\.in)?$', 'match_name': None,
+     'prereq': lambda x: "#" in x or "'''" in x or '"""' in x,
+     'check': lambda x: check_spelling(x, PY_COMMENT)},
 
     {'regex': r'(\.c|\.h)(\.in)?$', 'match_name': None,
      'check': lambda x: empty_return_with_brace(x),
@@ -662,10 +631,27 @@ checks = [
      lambda: print_warning("Empty return followed by brace, consider omitting")
      },
 
+    {'regex': r'(\.c)(\.in)?$', 'match_name': None,
+     'check':
+     lambda x: __regex_static_inline_c_file.search(x) is not None and
+     __regex_always_inline.search(x) is None,
+     'print':
+     lambda: print_warning(
+         "Using 'static inline' in a c-file without ALWAYS_INLINE.")
+     },
+
     {'regex': r'(\.at|\.sh)$', 'match_name': None,
      'check': lambda x: has_efgrep(x),
      'print':
      lambda: print_error("grep -E/-F should be used instead of egrep/fgrep")},
+
+    {'regex': 'AUTHORS.rst$', 'match_name': None,
+     'check': lambda x: update_missing_authors(x),
+     'print': None},
+
+    {'regex': None, 'match_name': None,
+     'check': lambda x: 'ALLOW_EXPERIMENTAL_API' in x,
+     'print': lambda: print_error("DPDK Experimental API is not allowed")},
 ]
 
 
@@ -739,7 +725,7 @@ infix_operators = \
             '&=', '^=', '|=', '<<=', '>>=']] \
     + [r'[^<" ]<[^=" ]',
        r'[^\->" ]>[^=" ]',
-       r'[^ !()/"]\*[^/]',
+       r'[^ !()/"\*]\*+[^/]',
        r'[^ !&()"]&',
        r'[^" +(]\+[^"+;]',
        r'[^" \-(]\-[^"\->;]',
@@ -833,7 +819,7 @@ def run_file_checks(text):
 def run_subject_checks(subject, spellcheck=False):
     warnings = False
 
-    if spellcheck and check_spelling(subject, False):
+    if spellcheck and check_spelling(subject, comment_type=NOT_COMMENT):
         warnings = True
 
     summary = subject[subject.rindex(': ') + 2:]
@@ -860,9 +846,58 @@ def run_subject_checks(subject, spellcheck=False):
     return warnings
 
 
+def get_top_directory():
+    result = subprocess.run('git rev-parse --show-toplevel',
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, shell=True)
+
+    if result and result.returncode == 0:
+        return result.stdout.decode('utf-8').strip()
+
+    return os.getenv('OVS_SRC_DIR', '.')
+
+
+def update_missing_authors(diffed_line):
+    global missing_authors
+    for author in missing_authors:
+        m = re.search(r'<(.*?)>', author)
+        if not m:
+            continue
+        pattern = r'\b' + re.escape(m.group(1)) + r'\b'
+        if re.search(pattern, diffed_line) is None:
+            continue
+        else:
+            missing_authors.remove(author)
+
+    return False
+
+
+def do_authors_exist(authors):
+    authors = list(set(authors))
+    missing_authors = []
+
+    try:
+        authors_file = get_top_directory() + "/AUTHORS.rst"
+        with open(authors_file, "r", encoding="utf-8") as file:
+            file_content = file.read()
+            for author in authors:
+                m = re.search(r'<(.*?)>', author)
+                if not m:
+                    continue
+                pattern = r'\b' + re.escape(m.group(1)) + r'\b'
+                if re.search(pattern, file_content) is None:
+                    missing_authors.append(author)
+
+    except FileNotFoundError:
+        print_error("Could not open AUTHORS.rst in '%s/'!" %
+                    get_top_directory())
+
+    return missing_authors
+
+
 def ovs_checkpatch_parse(text, filename, author=None, committer=None):
     global print_file_name, total_line, checking_file, \
-        empty_return_check_state
+        empty_return_check_state, missing_authors
 
     PARSE_STATE_HEADING = 0
     PARSE_STATE_DIFF_HEADER = 1
@@ -977,6 +1012,11 @@ def ovs_checkpatch_parse(text, filename, author=None, committer=None):
                                       "who are not authors or co-authors or "
                                       "committers: %s"
                                       % ", ".join(extra_sigs))
+
+                if check_authors_file:
+                    missing_authors = do_authors_exist(missing_authors +
+                                                       co_authors + [author])
+
             elif is_committer.match(line):
                 committer = is_committer.match(line).group(2)
             elif is_author.match(line):
@@ -1002,7 +1042,7 @@ def ovs_checkpatch_parse(text, filename, author=None, committer=None):
                             '--abbrev=12 COMMIT_REF\n')
                 print("%d: %s\n" % (lineno, line))
             elif spellcheck:
-                check_spelling(line, False)
+                check_spelling(line, comment_type=NOT_COMMENT)
             for typo, correct in tags_typos.items():
                 m = re.match(typo, line, re.I)
                 if m:
@@ -1033,18 +1073,13 @@ def ovs_checkpatch_parse(text, filename, author=None, committer=None):
                 interim_line_check(current_file, cmp_line, lineno)
                 continue
 
-            # Skip files which have /datapath in them, since they are
-            # linux or windows coding standards
-            if current_file.startswith('datapath'):
-                continue
+            # Linux headers use Linux kernel coding style for the most part.
             if current_file.startswith('include/linux'):
                 continue
             # "sparse" includes could be copy-pasted from different sources
             # like DPDK or Linux and could contain workarounds not suitable
             # for a common style.
             if current_file.startswith('include/sparse'):
-                continue
-            if current_file.startswith('utilities/bugtool'):
                 continue
             run_checks(current_file, cmp_line, lineno)
 
@@ -1067,7 +1102,10 @@ Input options:
 
 Check options:
 -h|--help                      This help message
+-a|--check-authors-file        Check AUTHORS file for existence of the authors.
+                               Should be used by commiters only!
 -b|--skip-block-whitespace     Skips the if/while/for whitespace tests
+-D|--dictionaries DICTIONARY   Specify codespell dictionaries.
 -l|--skip-leading-whitespace   Skips the leading whitespace test
 -q|--quiet                     Only print error and warning information
 -s|--skip-signoff-lines        Tolerate missing Signed-off-by line
@@ -1087,6 +1125,19 @@ def ovs_checkpatch_print_result():
               (total_line, __warnings, __errors))
     elif not quiet:
         print("Lines checked: %d, no obvious problems found\n" % (total_line))
+
+
+def ovs_checkpatch_print_missing_authors():
+    if missing_authors:
+        if len(missing_authors) == 1:
+            print_warning("Author '%s' is not in the AUTHORS.rst file!"
+                          % missing_authors[0])
+        else:
+            print_warning("Authors '%s' are not in the AUTHORS.rst file!"
+                          % ', '.join(missing_authors))
+        return True
+
+    return False
 
 
 def ovs_checkpatch_file(filename):
@@ -1109,13 +1160,21 @@ def ovs_checkpatch_file(filename):
         else:
             mail.add_header('Subject', sys.argv[-1])
 
-        print("Subject missing! Your provisional subject is",
-              mail['Subject'])
+        if not checking_file:
+            print("Subject missing! Your provisional subject is",
+                  mail['Subject'])
 
-    if run_subject_checks('Subject: ' + mail['Subject'], spellcheck):
+    subject = ' '.join(mail['Subject'].split())
+    subject = re.sub(r'^\[(PATCH|RFC)[^\]]*\]\s*', '', subject)
+    mail.replace_header('Subject', subject)
+
+    if not checking_file and run_subject_checks('Subject: ' + mail['Subject'],
+                                                spellcheck):
         result = True
 
     ovs_checkpatch_print_result()
+    if ovs_checkpatch_print_missing_authors():
+        result = True
     return result
 
 
@@ -1138,9 +1197,11 @@ if __name__ == '__main__':
                                           sys.argv[1:])
         n_patches = int(numeric_options[-1][1:]) if numeric_options else 0
 
-        optlist, args = getopt.getopt(args, 'bhlstfSq',
+        optlist, args = getopt.getopt(args, 'abD:hlstfSq',
                                       ["check-file",
                                        "help",
+                                       "check-authors-file",
+                                       "dictionaries=",
                                        "skip-block-whitespace",
                                        "skip-leading-whitespace",
                                        "skip-signoff-lines",
@@ -1157,6 +1218,13 @@ if __name__ == '__main__':
         if o in ("-h", "--help"):
             usage()
             sys.exit(0)
+        elif o in ("-a", "--check-authors-file"):
+            check_authors_file = True
+        elif o in ("-D", "--dictionaries"):
+            if __codespell_dict_reset_once:
+                __codespell_dict_reset_once = False
+                codespell_dictionaries = []
+            codespell_dictionaries.append(a)
         elif o in ("-b", "--skip-block-whitespace"):
             skip_block_whitespace_check = True
         elif o in ("-l", "--skip-leading-whitespace"):
@@ -1172,11 +1240,7 @@ if __name__ == '__main__':
         elif o in ("-f", "--check-file"):
             checking_file = True
         elif o in ("-S", "--spellcheck"):
-            if not open_spell_check_dict():
-                print("WARNING: The enchant library isn't available.")
-                print("         Please install python enchant.")
-            else:
-                spellcheck = True
+            spellcheck = True
         elif o in ("-q", "--quiet"):
             quiet = True
         else:
@@ -1185,6 +1249,11 @@ if __name__ == '__main__':
 
     if sys.stdout.isatty():
         colors = True
+
+    if spellcheck and not open_spell_check_dict():
+        print("WARNING: The enchant library isn't available.")
+        print("         Please install python enchant.")
+        spellcheck = False
 
     if n_patches:
         status = 0
@@ -1207,9 +1276,10 @@ Subject: %s
             if not quiet:
                 print('== Checking %s ("%s") ==' % (revision[0:12], name))
             result = ovs_checkpatch_parse(patch, revision)
-            ovs_checkpatch_print_result()
             if result:
                 status = EXIT_FAILURE
+        if ovs_checkpatch_print_missing_authors():
+            status = EXIT_FAILURE
         sys.exit(status)
 
     if not args:
@@ -1218,6 +1288,8 @@ Subject: %s
             sys.exit(EXIT_FAILURE)
         result = ovs_checkpatch_parse(sys.stdin.read(), '-')
         ovs_checkpatch_print_result()
+        if ovs_checkpatch_print_missing_authors():
+            result = EXIT_FAILURE
         sys.exit(result)
 
     status = 0

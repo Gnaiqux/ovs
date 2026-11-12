@@ -24,9 +24,11 @@
 #include "cmap.h"
 #include "lib/dpif-provider.h"
 #include "dpif.h"
+#include "dpif-offload.h"
 #include "openvswitch/dynamic-string.h"
 #include "fail-open.h"
 #include "guarded-list.h"
+#include "openvswitch/json.h"
 #include "latch.h"
 #include "openvswitch/list.h"
 #include "netlink.h"
@@ -57,6 +59,7 @@ COVERAGE_DEFINE(dumped_inconsistent_flow);
 COVERAGE_DEFINE(dumped_new_flow);
 COVERAGE_DEFINE(handler_duplicate_upcall);
 COVERAGE_DEFINE(revalidate_missed_dp_flow);
+COVERAGE_DEFINE(revalidate_missing_dp_flow);
 COVERAGE_DEFINE(ukey_dp_change);
 COVERAGE_DEFINE(ukey_invalid_stat_reset);
 COVERAGE_DEFINE(ukey_replace_contention);
@@ -229,6 +232,8 @@ struct upcall {
     uint16_t mru;                  /* If !0, Maximum receive unit of
                                       fragmented IP packet */
     uint64_t hash;
+    uint32_t pid;                  /* Socket PID this upcall was received from,
+                                    * or zero. */
 
     enum upcall_type type;         /* Type of the upcall. */
     const struct nlattr *actions;  /* Flow actions in DPIF_UC_ACTION Upcalls. */
@@ -284,6 +289,7 @@ enum flow_del_reason {
     FDR_TOO_EXPENSIVE,      /* Too expensive to revalidate. */
     FDR_UPDATE_FAIL,        /* Datapath update failed. */
     FDR_XLATION_ERROR,      /* Flow translation error. */
+    FDR_FLOW_MISSING_DP,    /* Flow is missing from the datapath. */
 };
 
 /* 'udpif_key's are responsible for tracking the little bit of state udpif
@@ -318,6 +324,7 @@ struct udpif_key {
     uint64_t dump_seq OVS_GUARDED;            /* Tracks udpif->dump_seq. */
     uint64_t reval_seq OVS_GUARDED;           /* Tracks udpif->reval_seq. */
     enum ukey_state state OVS_GUARDED;        /* Tracks ukey lifetime. */
+    uint32_t missed_dumps OVS_GUARDED;        /* Missed consecutive dumps. */
 
     /* 'state' debug information. */
     unsigned int state_thread OVS_GUARDED;    /* Thread that transitions. */
@@ -383,6 +390,7 @@ static void upcall_unixctl_disable_ufid(struct unixctl_conn *, int argc,
                                               const char *argv[], void *aux);
 static void upcall_unixctl_enable_ufid(struct unixctl_conn *, int argc,
                                              const char *argv[], void *aux);
+
 static void upcall_unixctl_set_flow_limit(struct unixctl_conn *conn, int argc,
                                             const char *argv[], void *aux);
 static void upcall_unixctl_dump_wait(struct unixctl_conn *conn, int argc,
@@ -393,6 +401,9 @@ static void upcall_unixctl_pause(struct unixctl_conn *conn, int argc,
                                  const char *argv[], void *aux);
 static void upcall_unixctl_resume(struct unixctl_conn *conn, int argc,
                                   const char *argv[], void *aux);
+
+static void upcall_unixctl_ofproto_detrace(struct unixctl_conn *, int argc,
+                                           const char *argv[], void *aux);
 
 static struct udpif_key *ukey_create_from_upcall(struct upcall *,
                                                  struct flow_wildcards *);
@@ -470,6 +481,8 @@ udpif_init(void)
                                  upcall_unixctl_pause, NULL);
         unixctl_command_register("revalidator/resume", NULL, 0, 0,
                                  upcall_unixctl_resume, NULL);
+        unixctl_command_register("ofproto/detrace", "UFID [pmd=PMD-ID]", 1, 2,
+                                 upcall_unixctl_ofproto_detrace, NULL);
         ovsthread_once_done(&once);
     }
 }
@@ -814,16 +827,8 @@ udpif_get_n_flows(struct udpif *udpif)
         atomic_store_relaxed(&udpif->n_flows_timestamp, now);
         dpif_get_dp_stats(udpif->dpif, &stats);
         flow_count = stats.n_flows;
-
-        if (!dpif_synced_dp_layers(udpif->dpif)) {
-            /* If the dpif layer does not sync the flows, we need to include
-             * the hardware offloaded flows separately. */
-            uint64_t hw_flows;
-
-            if (!dpif_get_n_offloaded_flows(udpif->dpif, &hw_flows)) {
-                flow_count += hw_flows;
-            }
-        }
+        flow_count += dpif_offload_flow_count_by_impl(
+                          udpif->dpif, DPIF_OFFLOAD_IMPL_FLOWS_PROVIDER_ONLY);
 
         atomic_store_relaxed(&udpif->n_flows, flow_count);
         ovs_mutex_unlock(&udpif->n_flows_mutex);
@@ -923,6 +928,7 @@ recv_upcalls(struct handler *handler)
         upcall->key_len = dupcall->key_len;
         upcall->ufid = &dupcall->ufid;
         upcall->hash = hash;
+        upcall->pid = dupcall->pid;
 
         upcall->out_tun_key = dupcall->out_tun_key;
         upcall->actions = dupcall->actions;
@@ -969,7 +975,7 @@ udpif_run_flow_rebalance(struct udpif *udpif)
         return;
     }
 
-    if (!netdev_any_oor()) {
+    if (!dpif_offload_netdevs_out_of_resources(udpif->dpif)) {
         return;
     }
 
@@ -1058,7 +1064,7 @@ udpif_revalidator(void *arg)
 
             dpif_flow_dump_destroy(udpif->dump);
             seq_change(udpif->dump_seq);
-            if (netdev_is_offload_rebalance_policy_enabled()) {
+            if (dpif_offload_rebalance_policy_enabled()) {
                 udpif_run_flow_rebalance(udpif);
             }
 
@@ -1262,6 +1268,7 @@ upcall_receive(struct upcall *upcall, const struct dpif_backer *backer,
     upcall->key = NULL;
     upcall->key_len = 0;
     upcall->mru = mru;
+    upcall->pid = 0;
 
     upcall->out_tun_key = NULL;
     upcall->actions = NULL;
@@ -1554,8 +1561,11 @@ process_upcall(struct udpif *udpif, struct upcall *upcall,
             memset(&ipfix_actions, 0, sizeof ipfix_actions);
 
             if (upcall->out_tun_key) {
-                odp_tun_key_from_attr(upcall->out_tun_key, &output_tunnel_key,
-                                      NULL);
+                if (odp_tun_key_from_attr(upcall->out_tun_key,
+                                          &output_tunnel_key,
+                                          NULL) != ODP_FIT_ERROR) {
+                    return EINVAL;
+                }
             }
 
             actions_len = dpif_read_actions(udpif, upcall, flow,
@@ -1718,6 +1728,7 @@ handle_upcalls(struct udpif *udpif, struct upcall *upcalls,
             op->dop.execute.probe = false;
             op->dop.execute.mtu = upcall->mru;
             op->dop.execute.hash = upcall->hash;
+            op->dop.execute.upcall_pid = upcall->pid;
         }
     }
 
@@ -1819,6 +1830,7 @@ ukey_create__(const struct nlattr *key, size_t key_len,
     ukey->state_thread = ovsthread_id_self();
     ukey->state_where = OVS_SOURCE_LOCATOR;
     ukey->created = ukey->flow_time = time_msec();
+    ukey->missed_dumps = 0;
     memset(&ukey->stats, 0, sizeof ukey->stats);
     ukey->stats.used = used;
     ukey->dp_layer = NULL;
@@ -2695,7 +2707,6 @@ ukey_netdev_unref(struct udpif_key *ukey)
 static void
 ukey_to_flow_netdev(struct udpif *udpif, struct udpif_key *ukey)
 {
-    const char *dpif_type_str = dpif_normalize_type(dpif_type(udpif->dpif));
     const struct nlattr *k;
     unsigned int left;
 
@@ -2707,8 +2718,9 @@ ukey_to_flow_netdev(struct udpif *udpif, struct udpif_key *ukey)
         enum ovs_key_attr type = nl_attr_type(k);
 
         if (type == OVS_KEY_ATTR_IN_PORT) {
-            ukey->in_netdev = netdev_ports_get(nl_attr_get_odp_port(k),
-                                               dpif_type_str);
+            ukey->in_netdev =
+                netdev_ref(dpif_offload_get_netdev_by_port_id(
+                               udpif->dpif, NULL, nl_attr_get_odp_port(k)));
         } else if (type == OVS_KEY_ATTR_TUNNEL) {
             struct flow_tnl tnl;
             enum odp_key_fitness res;
@@ -2786,6 +2798,24 @@ udpif_update_used(struct udpif *udpif, struct udpif_key *ukey,
         stats->used = ukey->created;
     }
     return stats->used;
+}
+
+static bool
+did_dp_hw_only_offload_change(const char *old_type, const char *new_type)
+{
+    enum dpif_offload_impl_type old_impl = old_type
+        ? dpif_offload_get_impl_type_by_class(old_type)
+        : DPIF_OFFLOAD_IMPL_NONE;
+    enum dpif_offload_impl_type new_impl = new_type
+        ? dpif_offload_get_impl_type_by_class(new_type)
+        : DPIF_OFFLOAD_IMPL_NONE;
+
+    if (old_impl != new_impl
+        && (old_impl == DPIF_OFFLOAD_IMPL_FLOWS_PROVIDER_ONLY
+            || new_impl == DPIF_OFFLOAD_IMPL_FLOWS_PROVIDER_ONLY)) {
+        return true;
+    }
+    return false;
 }
 
 static void
@@ -2886,9 +2916,8 @@ revalidate(struct revalidator *revalidator)
 
             ukey->offloaded = f->attrs.offloaded;
             if (!ukey->dp_layer
-                || (!dpif_synced_dp_layers(udpif->dpif)
-                    && strcmp(ukey->dp_layer, f->attrs.dp_layer))) {
-
+                || did_dp_hw_only_offload_change(ukey->dp_layer,
+                                                 f->attrs.dp_layer)) {
                 if (ukey->dp_layer) {
                     /* The dp_layer has changed this is probably due to an
                      * earlier revalidate cycle moving it to/from hw offload.
@@ -2945,7 +2974,7 @@ revalidate(struct revalidator *revalidator)
             }
             ukey->dump_seq = dump_seq;
 
-            if (netdev_is_offload_rebalance_policy_enabled() &&
+            if (dpif_offload_rebalance_policy_enabled() &&
                 result != UKEY_DELETE) {
                 udpif_update_flow_pps(udpif, ukey, f);
             }
@@ -3034,6 +3063,21 @@ revalidator_sweep__(struct revalidator *revalidator, bool purge)
                     result = revalidate_ukey(udpif, ukey, &stats, &odp_actions,
                                              reval_seq, &recircs, &del_reason);
                 }
+
+                if (ukey->dump_seq != dump_seq) {
+                    ukey->missed_dumps++;
+                    if (ukey->missed_dumps >= 4) {
+                        /* If the flow was not dumped for 4 revalidator rounds,
+                         * we can assume the datapath flow no longer exists
+                         * and the ukey should be deleted. */
+                        COVERAGE_INC(revalidate_missing_dp_flow);
+                        del_reason = FDR_FLOW_MISSING_DP;
+                        result = UKEY_DELETE;
+                    }
+                } else {
+                    ukey->missed_dumps = 0;
+                }
+
                 if (result != UKEY_KEEP) {
                     /* Clears 'recircs' if filled by revalidate_ukey(). */
                     reval_op_init(&ops[n_ops++], result, udpif, ukey, &recircs,
@@ -3117,11 +3161,71 @@ dp_purge_cb(void *aux, unsigned pmd_id)
     udpif_resume_revalidators(udpif);
 }
 
-static void
-upcall_unixctl_show(struct unixctl_conn *conn, int argc OVS_UNUSED,
-                    const char *argv[] OVS_UNUSED, void *aux OVS_UNUSED)
+static struct json *
+upcall_unixctl_show_json(void)
 {
-    struct ds ds = DS_EMPTY_INITIALIZER;
+    struct json *json_udpifs = json_object_create();
+    struct udpif *udpif;
+
+    LIST_FOR_EACH (udpif, list_node, &all_udpifs) {
+        struct json *json_revalidators = json_object_create();
+        struct json *json_flows = json_object_create();
+        struct json *json_udpif = json_object_create();
+        uint64_t n_offloaded_flows;
+        unsigned int flow_limit;
+        bool ufid_enabled;
+        size_t i;
+
+        atomic_read_relaxed(&udpif->flow_limit, &flow_limit);
+        ufid_enabled = udpif_use_ufid(udpif);
+        n_offloaded_flows = dpif_offload_flow_count(udpif->dpif);
+
+        json_object_put(json_flows, "average",
+                        json_integer_create(udpif->avg_n_flows));
+        json_object_put(json_flows, "current",
+                        json_integer_create(udpif_get_n_flows(udpif)));
+        json_object_put(json_flows, "limit",
+                        json_integer_create(flow_limit));
+        json_object_put(json_flows, "maximum",
+                        json_integer_create(udpif->max_n_flows));
+        json_object_put(json_flows, "offloaded",
+                        json_integer_create(n_offloaded_flows));
+        json_object_put(json_udpif, "dump-duration-ms",
+                        json_integer_create(udpif->dump_duration));
+        json_object_put(json_udpif, "flows", json_flows);
+
+        for (i = 0; i < udpif->n_revalidators; i++) {
+            struct revalidator *revalidator = &udpif->revalidators[i];
+            struct json *json_rv;
+            int j, elements = 0;
+            char *key;
+
+            /* Revalidators that are not fully initialized yet have ID 0.
+             * Skip them, otherwise they would overwrite each other. */
+            if (!revalidator->id) {
+                continue;
+            }
+
+            json_rv = json_object_create();
+            key = xasprintf("%u", revalidator->id);
+            for (j = i; j < N_UMAPS; j += udpif->n_revalidators) {
+                elements += cmap_count(&udpif->ukeys[j].cmap);
+            }
+            json_object_put(json_rv, "keys", json_integer_create(elements));
+            json_object_put_nocopy(json_revalidators, key, json_rv);
+        }
+        json_object_put(json_udpif, "revalidators", json_revalidators);
+        json_object_put(json_udpif, "ufid-enabled",
+                        json_boolean_create(ufid_enabled));
+
+        json_object_put(json_udpifs, dpif_name(udpif->dpif), json_udpif);
+    }
+    return json_udpifs;
+}
+
+static void
+upcall_unixctl_show_text(struct ds *ds)
+{
     uint64_t n_offloaded_flows;
     struct udpif *udpif;
 
@@ -3133,22 +3237,23 @@ upcall_unixctl_show(struct unixctl_conn *conn, int argc OVS_UNUSED,
         atomic_read_relaxed(&udpif->flow_limit, &flow_limit);
         ufid_enabled = udpif_use_ufid(udpif);
 
-        ds_put_format(&ds, "%s:\n", dpif_name(udpif->dpif));
-        ds_put_format(&ds, "  flows         : (current %lu)"
+        ds_put_format(ds, "%s:\n", dpif_name(udpif->dpif));
+        ds_put_format(ds, "  flows         : (current %lu)"
             " (avg %u) (max %u) (limit %u)\n", udpif_get_n_flows(udpif),
             udpif->avg_n_flows, udpif->max_n_flows, flow_limit);
-        if (!dpif_get_n_offloaded_flows(udpif->dpif, &n_offloaded_flows)) {
-            ds_put_format(&ds, "  offloaded flows : %"PRIu64"\n",
+        n_offloaded_flows = dpif_offload_flow_count(udpif->dpif);
+        if (n_offloaded_flows) {
+            ds_put_format(ds, "  offloaded flows : %"PRIu64"\n",
                           n_offloaded_flows);
         }
-        ds_put_format(&ds, "  dump duration : %lldms\n", udpif->dump_duration);
-        ds_put_format(&ds, "  ufid enabled : ");
+        ds_put_format(ds, "  dump duration : %lldms\n", udpif->dump_duration);
+        ds_put_format(ds, "  ufid enabled : ");
         if (ufid_enabled) {
-            ds_put_format(&ds, "true\n");
+            ds_put_format(ds, "true\n");
         } else {
-            ds_put_format(&ds, "false\n");
+            ds_put_format(ds, "false\n");
         }
-        ds_put_char(&ds, '\n');
+        ds_put_char(ds, '\n');
 
         for (i = 0; i < udpif->n_revalidators; i++) {
             struct revalidator *revalidator = &udpif->revalidators[i];
@@ -3157,12 +3262,24 @@ upcall_unixctl_show(struct unixctl_conn *conn, int argc OVS_UNUSED,
             for (j = i; j < N_UMAPS; j += udpif->n_revalidators) {
                 elements += cmap_count(&udpif->ukeys[j].cmap);
             }
-            ds_put_format(&ds, "  %u: (keys %d)\n", revalidator->id, elements);
+            ds_put_format(ds, "  %u: (keys %d)\n", revalidator->id, elements);
         }
     }
+}
 
-    unixctl_command_reply(conn, ds_cstr(&ds));
-    ds_destroy(&ds);
+static void
+upcall_unixctl_show(struct unixctl_conn *conn, int argc OVS_UNUSED,
+                    const char *argv[] OVS_UNUSED, void *aux OVS_UNUSED)
+{
+    if (unixctl_command_get_output_format(conn) == UNIXCTL_OUTPUT_FMT_JSON) {
+        unixctl_command_reply_json(conn, upcall_unixctl_show_json());
+    } else {
+        struct ds ds = DS_EMPTY_INITIALIZER;
+
+        upcall_unixctl_show_text(&ds);
+        unixctl_command_reply(conn, ds_cstr(&ds));
+        ds_destroy(&ds);
+    }
 }
 
 /* Disable using the megaflows.
@@ -3308,6 +3425,63 @@ upcall_unixctl_resume(struct unixctl_conn *conn, int argc OVS_UNUSED,
         udpif_resume_revalidators(udpif);
     }
     unixctl_command_reply(conn, "");
+}
+
+static void
+upcall_unixctl_ofproto_detrace(struct unixctl_conn *conn, int argc,
+                               const char *argv[], void *aux OVS_UNUSED)
+{
+    const char *key_s = argv[1];
+    const char *pmd_str = NULL;
+    unsigned int pmd_id;
+    ovs_u128 ufid;
+
+    if (odp_ufid_from_string(key_s, &ufid) <= 0) {
+        unixctl_command_reply_error(conn, "failed to parse ufid");
+        return;
+    }
+
+    if (argc == 3) {
+        pmd_str = argv[2];
+        if (!ovs_scan(pmd_str, "pmd=%d", &pmd_id)) {
+            unixctl_command_reply_error(conn,
+                                        "Invalid pmd argument format. "
+                                        "Expecting 'pmd=PMD-ID'");
+            return;
+        }
+    }
+
+    struct ds ds = DS_EMPTY_INITIALIZER;
+    struct udpif *udpif;
+
+    LIST_FOR_EACH (udpif, list_node, &all_udpifs) {
+        if (!pmd_str) {
+            const char *type = dpif_normalize_type(dpif_type(udpif->dpif));
+
+            pmd_id = !strcmp(type, "system") ? PMD_ID_NULL : NON_PMD_CORE_ID;
+        }
+
+        struct udpif_key *ukey = ukey_lookup(udpif, &ufid, pmd_id);
+        if (!ukey) {
+            ds_put_format(&ds, "UFID was not found for %s\n",
+                          dpif_name(udpif->dpif));
+            continue;
+        }
+
+        ovs_mutex_lock(&ukey->mutex);
+        /* It only makes sense to format rules for ukeys that are (still)
+         * in use. */
+        if ((ukey->state == UKEY_VISIBLE || ukey->state == UKEY_OPERATIONAL)
+            && ukey->xcache) {
+            xlate_xcache_format(&ds, ukey->xcache);
+        } else {
+            ds_put_format(&ds, "Cache was not found for %s\n",
+                          dpif_name(udpif->dpif));
+        }
+        ovs_mutex_unlock(&ukey->mutex);
+    }
+    unixctl_command_reply(conn, ds_cstr(&ds));
+    ds_destroy(&ds);
 }
 
 

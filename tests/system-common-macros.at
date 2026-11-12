@@ -2,10 +2,7 @@
 #
 # Delete namespaces from the running OS
 m4_define([DEL_NAMESPACES],
-   [m4_foreach([ns], [$@],
-               [ip netns del ns
-])
-   ]
+   [m4_foreach([ns], [$@], [echo removing namespace ns; ip netns del ns])]
 )
 
 # ADD_NAMESPACES(ns [, ns ... ])
@@ -72,7 +69,7 @@ m4_define([ADD_INT],
 #
 m4_define([ADD_VETH],
     [ AT_CHECK([ip link add $1 type veth peer name ovs-$1 || return 77])
-      on_exit 'ip link del ovs-$1'
+      on_exit 'echo removing interface ovs-$1; ip link del ovs-$1'
       CONFIGURE_VETH_OFFLOADS([$1])
       AT_CHECK([ip link set $1 netns $2])
       AT_CHECK([ip link set dev ovs-$1 up])
@@ -269,6 +266,32 @@ m4_define([NETNS_DAEMONIZE],
    ]
 )
 
+# OVS_GET_HTTP([url], [optional_curl_arguments])
+#
+# Do a HTTP get; we are currently using the curl command.
+#
+m4_define([OVS_GET_HTTP],
+    [curl $1 --retry 3 --max-time 1 --retry-connrefused -v $2]
+)
+
+# OVS_GET_FTP([url], [optional_curl_arguments])
+#
+# Do a passive FTP get; we are currently using the curl command.
+#
+m4_define([OVS_GET_FTP],
+    [curl ftp://$1 --retry 3 --max-time 1 --retry-connrefused \
+        -v $2]
+)
+
+# OVS_GET_FTP_ACTIVE([url], [optional_curl_arguments])
+#
+# Do an active FTP get; we are currently using the curl command.
+#
+m4_define([OVS_GET_FTP_ACTIVE],
+    [curl ftp://$1 --retry 3 --max-time 1 --retry-connrefused -v \
+        --ftp-port - $2]
+)
+
 # OVS_CHECK_FIREWALL()
 #
 # Check if firewalld is active, skip the test if it is on.
@@ -307,14 +330,6 @@ m4_define([OFPROTO_CLEAR_DURATION_IDLE], [[sed -e 's/duration=.*s,/duration=<cle
 # Macro to skip tests when tc qdisc can't be applied on a OVS port.
 m4_define([OVS_CHECK_TC_QDISC],
     [AT_SKIP_IF([test $HAVE_TC = no])])
-
-# OVS_CHECK_TUNNEL_TSO()
-#
-# Macro to be used in general tunneling tests that could be also
-# used by system-tso. In that case, tunneling is not supported and
-# the test should be skipped.
-m4_define([OVS_CHECK_TUNNEL_TSO],
-    [m4_ifdef([CHECK_SYSTEM_TSO], [AT_SKIP_IF(:)])])
 
 # OVS_CHECK_VXLAN()
 #
@@ -378,3 +393,101 @@ m4_define([OVS_CHECK_GITHUB_ACTION],
 # OVS_CHECK_DROP_ACTION()
 m4_define([OVS_CHECK_DROP_ACTION],
     [AT_SKIP_IF([! grep -q "Datapath supports explicit drop action" ovs-vswitchd.log])])
+
+# OVS_CHECK_PSAMPLE()
+m4_define([OVS_CHECK_PSAMPLE],
+    [AT_SKIP_IF([! grep -q "Datapath supports psample action" ovs-vswitchd.log])])
+
+# OVS_CHECK_XT()
+m4_define([OVS_CHECK_XT],
+    [AT_SKIP_IF([test $HAVE_IPTABLES = no && test $HAVE_NFT = no])])
+
+OVS_START_SHELL_HELPERS
+
+# ovs_get_vf_port(<PF_PORT_PCI>, <VF_INDEX>)
+#
+# This function tries to find the VF's netdev for the given PF's VF index.
+#
+ovs_get_vf_port() {
+    local PF_PCI=$1
+    local VF_IDX=$2
+
+    local vf_net_dir="/sys/bus/pci/devices/$PF_PCI/virtfn$VF_IDX/net"
+    if test ! -d "$vf_net_dir"; then
+        return 1
+    fi
+
+    local vf_name=$(ls "$vf_net_dir" 2>/dev/null | head -1)
+    if test -z "$vf_name"; then
+        return 2
+    fi
+
+    echo "$vf_name"
+    return 0
+}
+
+# ovs_get_representor_port(<PF_PORT_PCI>, <VF_INDEX>)
+#
+# This function tries to find the representor's netdev for the given PF's VF
+# index.
+#
+ovs_get_representor_port() {
+    local PF_PCI=$1
+    local VF_IDX=$2
+
+    local representor=$(grep -l "vf$VF_IDX$" \
+                        /sys/bus/pci/devices/$PF_PCI/net/*/phys_port_name \
+                        2>/dev/null | head -1)
+    if test -z "$representor"; then
+        return 2
+    fi
+
+    basename $(dirname "$representor")
+    return 0
+}
+
+# ovs_verify_pf_cfg(<PF_PORT_PCI>)
+#
+# Verify that the given PF port exists and that the required VFs are properly
+# configured, i.e. have representor ports.
+#
+ovs_verify_pf_cfg() {
+    local PF_PCI=$1
+    local VF_NAMES=()
+    local REPRESENTOR_NAMES=()
+    local PCI_REGEX=[[0-9a-fA-F]]{4}:[[0-9a-fA-F]]{2}:[[0-9a-fA-F]]{2}\.[[0-7]]
+    local vf_net_dir vf_name representor i
+
+    echo "$PF_PCI" | grep -E -q "^$PCI_REGEX$" || return 1
+
+    for i in {0..5}; do
+        # Get VF netdev using PCI path
+        vf_net_dir="/sys/bus/pci/devices/$PF_PCI/virtfn$i/net"
+        if test ! -d "$vf_net_dir"; then
+            return 2
+        fi
+
+        vf_name=$(ls "$vf_net_dir" 2>/dev/null | head -1)
+        if test -z "$vf_name"; then
+            return 3
+        fi
+        VF_NAMES+=($vf_name)
+
+        # Find representor port for this VF
+        representor=$(grep -l "vf$i$" \
+                      /sys/bus/pci/devices/$PF_PCI/net/*/phys_port_name \
+                      2>/dev/null | head -1)
+        if test -z "$representor"; then
+            return 4
+        fi
+        REPRESENTOR_NAMES+=($(basename $(dirname "$representor")))
+    done
+
+    if test "${#VF_NAMES[*]}" -lt 6 -o "${#REPRESENTOR_NAMES[*]}" -lt 6; then
+        return 5
+    fi
+
+    return 0
+}
+
+OVS_END_SHELL_HELPERS

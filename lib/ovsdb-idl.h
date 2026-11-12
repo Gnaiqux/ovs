@@ -55,6 +55,7 @@ struct ovsdb_idl_row;
 struct ovsdb_idl_column;
 struct ovsdb_idl_table;
 struct ovsdb_idl_table_class;
+struct ovsdb_type;
 struct simap;
 struct uuid;
 
@@ -103,6 +104,8 @@ bool ovsdb_idl_server_has_table(const struct ovsdb_idl *,
                                 const struct ovsdb_idl_table_class *);
 bool ovsdb_idl_server_has_column(const struct ovsdb_idl *,
                                  const struct ovsdb_idl_column *);
+const struct ovsdb_type *ovsdb_idl_server_column_type(
+    const struct ovsdb_idl *, const struct ovsdb_idl_column *);
 
 /* Choosing columns and tables to replicate.
  *
@@ -348,6 +351,7 @@ void ovsdb_idl_txn_wait(const struct ovsdb_idl_txn *);
 enum ovsdb_idl_txn_status ovsdb_idl_txn_commit(struct ovsdb_idl_txn *);
 enum ovsdb_idl_txn_status ovsdb_idl_txn_commit_block(struct ovsdb_idl_txn *);
 void ovsdb_idl_txn_abort(struct ovsdb_idl_txn *);
+void ovsdb_idl_txn_assert_read_only(struct ovsdb_idl_txn *, bool assert);
 
 const char *ovsdb_idl_txn_get_error(const struct ovsdb_idl_txn *);
 

@@ -440,8 +440,7 @@ struct dpif_dp_stats {
 int dpif_get_dp_stats(const struct dpif *, struct dpif_dp_stats *);
 
 int dpif_set_features(struct dpif *, uint32_t new_features);
-
-int dpif_get_n_offloaded_flows(struct dpif *dpif, uint64_t *n_flows);
+uint32_t dpif_get_features(struct dpif *dpif);
 
 
 /* Port operations. */
@@ -524,7 +523,7 @@ struct dpif_flow_attrs {
 
 struct dpif_flow_dump_types {
     bool ovs_flows;
-    bool netdev_flows;
+    bool offloaded_flows;
 };
 
 void dpif_flow_stats_extract(const struct flow *, const struct dp_packet *packet,
@@ -732,6 +731,8 @@ struct dpif_execute {
     unsigned int mtu;               /* Maximum transmission unit to fragment.
                                        0 if not a fragmented packet */
     uint64_t hash;                  /* Packet flow hash. 0 if not specified. */
+    uint64_t upcall_pid;            /* Netlink PID to use for upcalls.
+                                     * 0 if not specified. */
     const struct flow *flow;         /* Flow extracted from 'packet'. */
 
     /* Input, but possibly modified as a side effect of execution. */
@@ -792,14 +793,6 @@ struct dpif_op {
 void dpif_operate(struct dpif *, struct dpif_op **ops, size_t n_ops,
                   enum dpif_offload_type);
 
-/* Queries the datapath for hardware offloads stats.
- *
- * Statistics are written in 'stats' following the 'netdev_custom_stats'
- * format. They are allocated on the heap and must be freed by the caller,
- * using 'netdev_free_custom_stats_counters'.
- */
-int dpif_offload_stats_get(struct dpif *dpif,
-                           struct netdev_custom_stats *stats);
 
 /* Upcalls. */
 
@@ -833,6 +826,7 @@ struct dpif_upcall {
     struct nlattr *mru;         /* Maximum receive unit. */
     struct nlattr *hash;        /* Packet hash. */
     struct nlattr *cutlen;      /* Number of bytes shrink from the end. */
+    uint32_t pid;               /* Socket PID the upcall was received from. */
 
     /* DPIF_UC_ACTION only. */
     struct nlattr *userdata;    /* Argument to OVS_ACTION_ATTR_USERSPACE. */
@@ -941,7 +935,7 @@ int dpif_get_pmds_for_port(const struct dpif * dpif, odp_port_t port_no,
 char *dpif_get_dp_version(const struct dpif *);
 bool dpif_supports_tnl_push_pop(const struct dpif *);
 bool dpif_may_support_explicit_drop_action(const struct dpif *);
-bool dpif_synced_dp_layers(struct dpif *);
+bool dpif_may_support_psample(const struct dpif *);
 
 /* Log functions. */
 struct vlog_module;

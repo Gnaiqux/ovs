@@ -33,6 +33,7 @@
 #include "dirs.h"
 #include "dpctl.h"
 #include "dpif.h"
+#include "dpif-offload.h"
 #include "dpif-provider.h"
 #include "openvswitch/dynamic-string.h"
 #include "flow.h"
@@ -738,8 +739,8 @@ show_dpif(struct dpif *dpif, struct dpctl_params *dpctl_p)
                 continue;
             }
             error = netdev_get_stats(netdev, &s);
+            netdev_close(netdev);
             if (!error) {
-                netdev_close(netdev);
                 print_stat(dpctl_p, "    RX packets:", s.rx_packets);
                 print_stat(dpctl_p, " errors:", s.rx_errors);
                 print_stat(dpctl_p, " dropped:", s.rx_dropped);
@@ -877,7 +878,7 @@ format_dpif_flow(struct ds *ds, const struct dpif_flow *f, struct hmap *ports,
         ds_put_cstr(ds, ", ");
     }
     odp_flow_format(f->key, f->key_len, f->mask, f->mask_len, ports, ds,
-                    dpctl_p->verbosity);
+                    dpctl_p->verbosity, false);
     ds_put_cstr(ds, ", ");
 
     dpif_flow_stats_format(&f->stats, ds);
@@ -964,10 +965,10 @@ determine_dpif_flow_dump_types(struct dump_types *dump_types,
                                struct dpif_flow_dump_types *dpif_dump_types)
 {
     dpif_dump_types->ovs_flows = dump_types->ovs || dump_types->non_offloaded;
-    dpif_dump_types->netdev_flows = dump_types->tc || dump_types->offloaded
-                                    || dump_types->non_offloaded
-                                    || dump_types->dpdk
-                                    || dump_types->partially_offloaded;
+    dpif_dump_types->offloaded_flows = dump_types->tc || dump_types->offloaded
+                                       || dump_types->non_offloaded
+                                       || dump_types->dpdk
+                                       || dump_types->partially_offloaded;
 }
 
 static bool
@@ -1042,9 +1043,9 @@ dpctl_dump_flows(int argc, const char *argv[], struct dpctl_params *dpctl_p)
 
     struct dpif_flow_dump_thread *flow_dump_thread;
     struct dpif_flow_dump *flow_dump;
-    struct dpif_flow f;
-    int pmd_id = PMD_ID_NULL;
+    unsigned pmd_id = PMD_ID_NULL;
     bool pmd_id_filter = false;
+    struct dpif_flow f;
     int lastargc = 0;
     int error;
 
@@ -1062,13 +1063,19 @@ dpctl_dump_flows(int argc, const char *argv[], struct dpctl_params *dpctl_p)
             }
             types_list = xstrdup(argv[--argc] + 5);
         } else if (!strncmp(argv[argc - 1], "pmd=", 4)) {
-            if (!ovs_scan(argv[--argc], "pmd=%d", &pmd_id)) {
+            int pmd_id_arg;
+
+            if (!ovs_scan(argv[--argc], "pmd=%d", &pmd_id_arg)) {
                 error = EINVAL;
                 goto out_free;
             }
-
-            if (pmd_id == -1) {
+            if (pmd_id_arg == -1) {
                 pmd_id = NON_PMD_CORE_ID;
+            } else if (pmd_id_arg < 0) {
+                error = EINVAL;
+                goto out_free;
+            } else {
+                pmd_id = pmd_id_arg;
             }
             pmd_id_filter = true;
         }
@@ -1598,33 +1605,58 @@ dpctl_del_flows(int argc, const char *argv[], struct dpctl_params *dpctl_p)
 }
 
 static int
+compare_custom_stats(const void *a, const void *b)
+{
+    const struct netdev_custom_stats *sa = a;
+    const struct netdev_custom_stats *sb = b;
+
+    return sa->label && sb->label ? strcmp(sa->label, sb->label)
+                                  : (sa->label != NULL) - (sb->label != NULL);
+}
+
+static int
 dpctl_offload_stats_show(int argc, const char *argv[],
                          struct dpctl_params *dpctl_p)
 {
-    struct netdev_custom_stats stats;
+    struct netdev_custom_stats *stats_array;
     struct dpif *dpif;
+    size_t n_stats;
     int error;
-    size_t i;
 
     error = opt_dpif_open(argc, argv, dpctl_p, 2, &dpif);
     if (error) {
         return error;
     }
 
-    memset(&stats, 0, sizeof(stats));
-    error = dpif_offload_stats_get(dpif, &stats);
+    error = dpif_offload_stats_get(dpif, &stats_array, &n_stats);
     if (error) {
         dpctl_error(dpctl_p, error, "retrieving offload statistics");
         goto close_dpif;
     }
 
-    dpctl_print(dpctl_p, "HW Offload stats:\n");
-    for (i = 0; i < stats.size; i++) {
-        dpctl_print(dpctl_p, "   %s: %6" PRIu64 "\n",
-                    stats.counters[i].name, stats.counters[i].value);
+    if (stats_array && n_stats) {
+        qsort(stats_array, n_stats, sizeof *stats_array, compare_custom_stats);
     }
 
-    netdev_free_custom_stats_counters(&stats);
+    dpctl_print(dpctl_p, "HW Offload stats:\n");
+    for (size_t i = 0; i < n_stats; i++) {
+        struct netdev_custom_stats *stats = &stats_array[i];
+
+        if (!stats) {
+            continue;
+        }
+
+        if (stats->label) {
+            dpctl_print(dpctl_p, "  %s:\n", stats->label);
+        }
+        for (size_t j = 0; j < stats->size; j++) {
+            dpctl_print(dpctl_p, "    %s: %6" PRIu64 "\n",
+                        stats->counters[j].name, stats->counters[j].value);
+        }
+        netdev_free_custom_stats_counters(stats);
+    }
+
+    free(stats_array);
 
 close_dpif:
     dpif_close(dpif);
@@ -2169,8 +2201,8 @@ dpctl_ct_set_limits(int argc, const char *argv[],
     struct ovs_list zone_limits = OVS_LIST_INITIALIZER(&zone_limits);
     int i =  dp_arg_exists(argc, argv) ? 2 : 1;
     struct ds ds = DS_EMPTY_INITIALIZER;
+    unsigned long long default_limit;
     struct dpif *dpif = NULL;
-    uint32_t default_limit;
     int error;
 
     if (i >= argc) {
@@ -2186,7 +2218,8 @@ dpctl_ct_set_limits(int argc, const char *argv[],
 
     /* Parse default limit */
     if (!strncmp(argv[i], "default=", 8)) {
-        if (ovs_scan(argv[i], "default=%"SCNu32, &default_limit)) {
+        if (str_to_ullong(argv[i] + 8, 10, &default_limit) &&
+            default_limit <= UINT32_MAX) {
             ct_dpif_push_zone_limit(&zone_limits, OVS_ZONE_LIMIT_DEFAULT_ZONE,
                                     default_limit, 0);
             i++;
@@ -2614,6 +2647,7 @@ dpctl_ct_ipf_get_status(int argc, const char *argv[],
         } else {
             dpctl_error(dpctl_p, error,
                         "ipf status could not be retrieved");
+            dpif_close(dpif);
             return error;
         }
 
@@ -2883,7 +2917,7 @@ dpctl_normalize_actions(int argc, const char *argv[],
 
     ds_clear(&s);
     odp_flow_format(keybuf.data, keybuf.size, NULL, 0, NULL,
-                    &s, dpctl_p->verbosity);
+                    &s, dpctl_p->verbosity, false);
     dpctl_print(dpctl_p, "input flow: %s\n", ds_cstr(&s));
 
     error = odp_flow_key_to_flow(keybuf.data, keybuf.size, &flow, &error_s);

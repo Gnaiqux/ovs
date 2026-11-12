@@ -579,6 +579,165 @@ for i in $(seq $n); do
 done
 
 AT_CLEANUP
+
+AT_BANNER([OVSDB - cluster failure while leaving])
+AT_SETUP([OVSDB cluster - leaving the cluster with some servers down])
+AT_KEYWORDS([ovsdb server negative unix cluster leave])
+
+AT_CHECK([ovsdb-tool '-vPATTERN:console:%c|%p|%m' create-cluster s1.db \
+            $top_srcdir/vswitchd/vswitch.ovsschema unix:s1.raft], [0], [], [stderr])
+schema_name=$(ovsdb-tool schema-name $top_srcdir/vswitchd/vswitch.ovsschema)
+for i in 2 3 4 5; do
+    AT_CHECK([ovsdb-tool join-cluster s$i.db $schema_name unix:s$i.raft unix:s1.raft])
+done
+
+on_exit 'kill $(cat *.pid)'
+on_exit "
+  for i in \$(ls $(pwd)/s[[0-5]]); do
+    ovs-appctl --timeout 1 -t \$i cluster/status $schema_name;
+  done
+"
+dnl Starting all the servers.
+for i in 1 2 3 4 5; do
+    AT_CHECK([ovsdb-server -v -vconsole:off -vsyslog:off \
+                           --detach --no-chdir --log-file=s$i.log \
+                           --pidfile=s$i.pid --unixctl=s$i \
+                           --remote=punix:s$i.ovsdb s$i.db])
+done
+
+dnl Make sure that all servers joined the cluster.
+for i in 1 2 3 4 5; do
+    AT_CHECK([ovsdb_client_wait unix:s$i.ovsdb $schema_name connected])
+done
+
+dnl Make sure the cluster is operational.
+m4_define([DB_REMOTE], [unix:s1.ovsdb,unix:s2.ovsdb,unix:s3.ovsdb,unix:s4.ovsdb,unix:s5.ovsdb])
+AT_CHECK([ovs-vsctl --db="DB_REMOTE" --no-wait init])
+AT_CHECK([ovs-vsctl --db="DB_REMOTE" -vovsdb_cs:console:dbg --no-leader-only \
+            --no-wait create QoS type=test-1], [0], [ignore], [ignore])
+
+dnl Stop servers 1 and 2.
+OVS_APP_EXIT_AND_WAIT_BY_TARGET([$(pwd)/s1], [s1.pid])
+OVS_APP_EXIT_AND_WAIT_BY_TARGET([$(pwd)/s2], [s2.pid])
+
+dnl Make sure that all remaining servers are functional as a cluster.
+for i in 3 4 5; do
+    AT_CHECK([ovsdb_client_wait unix:s$i.ovsdb $schema_name connected])
+done
+
+dnl Make sure the cluster is still operational.
+m4_define([DB_REMOTE], [unix:s3.ovsdb,unix:s4.ovsdb,unix:s5.ovsdb])
+AT_CHECK([ovs-vsctl --db="DB_REMOTE" -vovsdb_cs:console:dbg --no-leader-only \
+            --no-wait create QoS type=test-2], [0], [ignore], [ignore])
+
+dnl Servers 1 and 2 in a cluster of 5 are down, 3 servers are still alive.
+dnl Server 3 can't leave, because the NEW configuration will be a cluster of
+dnl 4 with 2 servers down and it doesn't have a quorum.  Try it.
+dnl The cluster will fall apart until servers 1 or 2 come back to resolve
+dnl the quorum issue, because servers 4 and 5 will no longer consider 3
+dnl to be part of the configuration.
+AT_CHECK([ovs-appctl -t $(pwd)/s3 cluster/leave $schema_name])
+
+dnl Check that the cluster is not operational.
+for i in 3 4 5; do
+    OVS_WAIT_UNTIL([ovs-appctl -t $(pwd)/s$i cluster/status $schema_name \
+                        | grep -qE 'leaving|disconnected'])
+done
+
+dnl Try to commit a transaction, it should not be successful.
+m4_define([DB_REMOTE], [unix:s3.ovsdb,unix:s4.ovsdb,unix:s5.ovsdb])
+AT_CHECK([ovs-vsctl --db="DB_REMOTE" -vovsdb_cs:console:dbg --no-leader-only \
+            --no-wait create QoS type=test-3], [1], [ignore], [stderr])
+
+dnl Now bring back the server 2.  This should allow server 3 to leave.
+AT_CHECK([ovsdb-server -v -vconsole:off -vsyslog:off \
+                          --detach --no-chdir --log-file=s2.log \
+                          --pidfile=s2.pid --unixctl=s2 \
+                          --remote=punix:s2.ovsdb s2.db])
+
+dnl Wait for server 3 to actually leave and stop the server.
+AT_CHECK([ovsdb_client_wait unix:s3.ovsdb $schema_name removed])
+OVS_APP_EXIT_AND_WAIT_BY_TARGET([$(pwd)/s3], [s3.pid])
+
+dnl Make sure that all remaining servers are functional as a cluster.
+for i in 2 4 5; do
+    AT_CHECK([ovsdb_client_wait unix:s$i.ovsdb $schema_name connected])
+done
+dnl Make sure the cluster is operational again.
+m4_define([DB_REMOTE], [unix:s2.ovsdb,unix:s4.ovsdb,unix:s5.ovsdb])
+AT_CHECK([ovs-vsctl --db="DB_REMOTE" -vovsdb_cs:console:dbg --no-leader-only \
+            --no-wait create QoS type=test-4], [0], [ignore], [ignore])
+
+dnl Now we have a cluster of 4 servers (1, 2, 4, 5) with 1 server down.
+dnl Server 2 should be able to leave, because the NEW configuration will
+dnl be a cluster of 3 servers with 1 being down and it has a quorum.
+AT_CHECK([ovs-appctl -t $(pwd)/s2 cluster/leave $schema_name])
+dnl Wait for server 2 to actually leave and stop the server.
+AT_CHECK([ovsdb_client_wait unix:s2.ovsdb $schema_name removed])
+OVS_APP_EXIT_AND_WAIT_BY_TARGET([$(pwd)/s2], [s2.pid])
+
+dnl Make sure the cluster is still operational.
+m4_define([DB_REMOTE], [unix:s4.ovsdb,unix:s5.ovsdb])
+AT_CHECK([ovs-vsctl --db="DB_REMOTE" -vovsdb_cs:console:dbg --no-leader-only \
+            --no-wait create QoS type=test-5], [0], [ignore], [ignore])
+
+dnl Now we have a cluster of 3 servers (1, 4, 5) with 1 server down.
+dnl None of the alive servers can leave, because the NEW configuration
+dnl will be a cluster of 2 with 1 server down and it has no quorum.
+dnl Request both to leave anyway.
+for i in 4 5; do
+    AT_CHECK([ovs-appctl -t $(pwd)/s$i cluster/leave $schema_name])
+done
+
+dnl Check that the cluster is not operational.
+for i in 4 5; do
+    OVS_WAIT_UNTIL([ovs-appctl -t $(pwd)/s$i cluster/status $schema_name \
+                        | grep -qE 'leaving|disconnected'])
+done
+
+dnl Try to commit a transaction, it should not be successful.
+m4_define([DB_REMOTE], [unix:s4.ovsdb,unix:s5.ovsdb])
+AT_CHECK([ovs-vsctl --db="DB_REMOTE" -vovsdb_cs:console:dbg --no-leader-only \
+            --no-wait create QoS type=test-6], [1], [ignore], [stderr])
+
+dnl Now bring back the first server.
+AT_CHECK([ovsdb-server -v -vconsole:off -vsyslog:off \
+                          --detach --no-chdir --log-file=s1.log \
+                          --pidfile=s1.pid --unixctl=s1 \
+                          --remote=punix:s1.ovsdb s1.db])
+
+dnl Now it should be possible for all the other servers to leave, so we
+dnl should end up with a single-node cluster that consists of server 1.
+for i in 4 5; do
+    AT_CHECK([ovsdb_client_wait unix:s$i.ovsdb $schema_name removed])
+done
+for i in 4 5; do
+    OVS_APP_EXIT_AND_WAIT_BY_TARGET([$(pwd)/s$i], [s$i.pid])
+done
+
+dnl Wait for the first server to become a leader of a single-node cluster.
+OVS_WAIT_UNTIL([ovs-appctl -t $(pwd)/s1 cluster/status $schema_name \
+                    | grep -q 'Role: leader'])
+AT_CHECK([ovs-appctl -t $(pwd)/s1 cluster/status $schema_name \
+            | grep -c '    s[[1-5]] '], [0], [dnl
+1
+])
+
+dnl Check that the database is operational and the data is still in there.
+m4_define([DB_REMOTE], [unix:s1.ovsdb])
+AT_CHECK([ovs-vsctl --db="DB_REMOTE" -vovsdb_cs:console:dbg --no-wait \
+            create QoS type=test-7], [0], [ignore], [ignore])
+AT_CHECK([ovs-vsctl --db="DB_REMOTE" --no-wait \
+            --columns=type --bare list QoS | sed '/^$/d' | sort], [0], [dnl
+test-1
+test-2
+test-4
+test-5
+test-7
+])
+
+OVS_APP_EXIT_AND_WAIT_BY_TARGET([$(pwd)/s1], [s1.pid])
+AT_CLEANUP
 
 
 OVS_START_SHELL_HELPERS
@@ -845,6 +1004,115 @@ OVS_WAIT_UNTIL([ovs-appctl -t $(pwd)/s2 cluster/status $schema_name | grep "Role
 for i in $(seq $n); do
     AT_CHECK([ovs-appctl -t $(pwd)/s$i cluster/status $schema_name | grep "Term: 1"], [0], [ignore])
 done
+
+# Now force election without pausing RPC, so the requests are actually sent.
+AT_CHECK([ovs-appctl -t $(pwd)/s2 cluster/failure-test force-election], [0], [ignore])
+
+# The server transitions into a candidate role while engaging the test
+# and shortly after it should step back to be a follower.
+OVS_WAIT_UNTIL([ovs-appctl -t $(pwd)/s2 cluster/status $schema_name | grep "Role: follower"])
+
+# No term change.
+for i in $(seq $n); do
+    AT_CHECK([ovs-appctl -t $(pwd)/s$i cluster/status $schema_name | grep "Term: 1"], [0], [ignore])
+done
+
+for i in $(seq $n); do
+    OVS_APP_EXIT_AND_WAIT_BY_TARGET([$(pwd)/s$i], [s$i.pid])
+done
+
+AT_CLEANUP
+
+AT_SETUP([OVSDB cluster - disruptive server with the old term and outdated log])
+AT_KEYWORDS([ovsdb server negative unix cluster disruptive])
+
+n=3
+cp $top_srcdir/vswitchd/vswitch.ovsschema schema
+AT_CHECK([ovsdb-tool '-vPATTERN:console:%c|%p|%m' create-cluster \
+            --election-timer=2000 s1.db schema unix:s1.raft], [0], [], [stderr])
+cid=$(ovsdb-tool db-cid s1.db)
+schema_name=$(ovsdb-tool schema-name schema)
+for i in $(seq 2 $n); do
+    AT_CHECK([ovsdb-tool join-cluster s$i.db $schema_name unix:s$i.raft unix:s1.raft])
+done
+
+on_exit 'kill $(cat *.pid)'
+for i in $(seq $n); do
+    AT_CHECK([ovsdb-server -v -vconsole:off -vsyslog:off --detach --no-chdir \
+                --log-file=s$i.log --pidfile=s$i.pid --unixctl=s$i \
+                --remote=punix:s$i.ovsdb s$i.db])
+done
+for i in $(seq $n); do
+    AT_CHECK([ovsdb_client_wait unix:s$i.ovsdb $schema_name connected])
+done
+
+# Create a few transactions.
+AT_CHECK([ovs-vsctl --db=unix:s1.ovsdb --no-wait init], [0], [ignore], [ignore])
+AT_CHECK([ovs-vsctl --db=unix:s1.ovsdb --no-wait create QoS type=x], [0], [ignore], [ignore])
+
+# Stop the s3.
+OVS_APP_EXIT_AND_WAIT_BY_TARGET([$(pwd)/s3], [s3.pid])
+
+# Commit more transactions to s1 and s2.
+AT_CHECK([ovs-vsctl --db=unix:s1.ovsdb --no-wait create QoS type=y], [0], [ignore], [ignore])
+AT_CHECK([ovs-vsctl --db=unix:s1.ovsdb --no-wait create QoS type=z], [0], [ignore], [ignore])
+
+# Stop the leader - s1.
+AT_CHECK([ovs-appctl -t $(pwd)/s1 cluster/status $schema_name | grep -q "Role: leader"])
+AT_CHECK([ovs-appctl -t $(pwd)/s1 cluster/status $schema_name | grep -q "Term: 2"])
+OVS_APP_EXIT_AND_WAIT_BY_TARGET([$(pwd)/s1], [s1.pid])
+
+# Wait for s2 to start election and increase the term.
+OVS_WAIT_UNTIL([ovs-appctl -t $(pwd)/s2 cluster/status $schema_name | grep "Role: candidate"])
+AT_CHECK([ovs-appctl -t $(pwd)/s2 cluster/status $schema_name | grep -q "Term: 3"])
+
+# Stop the s2 as well.
+OVS_APP_EXIT_AND_WAIT_BY_TARGET([$(pwd)/s2], [s2.pid])
+
+# Now we have all the servers down with terms 2, 3, 2, and the s3 behind on the
+# log by two transactions.  Let's bring them back up.
+for i in $(seq $n); do
+    AT_CHECK([ovsdb-server -v -vconsole:off -vsyslog:off --detach --no-chdir \
+                --log-file=s$i.log --pidfile=s$i.pid --unixctl=s$i \
+                --remote=punix:s$i.ovsdb s$i.db])
+done
+
+# Delay elections on s1 and s2 giving s3 time to try a few times.
+for i in $(seq 1 10); do
+    AT_CHECK([ovs-appctl -t $(pwd)/s1 cluster/failure-test delay-election], [0], [ignore])
+    AT_CHECK([ovs-appctl -t $(pwd)/s2 cluster/failure-test delay-election], [0], [ignore])
+    # Election timer is 2 seconds, so delaying every second is enough to keep
+    # s1 and s2 from starting elections.
+    sleep 1
+done
+
+for i in $(seq $n); do
+    AT_CHECK([ovsdb_client_wait unix:s$i.ovsdb $schema_name connected])
+done
+
+# s3 was behind on the log, it must not be a leader.
+AT_CHECK([ovs-appctl -t $(pwd)/s3 cluster/status $schema_name | grep -q "Role: follower"])
+
+# Add some more data.
+AT_CHECK([ovs-vsctl --db=unix:s1.ovsdb --no-leader-only --no-wait create QoS type=l], [0], [ignore], [ignore])
+AT_CHECK([ovs-vsctl --db=unix:s1.ovsdb --no-leader-only --no-wait create QoS type=m], [0], [ignore], [ignore])
+
+# Check that all the servers are in the cluster and have all the data.
+# A successful transaction reply only guarantees that the entry was
+# committed by a majority.  A follower may not have learned the new
+# commit index and applied it yet, so wait for every server to catch up.
+for i in $(seq $n); do
+    AT_CHECK([ovs-appctl -t $(pwd)/s$i cluster/status $schema_name \
+                | grep -qE "Role: (leader|follower)"])
+    OVS_WAIT_UNTIL_EQUAL([ovs-vsctl --db=unix:s$i.ovsdb --no-leader-only \
+                          --bare --columns=type list QoS | grep . | \
+                          sort | paste -s -d '\0' -],
+                         [lmxyz])
+done
+
+# Check that s3 never won a pre-vote.
+AT_CHECK([grep 'send notification, method="vote_request"' s3.log], [0], [stdout])
+AT_CHECK([test $(grep -c vote_request stdout) -eq $(grep -c '"is_prevote":true' stdout)])
 
 for i in $(seq $n); do
     OVS_APP_EXIT_AND_WAIT_BY_TARGET([$(pwd)/s$i], [s$i.pid])

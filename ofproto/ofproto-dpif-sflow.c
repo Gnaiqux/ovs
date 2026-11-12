@@ -60,7 +60,6 @@ enum dpif_sflow_tunnel_type {
     DPIF_SFLOW_TUNNEL_UNKNOWN = 0,
     DPIF_SFLOW_TUNNEL_VXLAN,
     DPIF_SFLOW_TUNNEL_GRE,
-    DPIF_SFLOW_TUNNEL_LISP,
     DPIF_SFLOW_TUNNEL_GENEVE
 };
 
@@ -299,7 +298,6 @@ sflow_agent_get_counters(void *ds_, SFLPoller *poller,
     struct dpif_sflow *ds = ds_;
     SFLCounters_sample_element elem, lacp_elem, of_elem, name_elem;
     SFLCounters_sample_element eth_elem;
-    enum netdev_features current;
     struct dpif_sflow_port *dsp;
     SFLIf_counters *counters;
     SFLEthernet_counters* eth_counters;
@@ -308,6 +306,7 @@ sflow_agent_get_counters(void *ds_, SFLPoller *poller,
     struct lacp_member_stats lacp_stats;
     uint32_t curr_speed;
     const char *ifName;
+    bool full_duplex;
 
     dsp = dpif_sflow_find_port(ds, u32_to_odp(poller->bridgePort));
     if (!dsp) {
@@ -318,11 +317,10 @@ sflow_agent_get_counters(void *ds_, SFLPoller *poller,
     counters = &elem.counterBlock.generic;
     counters->ifIndex = SFL_DS_INDEX(poller->dsi);
     counters->ifType = 6;
-    if (!netdev_get_features(dsp->ofport->netdev, &current, NULL, NULL, NULL)) {
+    if (!netdev_get_duplex(dsp->ofport->netdev, &full_duplex)) {
         /* The values of ifDirection come from MAU MIB (RFC 2668): 0 = unknown,
            1 = full-duplex, 2 = half-duplex, 3 = in, 4=out */
-        counters->ifDirection = (netdev_features_is_full_duplex(current)
-                                 ? 1 : 2);
+        counters->ifDirection = full_duplex ? 1 : 2;
     } else {
         counters->ifDirection = 0;
     }
@@ -628,8 +626,6 @@ dpif_sflow_tunnel_type(struct ofport *ofport) {
             return DPIF_SFLOW_TUNNEL_GRE;
         } else if (strcmp(type, "vxlan") == 0) {
             return DPIF_SFLOW_TUNNEL_VXLAN;
-        } else if (strcmp(type, "lisp") == 0) {
-            return DPIF_SFLOW_TUNNEL_LISP;
         } else if (strcmp(type, "geneve") == 0) {
             return DPIF_SFLOW_TUNNEL_GENEVE;
         }
@@ -649,7 +645,6 @@ dpif_sflow_tunnel_proto(enum dpif_sflow_tunnel_type tunnel_type)
         break;
 
     case DPIF_SFLOW_TUNNEL_VXLAN:
-    case DPIF_SFLOW_TUNNEL_LISP:
     case DPIF_SFLOW_TUNNEL_GENEVE:
         ipproto = IPPROTO_UDP;
 
@@ -808,7 +803,7 @@ dpif_sflow_set_options(struct dpif_sflow *ds,
 
     receiver = sfl_agent_addReceiver(ds->sflow_agent);
     sfl_receiver_set_sFlowRcvrOwner(receiver, "Open vSwitch sFlow");
-    sfl_receiver_set_sFlowRcvrTimeout(receiver, 0xffffffff);
+    sfl_receiver_set_sFlowRcvrTimeout(receiver, UINT32_MAX);
 
     /* Set the sampling_rate down in the datapath. */
     ds->probability = MAX(1, UINT32_MAX / ds->options->sampling_rate);
@@ -1237,6 +1232,7 @@ dpif_sflow_read_actions(const struct flow *flow,
         case OVS_ACTION_ATTR_DROP:
         case OVS_ACTION_ATTR_ADD_MPLS:
         case OVS_ACTION_ATTR_DEC_TTL:
+        case OVS_ACTION_ATTR_PSAMPLE:
         case __OVS_ACTION_ATTR_MAX:
         default:
             break;

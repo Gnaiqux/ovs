@@ -372,9 +372,9 @@ tnl_wc_init(struct flow *flow, struct flow_wildcards *wc)
             wc->masks.tunnel.ipv6_src = in6addr_exact;
             wc->masks.tunnel.ipv6_dst = in6addr_exact;
         }
-        wc->masks.tunnel.flags = (FLOW_TNL_F_DONT_FRAGMENT |
-                                  FLOW_TNL_F_CSUM |
-                                  FLOW_TNL_F_KEY);
+        /* FLOW_TNL_F_KEY is necessary to tell if the tun_id is present.  Other
+         * flags are either controlled by OpenFlow or not used for matching. */
+        wc->masks.tunnel.flags = FLOW_TNL_F_KEY;
         wc->masks.tunnel.ip_tos = UINT8_MAX;
         wc->masks.tunnel.ip_ttl = 0;
         /* The tp_src and tp_dst members in flow_tnl are set to be always
@@ -465,8 +465,12 @@ tnl_port_send(const struct ofport_dpif *ofport, struct flow *flow,
 
     flow->tunnel.flags &= ~(FLOW_TNL_F_MASK & ~FLOW_TNL_PUB_F_MASK);
     flow->tunnel.flags |= (cfg->dont_fragment ? FLOW_TNL_F_DONT_FRAGMENT : 0)
-        | (cfg->csum ? FLOW_TNL_F_CSUM : 0)
         | (cfg->out_key_present ? FLOW_TNL_F_KEY : 0);
+
+    if (cfg->csum == NETDEV_TNL_CSUM_ENABLED ||
+        (cfg->csum == NETDEV_TNL_CSUM_DEFAULT && !flow->tunnel.ip_dst)) {
+        flow->tunnel.flags |= FLOW_TNL_F_CSUM;
+    }
 
     if (cfg->set_egress_pkt_mark) {
         flow->pkt_mark = cfg->egress_pkt_mark;
@@ -706,8 +710,10 @@ tnl_port_format(const struct tnl_port *tnl_port, struct ds *ds)
         ds_put_cstr(ds, ", df=false");
     }
 
-    if (cfg->csum) {
+    if (cfg->csum == NETDEV_TNL_CSUM_ENABLED) {
         ds_put_cstr(ds, ", csum=true");
+    } else if (cfg->csum == NETDEV_TNL_CSUM_DISABLED) {
+        ds_put_cstr(ds, ", csum=false");
     }
 
     ds_put_cstr(ds, ")\n");

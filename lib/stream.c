@@ -55,11 +55,7 @@ enum stream_state {
 
 static const struct stream_class *stream_classes[] = {
     &tcp_stream_class,
-#ifndef _WIN32
     &unix_stream_class,
-#else
-    &windows_stream_class,
-#endif
 #ifdef HAVE_OPENSSL
     &ssl_stream_class,
 #endif
@@ -67,11 +63,8 @@ static const struct stream_class *stream_classes[] = {
 
 static const struct pstream_class *pstream_classes[] = {
     &ptcp_pstream_class,
-#ifndef _WIN32
     &punix_pstream_class,
-#else
-    &pwindows_pstream_class,
-#endif
+    &pfd_pstream_class,
 #ifdef HAVE_OPENSSL
     &pssl_pstream_class,
 #endif
@@ -131,7 +124,7 @@ stream_usage(const char *name, bool active, bool passive,
                "PORT at remote HOST\n");
 #ifdef HAVE_OPENSSL
         printf("  ssl:HOST:PORT           "
-               "SSL PORT at remote HOST\n");
+               "SSL/TLS PORT at remote HOST\n");
 #endif
         printf("  unix:FILE               "
                "Unix domain socket named FILE\n");
@@ -143,14 +136,16 @@ stream_usage(const char *name, bool active, bool passive,
                "listen to TCP PORT on IP\n");
 #ifdef HAVE_OPENSSL
         printf("  pssl:PORT[:IP]          "
-               "listen for SSL on PORT on IP\n");
+               "listen for SSL/TLS on PORT on IP\n");
 #endif
         printf("  punix:FILE              "
                "listen on Unix domain socket FILE\n");
+        printf("  pfd:FD                  "
+               "listen on pre-opened file descriptor FD\n");
     }
 
 #ifdef HAVE_OPENSSL
-    printf("PKI configuration (required to use SSL):\n"
+    printf("PKI configuration (required to use SSL/TLS):\n"
            "  -p, --private-key=FILE  file with private key\n"
            "  -c, --certificate=FILE  file with certificate for private key\n"
            "  -C, --ca-cert=FILE      file with peer CA certificate\n");
@@ -158,9 +153,14 @@ stream_usage(const char *name, bool active, bool passive,
         printf("  --bootstrap-ca-cert=FILE  file with peer CA certificate "
                "to read or create\n");
     }
-    printf("SSL options:\n"
-           "  --ssl-protocols=PROTOS  list of SSL protocols to enable\n"
-           "  --ssl-ciphers=CIPHERS   list of SSL ciphers to enable\n");
+    printf("SSL/TLS options:\n"
+           "  --ssl-protocols=PROTOS    range of SSL/TLS protocols to enable\n"
+           "  --ssl-ciphers=CIPHERS     list of SSL/TLS ciphers to enable\n"
+           "                            with TLSv1.2\n"
+           "  --ssl-ciphersuites=SUITES list of SSL/TLS ciphersuites to\n"
+           "                            enable with TLSv1.3 and later\n"
+           "  --ssl-server-name=NAME    server name for TLS Server Name\n"
+           "                            Indication (SNI)\n");
 #endif
 }
 
@@ -216,7 +216,7 @@ int
 stream_open(const char *name, struct stream **streamp, uint8_t dscp)
 {
     const struct stream_class *class;
-    struct stream *stream;
+    struct stream *stream = NULL;
     char *suffix_copy;
     int error;
 
@@ -547,7 +547,7 @@ int
 pstream_open(const char *name, struct pstream **pstreamp, uint8_t dscp)
 {
     const struct pstream_class *class;
-    struct pstream *pstream;
+    struct pstream *pstream = NULL;
     char *suffix_copy;
     int error;
 
@@ -827,7 +827,7 @@ stream_content_type_to_string(enum stream_content_type type)
         return "OpenFlow";
 
     case STREAM_SSL:
-        return "SSL";
+        return "SSL/TLS";
     }
 }
 

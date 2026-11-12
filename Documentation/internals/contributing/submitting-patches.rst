@@ -320,6 +320,22 @@ Examples of common tags follow.
   appropriate to cite the URL to the report in a Reported-at
   tag.  Use a Reported-by tag to acknowledge the reporters.
 
+``Assisted-by: Name of model, and/or AI Code Assistant``
+
+  When a patch has been created with the assistance of an AI tool,
+  this tag should be used to disclose that fact.  Provide the name
+  of the underlying model used, if known.  For the name of the tool,
+  only include the name, not an email address.  For example:
+
+  ::
+
+      Assisted-by: model-name-42.0, OVS-Code-Assistant-Pro-9.0
+
+  The author of the patch remains fully responsible for the content
+  and must ensure it complies with the `Developer's Certificate of
+  Origin`_.  See the `AI-assisted Contributions`_ section for more
+  information.
+
 Developer's Certificate of Origin
 ---------------------------------
 
@@ -356,6 +372,19 @@ Open vSwitch please sign off your work.  The sign off certifies the following:
         this project or the open source license(s) involved.
 
 See also http://developercertificate.org/.
+
+AI-assisted Contributions
+-------------------------
+
+OVS is a Linux Foundation Collaborative Project, and the Linux Foundation's
+policy for AI-generated patches can be found here:
+https://www.linuxfoundation.org/legal/generative-ai .
+
+OVS allows the use of AI assistants in producing patches.  Contributions
+which have used an AI assistant should disclose the use of the assistant by
+using the "Assisted-by" tag.  While AI-assisted patches are allowed, the author
+of the patch is ultimately responsible for ensuring that the AI-generated code
+has not violated any terms of the Developer's Certificate of Origin.
 
 Feature Deprecation Guidelines
 ------------------------------
@@ -457,3 +486,41 @@ Example
      both_modules += brcompat
     -- 
     1.7.7.3
+
+.. _posting-new-versions:
+
+Posting New Versions
+--------------------
+
+When review feedback requires changes, post a revised patch as a new email
+thread (do not reply to the original thread).  Increment the version number in
+the subject prefix, e.g. ``[PATCH v2]``, ``[PATCH v3]``, and so on.  Include a
+changelog below the ``---`` separator line describing what changed since the
+previous version.  For example::
+
+    ---
+    v3: Addressed review comments from Jane Doe:
+        - Fixed off-by-one in foo().
+
+    v2: Addressed review comments from John Doe:
+        - Reworded commit message to clarify intent.
+        - Replaced open-coded loop with existing helper foo().
+
+Always resend the complete patch or series, not just the changed parts.  Before
+reposting, make sure the review thread on the previous version has gone quiet;
+do not post a new version while active discussion is still ongoing unless a
+reviewer explicitly asks you to.
+
+After Submitting
+----------------
+
+After sending your patch to the mailing list, keep an eye on its state in
+`Patchwork <https://patchwork.ozlabs.org/project/openvswitch/list/>`__.
+Maintainers update states manually as review progresses; see
+:ref:`patch-states` in :doc:`/internals/patchwork` for what each state means.
+
+If the patch is marked **Changes Requested**, post a revised version as
+described in :ref:`posting-new-versions` above.
+
+If you have not received any feedback for a while, send a ping to the mailing
+list.

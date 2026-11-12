@@ -67,12 +67,14 @@
 
 VLOG_DEFINE_THIS_MODULE(ovsdb_server);
 
-/* SSL configuration. */
+/* SSL/TLS configuration. */
 static char *private_key_file;
 static char *certificate_file;
 static char *ca_cert_file;
 static char *ssl_protocols;
 static char *ssl_ciphers;
+static char *ssl_ciphersuites;
+static char *ssl_server_name;
 static bool bootstrap_ca_cert;
 
 /* Try to reclaim heap memory back to system after DB compaction. */
@@ -400,9 +402,6 @@ main_loop(struct server_config *config,
             poll_timer_wait_until(status_timer);
         }
         poll_block();
-        if (should_service_stop()) {
-            *exiting = true;
-        }
     }
 
     free(remotes_error);
@@ -417,6 +416,7 @@ parse_relay_args(const char *arg, char **name, char **remote)
 {
     const char *relay_prefix = "relay:";
     const int relay_prefix_len = strlen(relay_prefix);
+    const char *second_colon;
     bool is_relay;
 
     is_relay = !strncmp(arg, relay_prefix, relay_prefix_len);
@@ -424,15 +424,15 @@ parse_relay_args(const char *arg, char **name, char **remote)
         return false;
     }
 
-    *remote = strchr(arg + relay_prefix_len, ':');
+    second_colon = strchr(arg + relay_prefix_len, ':');
 
-    if (!*remote || (*remote)[0] == '\0') {
+    if (!second_colon || second_colon[1] == '\0') {
         *remote = NULL;
         return false;
     }
     arg += relay_prefix_len;
-    *name = xmemdup0(arg, *remote - arg);
-    *remote = xstrdup(*remote + 1);
+    *name = xmemdup0(arg, second_colon - arg);
+    *remote = xstrdup(second_colon + 1);
     return true;
 }
 
@@ -503,7 +503,7 @@ add_database_config(struct shash *db_conf, const char *opt,
 
     conf = shash_replace_nocopy(db_conf, filename, conf);
     if (conf) {
-        VLOG_WARN("Duplicate database configuration: %s", filename);
+        VLOG_WARN("Duplicate database configuration: %s", opt);
         db_config_destroy(conf);
     }
 }
@@ -642,7 +642,7 @@ reconfigure_ovsdb_server(struct server_config *server_config)
     FILE *file = NULL;
 
     if (config_file_path) {
-        file = fopen(config_file_path, "r+b");
+        file = fopen(config_file_path, "rb");
         if (!file) {
             VLOG_ERR("failed to open configuration file '%s': %s",
                      config_file_path, ovs_strerror(errno));
@@ -692,7 +692,7 @@ reconfigure_ovsdb_server(struct server_config *server_config)
     } else {
         error = reconfigure_ssl(server_config->all_dbs);
         if (error) {
-            VLOG_WARN("failed to configure SSL: %s", error);
+            VLOG_WARN("failed to configure SSL/TLS: %s", error);
             res = false;
         }
     }
@@ -742,7 +742,6 @@ main(int argc, char *argv[])
 
     ovs_cmdl_proctitle_init(argc, argv);
     set_program_name(argv[0]);
-    service_start(&argc, &argv);
     fatal_ignore_sigpipe();
     process_init();
     dns_resolve_init(true);
@@ -816,7 +815,7 @@ main(int argc, char *argv[])
         /* ovsdb-server is usually a long-running process, in which case it
          * makes plenty of sense to log the version, but --run makes
          * ovsdb-server more like a command-line tool, so skip it.  */
-        VLOG_INFO("%s (Open vSwitch) %s", program_name, VERSION);
+        VLOG_INFO("%s", ovs_get_program_version());
     }
 
     unixctl_command_register("exit", "", 0, 0, ovsdb_server_exit, &exiting);
@@ -917,7 +916,6 @@ main(int argc, char *argv[])
     dns_resolve_destroy();
     perf_counters_destroy();
     cooperative_multitasking_destroy();
-    service_stop();
     return 0;
 }
 
@@ -929,7 +927,6 @@ static bool
 is_already_open(struct server_config *server_config OVS_UNUSED,
                 const char *filename OVS_UNUSED)
 {
-#ifndef _WIN32
     struct stat s;
 
     if (!stat(filename, &s)) {
@@ -947,7 +944,6 @@ is_already_open(struct server_config *server_config OVS_UNUSED,
             }
         }
     }
-#endif  /* !_WIN32 */
 
     return false;
 }
@@ -1422,6 +1418,12 @@ add_manager_options(struct shash *remotes, const struct ovsdb_row *row)
         return;
     }
 
+    if (!strncmp("pfd:", target, 4)) {
+        VLOG_WARN_RL(&rl, "pfd: remotes can only be specified on the "
+                     "command line; ignoring \"%s\" from database", target);
+        return;
+    }
+
     options = add_remote(remotes, target, NULL);
     if (ovsdb_util_read_integer_column(row, "max_backoff", &max_backoff)) {
         options->rpc.max_backoff = max_backoff;
@@ -1482,7 +1484,16 @@ query_db_remotes(const char *name, const struct shash *all_dbs,
 
             datum = &row->fields[column->index];
             for (i = 0; i < datum->n; i++) {
-                add_remote(remotes, json_string(datum->keys[i].s), NULL);
+                const char *t = json_string(datum->keys[i].s);
+                if (!strncmp("pfd:", t, 4)) {
+                    static struct vlog_rate_limit pfd_rl
+                        = VLOG_RATE_LIMIT_INIT(1, 1);
+                    VLOG_WARN_RL(&pfd_rl, "pfd: remotes can only be "
+                                 "specified on the command line; ignoring "
+                                 "\"%s\" from database", t);
+                    continue;
+                }
+                add_remote(remotes, t, NULL);
             }
         }
     } else if (column->type.key.type == OVSDB_TYPE_UUID
@@ -1791,17 +1802,25 @@ reconfigure_ssl(const struct shash *all_dbs)
     const char *resolved_ca_cert;
     const char *resolved_ssl_protocols;
     const char *resolved_ssl_ciphers;
+    const char *resolved_ssl_ciphersuites;
+    const char *resolved_ssl_server_name;
 
     resolved_private_key = query_db_string(all_dbs, private_key_file, &errors);
     resolved_certificate = query_db_string(all_dbs, certificate_file, &errors);
     resolved_ca_cert = query_db_string(all_dbs, ca_cert_file, &errors);
     resolved_ssl_protocols = query_db_string(all_dbs, ssl_protocols, &errors);
     resolved_ssl_ciphers = query_db_string(all_dbs, ssl_ciphers, &errors);
+    resolved_ssl_ciphersuites = query_db_string(all_dbs, ssl_ciphersuites,
+                                                &errors);
+    resolved_ssl_server_name = query_db_string(all_dbs, ssl_server_name,
+                                               &errors);
 
     stream_ssl_set_key_and_cert(resolved_private_key, resolved_certificate);
     stream_ssl_set_ca_cert_file(resolved_ca_cert, bootstrap_ca_cert);
     stream_ssl_set_protocols(resolved_ssl_protocols);
     stream_ssl_set_ciphers(resolved_ssl_ciphers);
+    stream_ssl_set_ciphersuites(resolved_ssl_ciphersuites);
+    stream_ssl_set_server_name(resolved_ssl_server_name);
 
     return errors.string;
 }
@@ -2280,6 +2299,12 @@ ovsdb_server_add_remote(struct unixctl_conn *conn, int argc OVS_UNUSED,
         return;
     }
 
+    if (!strncmp("pfd:", remote, 4)) {
+        unixctl_command_reply_error(conn,
+            "pfd: remotes can only be specified on the command line");
+        return;
+    }
+
     retval = (strncmp("db:", remote, 3)
               ? NULL
               : parse_db_column(config->all_dbs, remote,
@@ -2618,9 +2643,7 @@ parse_options(int argc, char *argv[],
     static const struct option long_options[] = {
         {"remote",      required_argument, NULL, OPT_REMOTE},
         {"unixctl",     required_argument, NULL, OPT_UNIXCTL},
-#ifndef _WIN32
         {"run",         required_argument, NULL, OPT_RUN},
-#endif
         {"help",        no_argument, NULL, 'h'},
         {"version",     no_argument, NULL, 'V'},
         DAEMON_LONG_OPTIONS,
@@ -2698,6 +2721,14 @@ parse_options(int argc, char *argv[],
             ssl_ciphers = optarg;
             break;
 
+        case OPT_SSL_CIPHERSUITES:
+            ssl_ciphersuites = optarg;
+            break;
+
+        case OPT_SSL_SERVER_NAME:
+            ssl_server_name = optarg;
+            break;
+
         case OPT_BOOTSTRAP_CA_CERT:
             ca_cert_file = optarg;
             bootstrap_ca_cert = true;
@@ -2738,6 +2769,7 @@ parse_options(int argc, char *argv[],
             break;
 
         case OPT_CONFIG_FILE:
+            free(config_file_path);
             config_file_path = abs_file_name(ovs_dbdir(), optarg);
             add_default_db = false;
             break;
@@ -3023,16 +3055,18 @@ db_config_from_json(const char *name, const struct json *json)
         sync_exclude = ovsdb_parser_member(&parser, "exclude-tables",
                                            OP_ARRAY | OP_OPTIONAL);
         if (sync_exclude) {
-            const struct json_array *exclude = json_array(sync_exclude);
             struct sset set = SSET_INITIALIZER(&set);
+            size_t n = json_array_size(sync_exclude);
 
-            for (size_t i = 0; i < exclude->n; i++) {
-                if (exclude->elems[i]->type != JSON_STRING) {
+            for (size_t i = 0; i < n; i++) {
+                const struct json *exclude = json_array_at(sync_exclude, i);
+
+                if (exclude->type != JSON_STRING) {
                     ovsdb_parser_raise_error(&parser,
                         "'exclude-tables' must contain strings");
                     break;
                 }
-                sset_add(&set, json_string(exclude->elems[i]));
+                sset_add(&set, json_string(exclude));
             }
             conf->ab.sync_exclude = sset_join(&set, ",", "");
             sset_destroy(&set);

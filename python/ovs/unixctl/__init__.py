@@ -12,11 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
+import enum
 
 import ovs.util
 
 commands = {}
+
+
+@enum.unique
+# FIXME: Use @enum.verify(enum.NAMED_FLAGS) from Python 3.11 when available.
+class UnixctlOutputFormat(enum.IntFlag):
+    TEXT = 1 << 0
+    JSON = 1 << 1
 
 
 class _UnixctlCommand(object):
@@ -70,8 +77,7 @@ def command_register(name, usage, min_args, max_args, callback, aux):
 def socket_name_from_target(target):
     assert isinstance(target, str)
 
-    """ On Windows an absolute path contains ':' ( i.e: C:\\ ) """
-    if target.startswith('/') or target.find(':') > -1:
+    if target.startswith('/'):
         return 0, target
 
     pidfile_name = "%s/%s.pid" % (ovs.dirs.RUNDIR, target)
@@ -79,10 +85,7 @@ def socket_name_from_target(target):
     if pid < 0:
         return -pid, "cannot read pidfile \"%s\"" % pidfile_name
 
-    if sys.platform == "win32":
-        return 0, "%s/%s.ctl" % (ovs.dirs.RUNDIR, target)
-    else:
-        return 0, "%s/%s.%d.ctl" % (ovs.dirs.RUNDIR, target, pid)
+    return 0, "%s/%s.%d.ctl" % (ovs.dirs.RUNDIR, target, pid)
 
 
 command_register("help", "", 0, 0, _unixctl_help, None)

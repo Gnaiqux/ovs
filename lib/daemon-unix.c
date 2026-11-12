@@ -347,6 +347,7 @@ monitor_daemon(pid_t daemon_pid)
     time_t last_restart;
     char *status_msg;
     int crashes;
+    int status;
     bool child_ready = true;
 
     set_subprogram_name("monitor");
@@ -355,7 +356,6 @@ monitor_daemon(pid_t daemon_pid)
     crashes = 0;
     for (;;) {
         int retval;
-        int status;
 
         ovs_cmdl_proctitle_set("monitoring pid %lu (%s)",
                                (unsigned long int) daemon_pid, status_msg);
@@ -531,7 +531,7 @@ daemonize_post_detach(void)
 {
     if (detach) {
         if (chdir_) {
-            ignore(chdir("/"));
+            ovs_ignore(chdir("/"));
         }
         close_standard_fds();
     }
@@ -707,25 +707,6 @@ check_already_running(void)
         VLOG_FATAL("%s: pidfile check failed (%s), aborting",
                    pidfile, ovs_strerror(-pid));
     }
-}
-
-
-/* stub functions for non-windows platform. */
-
-void
-service_start(int *argc OVS_UNUSED, char **argv[] OVS_UNUSED)
-{
-}
-
-void
-service_stop(void)
-{
-}
-
-bool
-should_service_stop(void)
-{
-    return false;
 }
 
 
@@ -915,8 +896,9 @@ daemon_become_new_user(bool access_datapath, bool access_hardware_ports)
 static size_t
 get_sysconf_buffer_size(void)
 {
-    size_t bufsize, pwd_bs = 0, grp_bs = 0;
     const size_t default_bufsize = 1024;
+    long pwd_bs = 0, grp_bs = 0;
+    size_t bufsize;
 
     errno = 0;
     if ((pwd_bs = sysconf(_SC_GETPW_R_SIZE_MAX)) == -1) {
@@ -924,14 +906,24 @@ get_sysconf_buffer_size(void)
             VLOG_FATAL("%s: Read initial passwordd struct size "
                        "failed (%s), aborting. ", pidfile,
                        ovs_strerror(errno));
+        } else {
+            /* As per API documentation, sysconf(_SC_GETPW_R_SIZE_MAX) may
+             * return -1 without setting errno, indicating no recommended
+             * size. In that case, fall back to the default buffer size. */
+            pwd_bs = default_bufsize;
         }
     }
 
+    errno = 0;
     if ((grp_bs = sysconf(_SC_GETGR_R_SIZE_MAX)) == -1) {
         if (errno) {
             VLOG_FATAL("%s: Read initial group struct size "
                        "failed (%s), aborting. ", pidfile,
                        ovs_strerror(errno));
+        } else {
+            /* See above comment on _SC_GETPW_R_SIZE_MAX, as the same applies
+             * to _SC_GETGR_R_SIZE_MAX. */
+            grp_bs = default_bufsize;
         }
     }
 
@@ -970,7 +962,7 @@ enlarge_buffer(char **buf, size_t *sizep)
 void
 daemon_set_new_user(const char *user_spec)
 {
-    char *pos = strchr(user_spec, ':');
+    const char *pos = strchr(user_spec, ':');
     size_t init_bufsize, bufsize;
 
     init_bufsize = get_sysconf_buffer_size();
@@ -1025,7 +1017,7 @@ daemon_set_new_user(const char *user_spec)
     free(buf);
 
     if (pos) {
-        char *grpstr = pos + 1;
+        const char *grpstr = pos + 1;
         grpstr += strspn(grpstr, " \t\r\n");
 
         if (*grpstr) {

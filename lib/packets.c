@@ -33,11 +33,13 @@
 #include "ovs-thread.h"
 #include "odp-util.h"
 #include "dp-packet.h"
+#include "dp-packet-gso.h"
 #include "unaligned.h"
 
 const struct in6_addr in6addr_exact = IN6ADDR_EXACT_INIT;
 const struct in6_addr in6addr_all_hosts = IN6ADDR_ALL_HOSTS_INIT;
 const struct in6_addr in6addr_all_routers = IN6ADDR_ALL_ROUTERS_INIT;
+const struct in6_addr in6addr_v4mapped_any = IN6ADDR_V4MAPPED_ANY_INIT;
 
 struct in6_addr
 flow_tnl_dst(const struct flow_tnl *tnl)
@@ -1081,6 +1083,25 @@ ipv6_is_cidr(const struct in6_addr *netmask)
     return true;
 }
 
+bool
+ipv6_addr_equals_masked(const struct in6_addr *a, const struct in6_addr *b,
+                        int plen)
+{
+    struct in6_addr mask;
+    struct in6_addr ma;
+    struct in6_addr mb;
+
+    if (plen == 128) {
+        return ipv6_addr_equals(a, b);
+    }
+
+    mask = ipv6_create_mask(plen);
+    ma = ipv6_addr_bitand(a, &mask);
+    mb = ipv6_addr_bitand(b, &mask);
+
+    return ipv6_addr_equals(&ma, &mb);
+}
+
 /* Populates 'b' with an Ethernet II packet headed with the given 'eth_dst',
  * 'eth_src' and 'eth_type' parameters.  A payload of 'size' bytes is allocated
  * in 'b' and returned.  This payload may be populated with appropriate
@@ -1129,15 +1150,15 @@ packet_set_ipv4_addr(struct dp_packet *packet,
     pkt_metadata_init_conn(&packet->md);
 
     if (nh->ip_proto == IPPROTO_TCP && l4_size >= TCP_HEADER_LEN) {
-        if (dp_packet_hwol_l4_is_tcp(packet)) {
-            dp_packet_ol_reset_l4_csum_good(packet);
+        if (dp_packet_l4_checksum_valid(packet)) {
+            dp_packet_l4_checksum_set_partial(packet);
         } else {
             struct tcp_header *th = dp_packet_l4(packet);
             th->tcp_csum = recalc_csum32(th->tcp_csum, old_addr, new_addr);
         }
     } else if (nh->ip_proto == IPPROTO_UDP && l4_size >= UDP_HEADER_LEN ) {
-        if (dp_packet_hwol_l4_is_udp(packet)) {
-            dp_packet_ol_reset_l4_csum_good(packet);
+        if (dp_packet_l4_checksum_valid(packet)) {
+            dp_packet_l4_checksum_set_partial(packet);
         } else {
             struct udp_header *uh = dp_packet_l4(packet);
             if (uh->udp_csum) {
@@ -1149,8 +1170,8 @@ packet_set_ipv4_addr(struct dp_packet *packet,
         }
     }
 
-    if (dp_packet_hwol_l3_ipv4(packet)) {
-        dp_packet_ol_reset_ip_csum_good(packet);
+    if (dp_packet_ip_checksum_valid(packet)) {
+        dp_packet_ip_checksum_set_partial(packet);
     } else {
         nh->ip_csum = recalc_csum32(nh->ip_csum, old_addr, new_addr);
     }
@@ -1250,16 +1271,16 @@ packet_update_csum128(struct dp_packet *packet, uint8_t proto,
     size_t l4_size = dp_packet_l4_size(packet);
 
     if (proto == IPPROTO_TCP && l4_size >= TCP_HEADER_LEN) {
-        if (dp_packet_hwol_l4_is_tcp(packet)) {
-            dp_packet_ol_reset_l4_csum_good(packet);
+        if (dp_packet_l4_checksum_valid(packet)) {
+            dp_packet_l4_checksum_set_partial(packet);
         } else {
             struct tcp_header *th = dp_packet_l4(packet);
 
             th->tcp_csum = recalc_csum128(th->tcp_csum, addr, new_addr);
         }
     } else if (proto == IPPROTO_UDP && l4_size >= UDP_HEADER_LEN) {
-        if (dp_packet_hwol_l4_is_udp(packet)) {
-            dp_packet_ol_reset_l4_csum_good(packet);
+        if (dp_packet_l4_checksum_valid(packet)) {
+            dp_packet_l4_checksum_set_partial(packet);
         } else {
             struct udp_header *uh = dp_packet_l4(packet);
 
@@ -1299,7 +1320,7 @@ packet_set_ipv6_flow_label(ovs_16aligned_be32 *flow_label, ovs_be32 flow_key)
     put_16aligned_be32(flow_label, new_label);
 }
 
-static void
+void
 packet_set_ipv6_tc(ovs_16aligned_be32 *flow_label, uint8_t tc)
 {
     ovs_be32 old_label = get_16aligned_be32(flow_label);
@@ -1328,8 +1349,8 @@ packet_set_ipv4(struct dp_packet *packet, ovs_be32 src, ovs_be32 dst,
     if (nh->ip_tos != tos) {
         uint8_t *field = &nh->ip_tos;
 
-        if (dp_packet_hwol_l3_ipv4(packet)) {
-            dp_packet_ol_reset_ip_csum_good(packet);
+        if (dp_packet_ip_checksum_valid(packet)) {
+            dp_packet_ip_checksum_set_partial(packet);
         } else {
             nh->ip_csum = recalc_csum16(nh->ip_csum, htons((uint16_t) *field),
                                         htons((uint16_t) tos));
@@ -1341,8 +1362,8 @@ packet_set_ipv4(struct dp_packet *packet, ovs_be32 src, ovs_be32 dst,
     if (nh->ip_ttl != ttl) {
         uint8_t *field = &nh->ip_ttl;
 
-        if (dp_packet_hwol_l3_ipv4(packet)) {
-            dp_packet_ol_reset_ip_csum_good(packet);
+        if (dp_packet_ip_checksum_valid(packet)) {
+            dp_packet_ip_checksum_set_partial(packet);
         } else {
             nh->ip_csum = recalc_csum16(nh->ip_csum, htons(*field << 8),
                                         htons(ttl << 8));
@@ -1403,8 +1424,8 @@ packet_set_tcp_port(struct dp_packet *packet, ovs_be16 src, ovs_be16 dst)
     struct tcp_header *th = dp_packet_l4(packet);
     ovs_be16 *csum = NULL;
 
-    if (dp_packet_hwol_l4_is_tcp(packet)) {
-        dp_packet_ol_reset_l4_csum_good(packet);
+    if (dp_packet_l4_checksum_valid(packet)) {
+        dp_packet_l4_checksum_set_partial(packet);
     } else {
         csum = &th->tcp_csum;
     }
@@ -1422,8 +1443,8 @@ packet_set_udp_port(struct dp_packet *packet, ovs_be16 src, ovs_be16 dst)
 {
     struct udp_header *uh = dp_packet_l4(packet);
 
-    if (dp_packet_hwol_l4_is_udp(packet)) {
-        dp_packet_ol_reset_l4_csum_good(packet);
+    if (dp_packet_l4_checksum_valid(packet)) {
+        dp_packet_l4_checksum_set_partial(packet);
         packet_set_port(&uh->udp_src, src, NULL);
         packet_set_port(&uh->udp_dst, dst, NULL);
     } else {
@@ -1448,8 +1469,8 @@ packet_set_sctp_port(struct dp_packet *packet, ovs_be16 src, ovs_be16 dst)
 {
     struct sctp_header *sh = dp_packet_l4(packet);
 
-    if (dp_packet_hwol_l4_is_sctp(packet)) {
-        dp_packet_ol_reset_l4_csum_good(packet);
+    if (dp_packet_l4_checksum_valid(packet)) {
+        dp_packet_l4_checksum_set_partial(packet);
         sh->sctp_src = src;
         sh->sctp_dst = dst;
     } else {
@@ -1488,6 +1509,80 @@ packet_set_icmp(struct dp_packet *packet, uint8_t type, uint8_t code)
         ih->icmp_csum = recalc_csum16(ih->icmp_csum, orig_tc, new_tc);
     }
     pkt_metadata_init_conn(&packet->md);
+}
+
+/* Sets the ICMP id of the ICMP header contained in 'packet'.
+ * 'packet' must be a valid ICMP packet with its l4 offset properly
+ * populated. */
+void
+packet_set_icmp_id(struct dp_packet *packet, ovs_be16 icmp_id)
+{
+    struct icmp_header *ih = dp_packet_l4(packet);
+
+    if (!ih || dp_packet_l4_size(packet) < ICMP_HEADER_LEN) {
+        return;
+    }
+
+    ovs_be16 orig_ic = ih->icmp_fields.echo.id;
+
+    if (icmp_id != orig_ic) {
+        ih->icmp_fields.echo.id = icmp_id;
+        ih->icmp_csum = recalc_csum16(ih->icmp_csum, orig_ic, icmp_id);
+    }
+
+    pkt_metadata_init_conn(&packet->md);
+}
+
+uint8_t
+packet_get_icmp_type(const struct dp_packet *packet)
+{
+    struct icmp_header *ih = dp_packet_l4(packet);
+
+    if (!ih || dp_packet_l4_size(packet) < ICMP_HEADER_LEN) {
+        return 0;
+    }
+
+    return ih->icmp_type;
+}
+
+uint8_t
+packet_get_ip_proto(const struct dp_packet *packet)
+{
+    struct eth_header *l2 = dp_packet_eth(packet);
+    uint8_t ip_proto;
+
+    if (l2->eth_type == htons(ETH_TYPE_IPV6)) {
+        struct ovs_16aligned_ip6_hdr *nh6 = dp_packet_l3(packet);
+        ip_proto = nh6->ip6_ctlun.ip6_un1.ip6_un1_nxt;
+    } else {
+        struct ip_header *l3_hdr = dp_packet_l3(packet);
+        ip_proto = l3_hdr->ip_proto;
+    }
+
+    return ip_proto;
+}
+
+bool
+packet_is_icmpv4_info_message(const struct dp_packet *packet)
+{
+    uint8_t ip_proto, icmp_type;
+
+    ip_proto = packet_get_ip_proto(packet);
+    if (ip_proto != IPPROTO_ICMP) {
+        return false;
+    }
+
+    icmp_type = packet_get_icmp_type(packet);
+    if (icmp_type == ICMP4_ECHO_REQUEST ||
+        icmp_type == ICMP4_ECHO_REPLY ||
+        icmp_type == ICMP4_TIMESTAMP ||
+        icmp_type == ICMP4_TIMESTAMPREPLY ||
+        icmp_type == ICMP4_INFOREQUEST ||
+        icmp_type == ICMP4_INFOREPLY) {
+        return true;
+    }
+
+    return false;
 }
 
 /* Sets the IGMP type to IGMP_HOST_MEMBERSHIP_QUERY and populates the
@@ -1588,7 +1683,8 @@ packet_set_nd(struct dp_packet *packet, const struct in6_addr *target,
                              true);
     }
 
-    while (bytes_remain >= ND_LLA_OPT_LEN && opt->len != 0) {
+    while (bytes_remain >= ND_LLA_OPT_LEN && opt->len != 0
+           && bytes_remain >= (opt->len * ND_LLA_OPT_LEN)) {
         if (opt->type == ND_OPT_SOURCE_LINKADDR && opt->len == 1) {
             if (!eth_addr_equals(opt->mac, sll)) {
                 ovs_be16 *csum = &(ns->icmph.icmp6_cksum);
@@ -1772,17 +1868,21 @@ compose_ipv6(struct dp_packet *packet, uint8_t proto,
 
 /* Compose an IPv6 Neighbor Discovery Neighbor Solicitation message. */
 void
-compose_nd_ns(struct dp_packet *b, const struct eth_addr eth_src,
+compose_nd_ns(struct dp_packet *b, bool multicast,
+              struct eth_addr eth_src, struct eth_addr eth_dst,
               const struct in6_addr *ipv6_src, const struct in6_addr *ipv6_dst)
 {
     struct in6_addr sn_addr;
-    struct eth_addr eth_dst;
     struct ovs_nd_msg *ns;
     struct ovs_nd_lla_opt *lla_opt;
     uint32_t icmp_csum;
 
-    in6_addr_solicited_node(&sn_addr, ipv6_dst);
-    ipv6_multicast_to_ethernet(&eth_dst, &sn_addr);
+    if (multicast) {
+        in6_addr_solicited_node(&sn_addr, ipv6_dst);
+        ipv6_multicast_to_ethernet(&eth_dst, &sn_addr);
+    } else {
+        sn_addr = *ipv6_dst;
+    }
 
     eth_compose(b, eth_dst, eth_src, ETH_TYPE_IPV6, IPV6_HEADER_LEN);
     ns = compose_ipv6(b, IPPROTO_ICMPV6, ipv6_src, &sn_addr,
@@ -1979,8 +2079,8 @@ IP_ECN_set_ce(struct dp_packet *pkt, bool is_ipv6)
 
         tos |= IP_ECN_CE;
         if (nh->ip_tos != tos) {
-            if (dp_packet_hwol_l3_ipv4(pkt)) {
-                dp_packet_ol_reset_ip_csum_good(pkt);
+            if (dp_packet_ip_checksum_valid(pkt)) {
+                dp_packet_ip_checksum_set_partial(pkt);
             } else {
                 nh->ip_csum = recalc_csum16(nh->ip_csum, htons(nh->ip_tos),
                                             htons((uint16_t) tos));
@@ -1999,7 +2099,6 @@ packet_tcp_complete_csum(struct dp_packet *p, bool inner)
     struct tcp_header *tcp;
     size_t tcp_sz;
     void *ip_hdr;
-    bool is_v4;
 
     if (inner) {
         tcp = dp_packet_inner_l4(p);
@@ -2014,20 +2113,8 @@ packet_tcp_complete_csum(struct dp_packet *p, bool inner)
     ovs_assert(tcp);
     ovs_assert(ip_hdr);
 
-    if (!inner && dp_packet_hwol_is_outer_ipv6(p)) {
-        is_v4 = false;
-    } else if (!inner && dp_packet_hwol_is_outer_ipv4(p)) {
-        is_v4 = true;
-    } else if (dp_packet_hwol_is_ipv4(p)) {
-        is_v4 = true;
-    } else if (dp_packet_hwol_tx_ipv6(p)) {
-        is_v4 = false;
-    } else {
-        OVS_NOT_REACHED();
-    }
-
     tcp->tcp_csum = 0;
-    if (is_v4) {
+    if (IP_VER(((const struct ip_header *) ip_hdr)->ip_ihl_ver) == 4) {
         struct ip_header *ip = ip_hdr;
 
         tcp->tcp_csum = csum_finish(csum_continue(packet_csum_pseudoheader(ip),
@@ -2037,6 +2124,12 @@ packet_tcp_complete_csum(struct dp_packet *p, bool inner)
 
         tcp->tcp_csum = packet_csum_upperlayer6(ip6, tcp, ip6->ip6_nxt,
                                                 tcp_sz);
+    }
+
+    if (inner) {
+        dp_packet_inner_l4_checksum_set_good(p);
+    } else {
+        dp_packet_l4_checksum_set_good(p);
     }
 }
 
@@ -2048,7 +2141,6 @@ packet_udp_complete_csum(struct dp_packet *p, bool inner)
     struct udp_header *udp;
     size_t udp_sz;
     void *ip_hdr;
-    bool is_v4;
 
     if (inner) {
         udp = dp_packet_inner_l4(p);
@@ -2065,23 +2157,11 @@ packet_udp_complete_csum(struct dp_packet *p, bool inner)
 
     /* Skip csum calculation if the udp_csum is zero. */
     if (!udp->udp_csum) {
-        return;
-    }
-
-    if (!inner && dp_packet_hwol_is_outer_ipv6(p)) {
-        is_v4 = false;
-    } else if (!inner && dp_packet_hwol_is_outer_ipv4(p)) {
-        is_v4 = true;
-    } else if (dp_packet_hwol_is_ipv4(p)) {
-        is_v4 = true;
-    } else if (dp_packet_hwol_tx_ipv6(p)) {
-        is_v4 = false;
-    } else {
-        OVS_NOT_REACHED();
+        goto out;
     }
 
     udp->udp_csum = 0;
-    if (is_v4) {
+    if (IP_VER(((const struct ip_header *) ip_hdr)->ip_ihl_ver) == 4) {
         struct ip_header *ip = ip_hdr;
 
         udp->udp_csum = csum_finish(csum_continue(packet_csum_pseudoheader(ip),
@@ -2096,6 +2176,152 @@ packet_udp_complete_csum(struct dp_packet *p, bool inner)
     if (!udp->udp_csum) {
         udp->udp_csum = htons(0xffff);
     }
+
+out:
+    if (inner) {
+        dp_packet_inner_l4_checksum_set_good(p);
+    } else {
+        dp_packet_l4_checksum_set_good(p);
+    }
+}
+
+/* This helper computes a "constant" UDP checksum without looking at the
+ * L4 payload.
+ *
+ * This is possible when L4 is either TCP or UDP: the L4 payload checksum
+ * is either computed in SW or in HW later, but its contribution to the
+ * outer checksum is cancelled by the L4 payload being part of the global
+ * packet sum. */
+bool
+packet_udp_tunnel_csum(struct dp_packet *p)
+{
+    struct ip_header *inner_ip;
+    const void *inner_l4_data;
+    char *after_inner_l4_csum;
+    size_t inner_l4_csum_off;
+    struct udp_header *udp;
+    ovs_be16 inner_l4_csum;
+    uint32_t partial_csum;
+    struct ip_header *ip;
+    uint32_t inner_csum;
+    uint16_t tso_segsz;
+    bool inner_ipv4;
+    void *inner_l4;
+
+    inner_ip = dp_packet_inner_l3(p);
+    inner_l4 = dp_packet_inner_l4(p);
+    ip = dp_packet_l3(p);
+    udp = dp_packet_l4(p);
+
+    if (dp_packet_inner_l4_proto_tcp(p)) {
+        inner_l4_csum_off = offsetof(struct tcp_header, tcp_csum);
+        inner_l4_data = dp_packet_get_inner_tcp_payload(p);
+        if (!inner_l4_data) {
+            /* Malformed packet. */
+            return false;
+        }
+    } else if (dp_packet_inner_l4_proto_udp(p)) {
+        inner_l4_csum_off = offsetof(struct udp_header, udp_csum);
+        inner_l4_data = (char *) inner_l4 + sizeof (struct udp_header);
+        if (((struct udp_header *) inner_l4)->udp_csum == 0) {
+            /* There is no nested checksum.
+             * No choice but compute a full checksum. */
+            return false;
+        }
+    } else {
+        /* This optimisation applies only to inner TCP/UDP. */
+        return false;
+    }
+
+    if (!dp_packet_inner_l4_checksum_valid(p)) {
+        /* We have no idea about the contribution of the payload data
+         * and what the L4 checksum put in the packet data looks like.
+         * Simpler is to let a full checksum happen. */
+        return false;
+    }
+
+    inner_ipv4 = IP_VER(inner_ip->ip_ihl_ver) == 4;
+    if (inner_ipv4) {
+        inner_csum = packet_csum_pseudoheader(inner_ip);
+    } else {
+        struct ovs_16aligned_ip6_hdr *inner_ip6 = dp_packet_inner_l3(p);
+
+        inner_csum = packet_csum_pseudoheader6(inner_ip6);
+    }
+
+    inner_csum = csum_continue(inner_csum, inner_l4, inner_l4_csum_off);
+    after_inner_l4_csum = (char *) inner_l4 + inner_l4_csum_off + 2;
+    inner_l4_csum = csum_finish(csum_continue(inner_csum, after_inner_l4_csum,
+        (char *) inner_l4_data - after_inner_l4_csum));
+    /* Important: for inner UDP, a null inner_l4_csum here should in theory be
+     * replaced with 0xffff.  However, since the only use of inner_l4_csum is
+     * for the final outer checksum with a csum_add16() below, we can skip this
+     * entirely because adding 0xffff will have the same effect as adding 0x0
+     * after reducing in csum_finish. */
+
+    udp->udp_csum = 0;
+    if (IP_VER(ip->ip_ihl_ver) == 4) {
+        partial_csum = packet_csum_pseudoheader(ip);
+    } else {
+        struct ovs_16aligned_ip6_hdr *ip6 = dp_packet_l3(p);
+
+        partial_csum = packet_csum_pseudoheader6(ip6);
+    }
+
+    partial_csum = csum_continue(partial_csum, udp,
+        (char *) inner_ip - (char *) udp);
+    if (!inner_ipv4 || !dp_packet_inner_ip_checksum_valid(p)) {
+        /* IPv6 has no checksum, so for inner IPv6, we need to sum the header.
+         *
+         * In IPv4 case, if inner checksum is already good or HW offload
+         * has been requested, the (final) sum of the IPv4 header will be 0.
+         * Otherwise, we need to sum the header like for IPv6. */
+        partial_csum = csum_continue(partial_csum, inner_ip,
+            (char *) inner_l4 - (char *) inner_ip);
+    }
+    partial_csum = csum_continue(partial_csum, inner_l4, inner_l4_csum_off);
+    partial_csum = csum_add16(partial_csum, inner_l4_csum);
+    partial_csum = csum_continue(partial_csum, after_inner_l4_csum,
+        (char *) inner_l4_data - after_inner_l4_csum);
+    udp->udp_csum = csum_finish(partial_csum);
+    tso_segsz = dp_packet_get_tso_segsz(p);
+    if (tso_segsz) {
+        uint16_t payload_len = dp_packet_get_inner_tcp_payload_length(p);
+
+        ovs_assert(payload_len == tso_segsz * dp_packet_gso_nr_segs(p));
+
+        /* The pseudo header used in the outer UDP checksum is dependent on
+         * the ip_tot_len / ip6_plen which was a reflection of the TSO frame
+         * size. The segmented packet will be shorter. */
+        udp->udp_csum = recalc_csum16(udp->udp_csum, htons(payload_len),
+                                      htons(tso_segsz));
+
+        /* When segmenting the packet, various headers get updated:
+         * - inner L3
+         *   - for IPv4, ip_tot_len is updated, BUT it is not affecting the
+         *     outer UDP checksum because the IPv4 header itself contains
+         *     a checksum that compensates for this update,
+         *   - for IPv6, ip6_plen is updated, and this must be considered,
+         * - inner L4
+         *   - inner pseudo header used in the TCP checksum is dependent on
+         *     the inner ip_tot_len / ip6_plen,
+         *   - TCP seq number is updated,
+         *   - the HW may change some TCP flags (think PSH/FIN),
+         *   BUT the TCP checksum will compensate for those updates,
+         *
+         * Summary: we only care about the inner IPv6 header update.
+         */
+        if (IP_VER(inner_ip->ip_ihl_ver) != 4) {
+            udp->udp_csum = recalc_csum16(udp->udp_csum, htons(payload_len),
+                                          htons(tso_segsz));
+        }
+    }
+    if (!udp->udp_csum) {
+        udp->udp_csum = htons(0xffff);
+    }
+    dp_packet_l4_checksum_set_good(p);
+
+    return true;
 }
 
 /* Set SCTP checksum field in packet 'p' with complete checksum.
@@ -2120,4 +2346,10 @@ packet_sctp_complete_csum(struct dp_packet *p, bool inner)
     put_16aligned_be32(&sh->sctp_csum, 0);
     csum = crc32c((void *) sh, tp_len);
     put_16aligned_be32(&sh->sctp_csum, csum);
+
+    if (inner) {
+        dp_packet_inner_l4_checksum_set_good(p);
+    } else {
+        dp_packet_l4_checksum_set_good(p);
+    }
 }

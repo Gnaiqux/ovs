@@ -736,6 +736,8 @@ IP_ECN_is_ce(uint8_t dsfield)
 #define IP_FRAG_OFF_MASK  0x1fff /* Fragment offset. */
 #define IP_IS_FRAGMENT(ip_frag_off) \
         ((ip_frag_off) & htons(IP_MORE_FRAGMENTS | IP_FRAG_OFF_MASK))
+#define IP_IS_LATER_FRAG(ip_frag_off) \
+        ((ip_frag_off) & htons(IP_FRAG_OFF_MASK))
 
 #define IP_HEADER_LEN 20
 struct ip_header {
@@ -977,6 +979,8 @@ union ovs_16aligned_in6_addr {
     ovs_be16 be16[8];
     ovs_16aligned_be32 be32[4];
 };
+BUILD_ASSERT_DECL(sizeof(union ovs_16aligned_in6_addr)
+                  == sizeof(struct in6_addr));
 
 /* Like struct ip6_hdr, but whereas that struct requires 32-bit alignment, this
  * one only requires 16-bit alignment. */
@@ -1169,6 +1173,11 @@ extern const struct in6_addr in6addr_all_hosts;
 extern const struct in6_addr in6addr_all_routers;
 #define IN6ADDR_ALL_ROUTERS_INIT { { { 0xff,0x02,0x00,0x00,0x00,0x00,0x00,0x00, \
                                        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x02 } } }
+
+extern const struct in6_addr in6addr_v4mapped_any;
+#define IN6ADDR_V4MAPPED_ANY_INIT \
+    { { { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, \
+          0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00 } } }
 
 static inline bool ipv6_addr_equals(const struct in6_addr *a,
                                     const struct in6_addr *b)
@@ -1604,6 +1613,8 @@ bool ipv6_is_zero(const struct in6_addr *a);
 struct in6_addr ipv6_create_mask(int mask);
 int ipv6_count_cidr_bits(const struct in6_addr *netmask);
 bool ipv6_is_cidr(const struct in6_addr *netmask);
+bool ipv6_addr_equals_masked(const struct in6_addr *a,
+                             const struct in6_addr *b, int plen);
 
 bool ipv6_parse(const char *s, struct in6_addr *ip);
 char *ipv6_parse_masked(const char *s, struct in6_addr *ipv6,
@@ -1635,10 +1646,15 @@ void packet_set_ipv6_addr(struct dp_packet *packet, uint8_t proto,
                           bool recalculate_csum);
 void packet_set_ipv6_flow_label(ovs_16aligned_be32 *flow_label,
                                 ovs_be32 flow_key);
+void packet_set_ipv6_tc(ovs_16aligned_be32 *flow_label, uint8_t tc);
 void packet_set_tcp_port(struct dp_packet *, ovs_be16 src, ovs_be16 dst);
 void packet_set_udp_port(struct dp_packet *, ovs_be16 src, ovs_be16 dst);
 void packet_set_sctp_port(struct dp_packet *, ovs_be16 src, ovs_be16 dst);
 void packet_set_icmp(struct dp_packet *, uint8_t type, uint8_t code);
+void packet_set_icmp_id(struct dp_packet *, ovs_be16 icmp_id);
+uint8_t packet_get_icmp_type(const struct dp_packet *packet);
+uint8_t packet_get_ip_proto(const struct dp_packet *packet);
+bool packet_is_icmpv4_info_message(const struct dp_packet *packet);
 void packet_set_nd(struct dp_packet *, const struct in6_addr *target,
                    const struct eth_addr sll, const struct eth_addr tll);
 void packet_set_nd_ext(struct dp_packet *packet,
@@ -1657,7 +1673,9 @@ void compose_arp(struct dp_packet *, uint16_t arp_op,
                  const struct eth_addr arp_sha,
                  const struct eth_addr arp_tha, bool broadcast,
                  ovs_be32 arp_spa, ovs_be32 arp_tpa);
-void compose_nd_ns(struct dp_packet *, const struct eth_addr eth_src,
+void compose_nd_ns(struct dp_packet *, bool multicast,
+                   struct eth_addr eth_src,
+                   struct eth_addr eth_dst,
                    const struct in6_addr *ipv6_src,
                    const struct in6_addr *ipv6_dst);
 void compose_nd_na(struct dp_packet *, const struct eth_addr eth_src,
@@ -1684,6 +1702,7 @@ bool packet_rh_present(struct dp_packet *packet, uint8_t *nexthdr,
 void IP_ECN_set_ce(struct dp_packet *pkt, bool is_ipv6);
 void packet_tcp_complete_csum(struct dp_packet *, bool is_inner);
 void packet_udp_complete_csum(struct dp_packet *, bool is_inner);
+bool packet_udp_tunnel_csum(struct dp_packet *);
 void packet_sctp_complete_csum(struct dp_packet *, bool is_inner);
 
 #define DNS_HEADER_LEN 12

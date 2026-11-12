@@ -9,11 +9,7 @@ bin_SCRIPTS += utilities/ovs-docker \
 	utilities/ovs-pcap \
 	utilities/ovs-tcpdump \
 	utilities/ovs-tcpundump \
-	utilities/ovs-dpctl-top \
-	utilities/ovs-l3ping \
-	utilities/ovs-parse-backtrace \
-	utilities/ovs-test \
-	utilities/ovs-vlan-test
+	utilities/ovs-dpctl-top
 scripts_SCRIPTS += \
 	utilities/ovs-check-dead-ifs \
 	utilities/ovs-ctl \
@@ -22,13 +18,14 @@ scripts_SCRIPTS += \
 scripts_DATA += utilities/ovs-lib
 usdt_SCRIPTS += \
 	utilities/usdt-scripts/bridge_loop.bt \
-	utilities/usdt-scripts/dpif_nl_exec_monitor.py \
+	utilities/usdt-scripts/dpif_op_nl_monitor.py \
 	utilities/usdt-scripts/flow_reval_monitor.py \
 	utilities/usdt-scripts/kernel_delay.py \
 	utilities/usdt-scripts/kernel_delay.rst \
 	utilities/usdt-scripts/reval_monitor.py \
 	utilities/usdt-scripts/upcall_cost.py \
-	utilities/usdt-scripts/upcall_monitor.py
+	utilities/usdt-scripts/upcall_monitor.py \
+	utilities/usdt-scripts/usdt_lib.py
 
 completion_SCRIPTS += \
 	utilities/ovs-appctl-bashcomp.bash \
@@ -52,19 +49,16 @@ EXTRA_DIST += \
 	utilities/ovs-docker \
 	utilities/ovs-dpctl-top.in \
 	utilities/ovs-kmod-ctl.in \
-	utilities/ovs-l3ping.in \
 	utilities/ovs-lib.in \
-	utilities/ovs-parse-backtrace.in \
 	utilities/ovs-pcap.in \
 	utilities/ovs-pipegen.py \
 	utilities/ovs-pki.in \
 	utilities/ovs-save \
 	utilities/ovs-tcpdump.in \
 	utilities/ovs-tcpundump.in \
-	utilities/ovs-test.in \
-	utilities/ovs-vlan-test.in \
 	utilities/ovs-vsctl-bashcomp.bash \
 	utilities/checkpatch.py \
+	utilities/checkpatch_dict.txt \
 	utilities/docker/Makefile \
 	utilities/docker/ovs-override.conf \
 	utilities/docker/start-ovs \
@@ -72,13 +66,15 @@ EXTRA_DIST += \
 	utilities/docker/debian/Dockerfile \
 	utilities/docker/debian/build-kernel-modules.sh \
 	utilities/usdt-scripts/bridge_loop.bt \
-	utilities/usdt-scripts/dpif_nl_exec_monitor.py \
+	utilities/usdt-scripts/dpif_op_nl_monitor.py \
 	utilities/usdt-scripts/flow_reval_monitor.py \
 	utilities/usdt-scripts/kernel_delay.py \
 	utilities/usdt-scripts/kernel_delay.rst \
 	utilities/usdt-scripts/reval_monitor.py \
 	utilities/usdt-scripts/upcall_cost.py \
-	utilities/usdt-scripts/upcall_monitor.py
+	utilities/usdt-scripts/upcall_monitor.py \
+	utilities/usdt-scripts/usdt_lib.py
+
 MAN_ROOTS += \
 	utilities/ovs-testcontroller.8.in \
 	utilities/ovs-dpctl.8.in \
@@ -95,18 +91,14 @@ CLEANFILES += \
 	utilities/ovs-dpctl-top \
 	utilities/ovs-dpctl-top.8 \
 	utilities/ovs-kmod-ctl \
-	utilities/ovs-l3ping \
 	utilities/ovs-lib \
 	utilities/ovs-ofctl.8 \
-	utilities/ovs-parse-backtrace \
 	utilities/ovs-pcap \
 	utilities/ovs-pcap.1 \
 	utilities/ovs-pki \
 	utilities/ovs-sim \
 	utilities/ovs-tcpdump \
 	utilities/ovs-tcpundump \
-	utilities/ovs-test \
-	utilities/ovs-vlan-test \
 	utilities/ovs-vsctl.8
 
 man_MANS += \
@@ -147,9 +139,8 @@ FLAKE8_PYFILES += utilities/ovs-pcap.in \
 	utilities/ovs-check-dead-ifs.in \
 	utilities/ovs-tcpdump.in \
 	utilities/ovs-pipegen.py \
-	utilities/usdt-scripts/dpif_nl_exec_monitor.py \
+	utilities/usdt-scripts/dpif_op_nl_monitor.py \
 	utilities/usdt-scripts/flow_reval_monitor.py \
+	utilities/usdt-scripts/kernel_delay.py \
 	utilities/usdt-scripts/upcall_monitor.py \
 	utilities/usdt-scripts/upcall_cost.py
-
-include utilities/bugtool/automake.mk

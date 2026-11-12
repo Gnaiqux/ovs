@@ -29,13 +29,16 @@
 #include "latch.h"
 #include "openvswitch/hmap.h"
 #include "openvswitch/poll-loop.h"
+#include "openvswitch/types.h"
 #include "openvswitch/vlog.h"
 #include "ovs-atomic.h"
 #include "packets.h"
 #include "util.h"
 
 VLOG_DEFINE_THIS_MODULE(ipf);
+COVERAGE_DEFINE(ipf_stuck_frag_list_expired);
 COVERAGE_DEFINE(ipf_stuck_frag_list_purged);
+COVERAGE_DEFINE(ipf_l3csum_checked);
 COVERAGE_DEFINE(ipf_l3csum_err);
 
 enum {
@@ -77,7 +80,7 @@ enum {
 enum ipf_counter_type {
     IPF_NFRAGS_ACCEPTED,
     IPF_NFRAGS_COMPL_SENT,
-    IPF_NFRAGS_EXPD_SENT,
+    IPF_NFRAGS_EXPIRED,
     IPF_NFRAGS_TOO_SMALL,
     IPF_NFRAGS_OVERLAP,
     IPF_NFRAGS_PURGED,
@@ -299,6 +302,22 @@ ipf_reassembled_list_remove(struct reassembled_pkt *rp)
     ovs_list_remove(&rp->rp_list_node);
 }
 
+/* Normally, access to ipf lists requires holding ipf_lock.  This is a special
+ * function to work around this restriction.  As a consequence of not taking
+ * any locks, the result of this function can be wrong.  Must only be used in
+ * cases where the wrong result doesn't impact the overall correctness of the
+ * logic, e.g., a quick check if there is any work to be done on current
+ * iteration that otherwise would block all other threads by taking a lock.
+ *
+ * XXX: We need a proper thread-safe solution for this instead.
+ */
+static bool
+ipf_list_is_empty_unsafe(struct ovs_list *list)
+    OVS_NO_THREAD_SAFETY_ANALYSIS
+{
+    return ovs_list_is_empty(list);
+}
+
 /* Symmetric */
 static uint32_t
 ipf_list_key_hash(const struct ipf_list_key *key, uint32_t basis)
@@ -410,11 +429,12 @@ ipf_reassemble_v4_frags(struct ipf_list *ipf_list)
     dp_packet_set_size(pkt, dp_packet_size(pkt) - dp_packet_l2_pad_size(pkt));
     struct ip_header *l3 = dp_packet_l3(pkt);
     int len = ntohs(l3->ip_tot_len);
+    int orig_len = dp_packet_size(pkt);
 
     int rest_len = frag_list[ipf_list->last_inuse_idx].end_data_byte -
                    frag_list[1].start_data_byte + 1;
 
-    if (len + rest_len > IPV4_PACKET_MAX_SIZE) {
+    if (orig_len + rest_len > IPV4_PACKET_MAX_SIZE) {
         ipf_print_reass_packet(
             "Unsupported big reassembled v4 packet; v4 hdr:", l3);
         dp_packet_delete(pkt);
@@ -433,8 +453,8 @@ ipf_reassemble_v4_frags(struct ipf_list *ipf_list)
     len += rest_len;
     l3 = dp_packet_l3(pkt);
     ovs_be16 new_ip_frag_off = l3->ip_frag_off & ~htons(IP_MORE_FRAGMENTS);
-    if (dp_packet_hwol_tx_ip_csum(pkt)) {
-        dp_packet_ol_reset_ip_csum_good(pkt);
+    if (dp_packet_ip_checksum_valid(pkt)) {
+        dp_packet_ip_checksum_set_partial(pkt);
     } else {
         l3->ip_csum = recalc_csum16(l3->ip_csum, l3->ip_frag_off,
                                     new_ip_frag_off);
@@ -459,11 +479,12 @@ ipf_reassemble_v6_frags(struct ipf_list *ipf_list)
     dp_packet_set_size(pkt, dp_packet_size(pkt) - dp_packet_l2_pad_size(pkt));
     struct  ovs_16aligned_ip6_hdr *l3 = dp_packet_l3(pkt);
     int pl = ntohs(l3->ip6_plen) - sizeof(struct ovs_16aligned_ip6_frag);
+    int orig_len = dp_packet_size(pkt);
 
     int rest_len = frag_list[ipf_list->last_inuse_idx].end_data_byte -
                    frag_list[1].start_data_byte + 1;
 
-    if (pl + rest_len > IPV6_PACKET_MAX_DATA) {
+    if (orig_len + rest_len > IPV6_PACKET_MAX_DATA) {
         ipf_print_reass_packet(
              "Unsupported big reassembled v6 packet; v6 hdr:", l3);
         dp_packet_delete(pkt);
@@ -506,13 +527,15 @@ ipf_reassemble_v6_frags(struct ipf_list *ipf_list)
 }
 
 /* Called when a frag list state transitions to another state. This is
- * triggered by new fragment for the list being received.*/
-static void
+* triggered by new fragment for the list being received. Returns a reassembled
+* packet if this fragment has completed one. */
+static struct reassembled_pkt *
 ipf_list_state_transition(struct ipf *ipf, struct ipf_list *ipf_list,
                           bool ff, bool lf, bool v6)
     OVS_REQUIRES(ipf->ipf_lock)
 {
     enum ipf_list_state curr_state = ipf_list->state;
+    struct reassembled_pkt *ret = NULL;
     enum ipf_list_state next_state;
     switch (curr_state) {
     case IPF_LIST_STATE_UNUSED:
@@ -562,12 +585,15 @@ ipf_list_state_transition(struct ipf *ipf, struct ipf_list *ipf_list,
                 ipf_reassembled_list_add(&ipf->reassembled_pkt_list, rp);
                 ipf_expiry_list_remove(ipf_list);
                 next_state = IPF_LIST_STATE_COMPLETED;
+                ret = rp;
             } else {
                 next_state = IPF_LIST_STATE_REASS_FAIL;
             }
         }
     }
     ipf_list->state = next_state;
+
+    return ret;
 }
 
 /* Some sanity checks are redundant, but prudent, in case code paths for
@@ -576,11 +602,6 @@ ipf_list_state_transition(struct ipf *ipf, struct ipf_list *ipf_list,
 static bool
 ipf_is_valid_v4_frag(struct ipf *ipf, struct dp_packet *pkt)
 {
-    if (OVS_UNLIKELY(dp_packet_ip_checksum_bad(pkt))) {
-        COVERAGE_INC(ipf_l3csum_err);
-        goto invalid_pkt;
-    }
-
     const struct eth_header *l2 = dp_packet_eth(pkt);
     const struct ip_header *l3 = dp_packet_l3(pkt);
 
@@ -610,8 +631,17 @@ ipf_is_valid_v4_frag(struct ipf *ipf, struct dp_packet *pkt)
         goto invalid_pkt;
     }
 
-    if (OVS_UNLIKELY(!dp_packet_ip_checksum_good(pkt)
-                     && csum(l3, ip_hdr_len) != 0)) {
+    bool bad_csum = dp_packet_ip_checksum_bad(pkt);
+    if (OVS_UNLIKELY(!bad_csum && dp_packet_ip_checksum_unknown(pkt))) {
+        COVERAGE_INC(ipf_l3csum_checked);
+        if (csum(l3, ip_hdr_len)) {
+            dp_packet_ip_checksum_set_bad(pkt);
+            bad_csum = true;
+        } else {
+            dp_packet_ip_checksum_set_good(pkt);
+        }
+    }
+    if (OVS_UNLIKELY(bad_csum)) {
         COVERAGE_INC(ipf_l3csum_err);
         goto invalid_pkt;
     }
@@ -799,7 +829,8 @@ ipf_is_frag_duped(const struct ipf_frag *frag_list, int last_inuse_idx,
 static bool
 ipf_process_frag(struct ipf *ipf, struct ipf_list *ipf_list,
                  struct dp_packet *pkt, uint16_t start_data_byte,
-                 uint16_t end_data_byte, bool ff, bool lf, bool v6)
+                 uint16_t end_data_byte, bool ff, bool lf, bool v6,
+                 struct reassembled_pkt **rp)
     OVS_REQUIRES(ipf->ipf_lock)
 {
     bool duped_frag = ipf_is_frag_duped(ipf_list->frag_list,
@@ -808,19 +839,14 @@ ipf_process_frag(struct ipf *ipf, struct ipf_list *ipf_list,
 
     if (!duped_frag) {
         if (last_inuse_idx < ipf_list->size - 1) {
-            /* In the case of dpdk, it would be unfortunate if we had
-             * to create a clone fragment outside the dpdk mp due to the
-             * mempool size being too limited. We will otherwise need to
-             * recommend not setting the mempool number of buffers too low
-             * and also clamp the number of fragments. */
             struct ipf_frag *frag = &ipf_list->frag_list[last_inuse_idx + 1];
-            frag->pkt = dp_packet_clone(pkt);
+            frag->pkt = pkt;
             frag->start_data_byte = start_data_byte;
             frag->end_data_byte = end_data_byte;
             ipf_list->last_inuse_idx++;
             atomic_count_inc(&ipf->nfrag);
             ipf_count(ipf, v6, IPF_NFRAGS_ACCEPTED);
-            ipf_list_state_transition(ipf, ipf_list, ff, lf, v6);
+            *rp = ipf_list_state_transition(ipf, ipf_list, ff, lf, v6);
         } else {
             OVS_NOT_REACHED();
         }
@@ -853,7 +879,8 @@ ipf_list_init(struct ipf_list *ipf_list, struct ipf_list_key *key,
  * to a list of fragemnts. */
 static bool
 ipf_handle_frag(struct ipf *ipf, struct dp_packet *pkt, ovs_be16 dl_type,
-                uint16_t zone, long long now, uint32_t hash_basis)
+                uint16_t zone, long long now, uint32_t hash_basis,
+                struct reassembled_pkt **rp)
     OVS_REQUIRES(ipf->ipf_lock)
 {
     struct ipf_list_key key;
@@ -922,7 +949,7 @@ ipf_handle_frag(struct ipf *ipf, struct dp_packet *pkt, ovs_be16 dl_type,
     }
 
     return ipf_process_frag(ipf, ipf_list, pkt, start_data_byte,
-                            end_data_byte, ff, lf, v6);
+                            end_data_byte, ff, lf, v6, rp);
 }
 
 /* Filters out fragments from a batch of fragments and adjust the batch. */
@@ -941,48 +968,26 @@ ipf_extract_frags_from_batch(struct ipf *ipf, struct dp_packet_batch *pb,
                           ||
                           (dl_type == htons(ETH_TYPE_IPV6) &&
                           ipf_is_valid_v6_frag(ipf, pkt)))) {
+            struct reassembled_pkt *rp = NULL;
 
             ovs_mutex_lock(&ipf->ipf_lock);
-            if (!ipf_handle_frag(ipf, pkt, dl_type, zone, now, hash_basis)) {
-                dp_packet_batch_refill(pb, pkt, pb_idx);
-            } else {
-                dp_packet_delete(pkt);
+            if (!ipf_handle_frag(ipf, pkt, dl_type, zone, now, hash_basis,
+                                 &rp)) {
+                dp_packet_batch_add(pb, pkt);
+            } else if (rp) {
+                dp_packet_batch_add(pb, rp->pkt);
+                rp->list->reass_execute_ctx = rp->pkt;
             }
             ovs_mutex_unlock(&ipf->ipf_lock);
         } else {
-            dp_packet_batch_refill(pb, pkt, pb_idx);
+            dp_packet_batch_add(pb, pkt);
         }
     }
 }
 
-/* In case of DPDK, a memory source check is done, as DPDK memory pool
- * management has trouble dealing with multiple source types.  The
- * check_source paramater is used to indicate when this check is needed. */
-static bool
-ipf_dp_packet_batch_add(struct dp_packet_batch *pb , struct dp_packet *pkt,
-                        bool check_source OVS_UNUSED)
-{
-#ifdef DPDK_NETDEV
-    if ((dp_packet_batch_is_full(pb)) ||
-        /* DPDK cannot handle multiple sources in a batch. */
-        (check_source && !dp_packet_batch_is_empty(pb)
-         && pb->packets[0]->source != pkt->source)) {
-#else
-    if (dp_packet_batch_is_full(pb)) {
-#endif
-        return false;
-    }
-
-    dp_packet_batch_add(pb, pkt);
-    return true;
-}
-
-/* This would be used in rare cases where a list cannot be sent. One rare
- * reason known right now is a mempool source check, which exists due to DPDK
- * support, where packets are no longer being received on any port with a
- * source matching the fragment.  Another reason is a race where all
- * conntrack rules are unconfigured when some fragments are yet to be
- * flushed.
+/* This would be used in rare cases where a list cannot be sent.
+ * One reason is a race where all conntrack rules are unconfigured
+ * when some fragments are yet to be flushed.
  *
  * Returns true if the list was purged. */
 static bool
@@ -1014,38 +1019,23 @@ ipf_purge_list_check(struct ipf *ipf, struct ipf_list *ipf_list,
 
 /* Does the packet batch management and common accounting work associated
  * with 'ipf_send_completed_frags()' and 'ipf_send_expired_frags()'. */
-static bool
+static void
 ipf_send_frags_in_list(struct ipf *ipf, struct ipf_list *ipf_list,
-                       struct dp_packet_batch *pb,
-                       enum ipf_list_type list_type, bool v6, long long now)
+                       struct dp_packet_batch *pb, bool v6, long long now)
     OVS_REQUIRES(ipf->ipf_lock)
 {
     if (ipf_purge_list_check(ipf, ipf_list, now)) {
-        return true;
+        return;
     }
 
     while (ipf_list->last_sent_idx < ipf_list->last_inuse_idx) {
         struct dp_packet *pkt
             = ipf_list->frag_list[ipf_list->last_sent_idx + 1].pkt;
-        if (ipf_dp_packet_batch_add(pb, pkt, true)) {
-            ipf_list->last_sent_idx++;
-            atomic_count_dec(&ipf->nfrag);
-
-            if (list_type == IPF_FRAG_COMPLETED_LIST) {
-                ipf_count(ipf, v6, IPF_NFRAGS_COMPL_SENT);
-            } else {
-                ipf_count(ipf, v6, IPF_NFRAGS_EXPD_SENT);
-                pkt->md.ct_state = CS_INVALID;
-            }
-
-            if (ipf_list->last_sent_idx == ipf_list->last_inuse_idx) {
-                return true;
-            }
-        } else {
-            return false;
-        }
+        dp_packet_batch_add(pb, pkt);
+        atomic_count_dec(&ipf->nfrag);
+        ipf_count(ipf, v6, IPF_NFRAGS_COMPL_SENT);
+        ipf_list->last_sent_idx++;
     }
-    OVS_NOT_REACHED();
 }
 
 /* Adds fragments associated with a completed fragment list to a packet batch
@@ -1053,9 +1043,10 @@ ipf_send_frags_in_list(struct ipf *ipf, struct ipf_list *ipf_list,
  * cleans up the list context when it is empty.*/
 static void
 ipf_send_completed_frags(struct ipf *ipf, struct dp_packet_batch *pb,
-                         long long now, bool v6)
+                         long long now, bool v6, uint16_t zone,
+                         odp_port_t in_port)
 {
-    if (ovs_list_is_empty(&ipf->frag_complete_list)) {
+    if (ipf_list_is_empty_unsafe(&ipf->frag_complete_list)) {
         return;
     }
 
@@ -1063,23 +1054,31 @@ ipf_send_completed_frags(struct ipf *ipf, struct dp_packet_batch *pb,
     struct ipf_list *ipf_list;
 
     LIST_FOR_EACH_SAFE (ipf_list, list_node, &ipf->frag_complete_list) {
-        if (ipf_send_frags_in_list(ipf, ipf_list, pb, IPF_FRAG_COMPLETED_LIST,
-                                   v6, now)) {
-            ipf_completed_list_clean(&ipf->frag_lists, ipf_list);
-        } else {
-            break;
+
+        if ((ipf_list->key.dl_type == htons(ETH_TYPE_IPV6)) != v6) {
+            continue;
         }
+        if (ipf_list->key.zone != zone) {
+            continue;
+        }
+
+        /* Check that the batch's in_port matches. */
+        struct dp_packet *pkt
+            = ipf_list->frag_list[ipf_list->last_sent_idx + 1].pkt;
+        if (in_port != pkt->md.in_port.odp_port) {
+            continue;
+        }
+
+        ipf_send_frags_in_list(ipf, ipf_list, pb, v6, now);
+        ipf_completed_list_clean(&ipf->frag_lists, ipf_list);
     }
 
     ovs_mutex_unlock(&ipf->ipf_lock);
 }
 
-/* Conservatively adds fragments associated with a expired fragment list to
- * a packet batch to be processed by the calling application, typically
- * conntrack. Also cleans up the list context when it is empty.*/
+/* Remove expired fragment lists and clean up the list context. */
 static void
-ipf_send_expired_frags(struct ipf *ipf, struct dp_packet_batch *pb,
-                       long long now, bool v6)
+ipf_delete_expired_frags(struct ipf *ipf, long long now)
 {
     enum {
         /* Very conservative, due to DOS probability. */
@@ -1087,7 +1086,7 @@ ipf_send_expired_frags(struct ipf *ipf, struct dp_packet_batch *pb,
     };
 
 
-    if (ovs_list_is_empty(&ipf->frag_exp_list)) {
+    if (ipf_list_is_empty_unsafe(&ipf->frag_exp_list)) {
         return;
     }
 
@@ -1101,13 +1100,18 @@ ipf_send_expired_frags(struct ipf *ipf, struct dp_packet_batch *pb,
             break;
         }
 
-        if (ipf_send_frags_in_list(ipf, ipf_list, pb, IPF_FRAG_EXPIRY_LIST,
-                                   v6, now)) {
-            ipf_expiry_list_clean(&ipf->frag_lists, ipf_list);
-            lists_removed++;
-        } else {
-            break;
+        while (ipf_list->last_sent_idx < ipf_list->last_inuse_idx) {
+            struct dp_packet * pkt
+                = ipf_list->frag_list[ipf_list->last_sent_idx + 1].pkt;
+            dp_packet_delete(pkt);
+            atomic_count_dec(&ipf->nfrag);
+            COVERAGE_INC(ipf_stuck_frag_list_expired);
+            ipf_count(ipf, ipf_list->key.dl_type == htons(ETH_TYPE_IPV6),
+                      IPF_NFRAGS_EXPIRED);
+            ipf_list->last_sent_idx++;
         }
+        ipf_expiry_list_clean(&ipf->frag_lists, ipf_list);
+        lists_removed++;
     }
 
     ovs_mutex_unlock(&ipf->ipf_lock);
@@ -1116,9 +1120,10 @@ ipf_send_expired_frags(struct ipf *ipf, struct dp_packet_batch *pb,
 /* Adds a reassmebled packet to a packet batch to be processed by the caller.
  */
 static void
-ipf_execute_reass_pkts(struct ipf *ipf, struct dp_packet_batch *pb)
+ipf_execute_reass_pkts(struct ipf *ipf, struct dp_packet_batch *pb,
+                       ovs_be16 dl_type)
 {
-    if (ovs_list_is_empty(&ipf->reassembled_pkt_list)) {
+    if (ipf_list_is_empty_unsafe(&ipf->reassembled_pkt_list)) {
         return;
     }
 
@@ -1127,7 +1132,8 @@ ipf_execute_reass_pkts(struct ipf *ipf, struct dp_packet_batch *pb)
 
     LIST_FOR_EACH_SAFE (rp, rp_list_node, &ipf->reassembled_pkt_list) {
         if (!rp->list->reass_execute_ctx &&
-            ipf_dp_packet_batch_add(pb, rp->pkt, false)) {
+            rp->list->key.dl_type == dl_type) {
+            dp_packet_batch_add(pb, rp->pkt);
             rp->list->reass_execute_ctx = rp->pkt;
         }
     }
@@ -1141,7 +1147,7 @@ static void
 ipf_post_execute_reass_pkts(struct ipf *ipf,
                             struct dp_packet_batch *pb, bool v6)
 {
-    if (ovs_list_is_empty(&ipf->reassembled_pkt_list)) {
+    if (ipf_list_is_empty_unsafe(&ipf->reassembled_pkt_list)) {
         return;
     }
 
@@ -1152,13 +1158,14 @@ ipf_post_execute_reass_pkts(struct ipf *ipf,
         const size_t pb_cnt = dp_packet_batch_size(pb);
         int pb_idx;
         struct dp_packet *pkt;
-        /* Inner batch loop is constant time since batch size is <=
-         * NETDEV_MAX_BURST. */
         DP_PACKET_BATCH_REFILL_FOR_EACH (pb_idx, pb_cnt, pkt, pb) {
             if (rp && pkt == rp->list->reass_execute_ctx) {
                 const struct ipf_frag *frag_0 = &rp->list->frag_list[0];
                 void *l4_frag = dp_packet_l4(frag_0->pkt);
                 void *l4_reass = dp_packet_l4(pkt);
+
+                /* Complete all L4 checksums before reassembly. */
+                dp_packet_ol_send_prepare(pkt, 0);
                 memcpy(l4_frag, l4_reass, dp_packet_l4_size(frag_0->pkt));
 
                 for (int i = 0; i <= rp->list->last_inuse_idx; i++) {
@@ -1187,8 +1194,8 @@ ipf_post_execute_reass_pkts(struct ipf *ipf,
                     } else {
                         struct ip_header *l3_frag = dp_packet_l3(frag_i->pkt);
                         struct ip_header *l3_reass = dp_packet_l3(pkt);
-                        if (dp_packet_hwol_tx_ip_csum(frag_i->pkt)) {
-                            dp_packet_ol_reset_ip_csum_good(frag_i->pkt);
+                        if (dp_packet_ip_checksum_valid(frag_i->pkt)) {
+                            dp_packet_ip_checksum_set_partial(frag_i->pkt);
                         } else {
                             ovs_be32 reass_ip =
                                 get_16aligned_be32(&l3_reass->ip_src);
@@ -1216,7 +1223,7 @@ ipf_post_execute_reass_pkts(struct ipf *ipf,
                 free(rp);
                 rp = NULL;
             } else {
-                dp_packet_batch_refill(pb, pkt, pb_idx);
+                dp_packet_batch_add(pb, pkt);
             }
         }
     }
@@ -1237,7 +1244,7 @@ ipf_preprocess_conntrack(struct ipf *ipf, struct dp_packet_batch *pb,
     }
 
     if (ipf_get_enabled(ipf) || atomic_count_get(&ipf->nfrag)) {
-        ipf_execute_reass_pkts(ipf, pb);
+        ipf_execute_reass_pkts(ipf, pb, dl_type);
     }
 }
 
@@ -1247,13 +1254,14 @@ ipf_preprocess_conntrack(struct ipf *ipf, struct dp_packet_batch *pb,
  * with low priority.  Reassembled packets are freed. */
 void
 ipf_postprocess_conntrack(struct ipf *ipf, struct dp_packet_batch *pb,
-                          long long now, ovs_be16 dl_type)
+                          long long now, ovs_be16 dl_type, uint16_t zone,
+                          odp_port_t in_port)
 {
     if (ipf_get_enabled(ipf) || atomic_count_get(&ipf->nfrag)) {
         bool v6 = dl_type == htons(ETH_TYPE_IPV6);
         ipf_post_execute_reass_pkts(ipf, pb, v6);
-        ipf_send_completed_frags(ipf, pb, now, v6);
-        ipf_send_expired_frags(ipf, pb, now, v6);
+        ipf_send_completed_frags(ipf, pb, now, v6, zone, in_port);
+        ipf_delete_expired_frags(ipf, now);
     }
 }
 
@@ -1270,8 +1278,8 @@ ipf_clean_thread_main(void *f)
 
         long long now = time_msec();
 
-        if (!ovs_list_is_empty(&ipf->frag_exp_list) ||
-            !ovs_list_is_empty(&ipf->frag_complete_list)) {
+        if (!ipf_list_is_empty_unsafe(&ipf->frag_exp_list) ||
+            !ipf_list_is_empty_unsafe(&ipf->frag_complete_list)) {
 
             ovs_mutex_lock(&ipf->ipf_lock);
 
@@ -1336,10 +1344,11 @@ ipf_init(void)
 void
 ipf_destroy(struct ipf *ipf)
 {
-    ovs_mutex_lock(&ipf->ipf_lock);
     latch_set(&ipf->ipf_clean_thread_exit);
     pthread_join(ipf->ipf_clean_thread, NULL);
     latch_destroy(&ipf->ipf_clean_thread_exit);
+
+    ovs_mutex_lock(&ipf->ipf_lock);
 
     struct ipf_list *ipf_list;
     HMAP_FOR_EACH_POP (ipf_list, node, &ipf->frag_lists) {
@@ -1426,7 +1435,7 @@ ipf_get_status(struct ipf *ipf, struct ipf_status *ipf_status)
                         &ipf_status->v4.nfrag_accepted);
     atomic_read_relaxed(&ipf->n4frag_cnt[IPF_NFRAGS_COMPL_SENT],
                         &ipf_status->v4.nfrag_completed_sent);
-    atomic_read_relaxed(&ipf->n4frag_cnt[IPF_NFRAGS_EXPD_SENT],
+    atomic_read_relaxed(&ipf->n4frag_cnt[IPF_NFRAGS_EXPIRED],
                         &ipf_status->v4.nfrag_expired_sent);
     atomic_read_relaxed(&ipf->n4frag_cnt[IPF_NFRAGS_TOO_SMALL],
                         &ipf_status->v4.nfrag_too_small);
@@ -1442,7 +1451,7 @@ ipf_get_status(struct ipf *ipf, struct ipf_status *ipf_status)
                         &ipf_status->v6.nfrag_accepted);
     atomic_read_relaxed(&ipf->n6frag_cnt[IPF_NFRAGS_COMPL_SENT],
                         &ipf_status->v6.nfrag_completed_sent);
-    atomic_read_relaxed(&ipf->n6frag_cnt[IPF_NFRAGS_EXPD_SENT],
+    atomic_read_relaxed(&ipf->n6frag_cnt[IPF_NFRAGS_EXPIRED],
                         &ipf_status->v6.nfrag_expired_sent);
     atomic_read_relaxed(&ipf->n6frag_cnt[IPF_NFRAGS_TOO_SMALL],
                         &ipf_status->v6.nfrag_too_small);

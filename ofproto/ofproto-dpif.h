@@ -88,12 +88,6 @@ struct rule_dpif {
     struct rule_dpif *new_rule OVS_GUARDED;
     bool forward_counts OVS_GUARDED;   /* Forward counts? 'used' time will be
                                         * forwarded in all cases. */
-
-    /* If non-zero then the recirculation id that has
-     * been allocated for use with this rule.
-     * The recirculation id and associated internal flow should
-     * be freed when the rule is freed */
-    uint32_t recirc_id;
 };
 
 struct rule_dpif *rule_dpif_lookup_from_table(struct ofproto_dpif *,
@@ -109,8 +103,6 @@ struct rule_dpif *rule_dpif_lookup_from_table(struct ofproto_dpif *,
 
 void rule_dpif_credit_stats(struct rule_dpif *,
                             const struct dpif_flow_stats *, bool);
-
-void rule_set_recirc_id(struct rule *, uint32_t id);
 
 /* Returns true if 'rule' is an internal rule, false otherwise. */
 static inline bool
@@ -213,7 +205,10 @@ struct group_dpif *group_dpif_lookup(struct ofproto_dpif *,
     DPIF_SUPPORT_FIELD(bool, ct_zero_snat, "Conntrack all-zero IP SNAT")    \
                                                                             \
     /* True if the datapath supports add_mpls action. */                    \
-    DPIF_SUPPORT_FIELD(bool, add_mpls, "MPLS Label add")
+    DPIF_SUPPORT_FIELD(bool, add_mpls, "MPLS Label add")                    \
+                                                                            \
+    /* True if the datapath supports psample action. */                     \
+    DPIF_SUPPORT_FIELD(bool, psample, "psample action")
 
 
 /* Stores the various features which the corresponding backer supports. */
@@ -328,6 +323,7 @@ struct ofproto_dpif {
     struct netflow *netflow;
     struct dpif_sflow *sflow;
     struct dpif_ipfix *ipfix;
+    struct dpif_lsample *lsample;
     struct hmap bundles;        /* Contains "struct ofbundle"s. */
     struct mac_learning *ml;
     struct mcast_snooping *ms;
@@ -361,6 +357,8 @@ struct ofproto_dpif {
 
     bool is_controller_connected; /* True if any controller admitted this
                                    * switch connection. */
+    bool explicit_sampled_drops;  /* If explicit drop actions must added after
+                                   * trailing sample actions. */
 };
 
 struct ofproto_dpif *ofproto_dpif_lookup_by_name(const char *name);
@@ -411,5 +409,6 @@ bool ofproto_dpif_ct_zone_timeout_policy_get_name(
     uint8_t nw_proto, char **tp_name, bool *unwildcard);
 
 bool ovs_explicit_drop_action_supported(struct ofproto_dpif *);
+bool ovs_psample_supported(struct ofproto_dpif *);
 
 #endif /* ofproto-dpif.h */

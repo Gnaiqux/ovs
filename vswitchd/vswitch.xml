@@ -64,7 +64,7 @@
       </column>
 
       <column name="ssl">
-        SSL used globally by the daemon.
+        SSL/TLS used globally by the daemon.
       </column>
 
       <column name="external_ids" key="system-id">
@@ -254,6 +254,25 @@
         </p>
       </column>
 
+      <column name="other_config" key="hw-offload-priority"
+              type='{"type": "string"}'>
+        <p>
+          This configuration sets the order of the hardware offload providers
+          to try when multiple exist for a given datapath implementation.
+          The argument provided should be a list of comma-separated hardware
+          offload provider names.
+        </p>
+        <p>
+          If implementations are missing from the list, they are added at the
+          end in undefined order.
+        </p>
+        <p>
+          The default value is <code>tc,dpdk</code>.  Changing this value
+          requires restarting the daemon if hardware offload is already
+          enabled.
+        </p>
+      </column>
+
       <column name="other_config" key="n-offload-threads"
               type='{"type": "integer", "minInteger": 1, "maxInteger": 10}'>
         <p>
@@ -334,13 +353,22 @@
           those uncovered cores are considered not set.
         </p>
         <p>
-          For performance reasons, it is best to set this to a single core on
-          the system, rather than allow lcore threads to float.
+          The lowest set core will be assigned in DPDK as the DPDK main thread.
+          Other set bits will be assigned by DPDK as DPDK worker threads.
+          As OVS implements its own threading for the datapath (see
+          <ref column="other_config" key="pmd-cpu-mask"/>), DPDK worker
+          threads will be unused.
         </p>
         <p>
-          If not specified, the value will be determined by choosing the lowest
-          CPU core from initial cpu affinity list. Otherwise, the value will be
-          passed directly to the DPDK library.
+          If this option is specified, all OVS main, handler, and revalidator
+          threads will be pinned to the selected DPDK main thread core.
+          This means that potentially many threads will share a single CPU
+          core, which may not be desirable for performance reasons.
+        </p>
+        <p>
+          If this option is not specified the value for DPDK initialization
+          will be auto-determined and all OVS main, revalidator and handler
+          threads will float on the OVS cpu affinity list.
         </p>
       </column>
 
@@ -422,6 +450,37 @@
           If not specified, this will be guessed by the DPDK library (default
           is /dev/hugepages). Changing this value requires restarting the
           daemon.
+        </p>
+      </column>
+
+      <column name="other_config" key="dpdk-probe-at-init"
+              type='{"type": "boolean"}'>
+        <p>
+          Specifies whether DPDK should probe all devices available at the
+          time DPDK is initialized. When set to <code>false</code> (the
+          default), OVS will instruct DPDK to skip probing devices at
+          initialization, unless <ref column="other_config" key="dpdk-extra"/>
+          already contains allowed or blocked devices. This is required when
+          declaring DPDK ports using the
+          <code>class=eth,mac=XX:XX:XX:XX:XX:XX</code> syntax.
+        </p>
+        <p>
+          Enabling this option implies higher resource consumption, as OVS may
+          not use all probed devices. It may also cause undesired side effects
+          such as additional interrupt handling and link status checks for
+          unused devices. For example, mlx5 devices maintain link status and
+          liveness by taking kernel locks frequently, even when OVS only uses
+          a subset of the available ports.
+        </p>
+        <p>
+          Note that this option has no effect when
+          <ref column="other_config" key="dpdk-extra"/> contains allowed
+          (<code>-a</code> or <code>--allow</code>) or blocked
+          (<code>-b</code> or <code>--block</code>) devices, as DPDK will
+          honor those specifications regardless of this setting.
+        </p>
+        <p>
+          Defaults to <code>false</code>.
         </p>
       </column>
 
@@ -869,6 +928,30 @@
           The feature is considered experimental.
         </p>
       </column>
+
+      <column name="other_config" key="explicit-sampled-drops"
+              type='{"type": "boolean"}'>
+        <p>
+         When a flow is installed in the datapath with an empty action list,
+         it indicates an implicit "drop" action.  Most datapaths report this
+         for event for statistics and monitoring (in datapath-specific ways).
+        </p>
+        <p>
+         However, if any of the per-bridge or per-flow sampling functionalities
+         are enabled (e.g: sFlow, IPFIX, local sampling), the action list might
+         not be empty, but contain an action to implement such functionality.
+         This makes the datapaths not report the packet drop.
+        </p>
+        <p>
+         This knob makes Open vSwitch detect when the last datapath action
+         comes from these sampling features and add an explicit drop action at
+         the end to keep drop statistics accurate.
+        </p>
+        <p>
+         The default value is <code>false</code>.
+        </p>
+      </column>
+
     </group>
     <group title="Status">
       <column name="next_cfg">
@@ -908,17 +991,11 @@
 
         <column name="statistics" key="cpu"
                 type='{"type": "integer", "minInteger": 1}'>
-          <p>
-            Number of CPU processors, threads, or cores currently online and
-            available to the operating system on which Open vSwitch is running,
-            as an integer.  This may be less than the number installed, if some
-            are not online or if they are not available to the operating
-            system.
-          </p>
-          <p>
-            Open vSwitch userspace processes are not multithreaded, but the
-            Linux kernel-based datapath is.
-          </p>
+          Number of CPU processors, threads, or cores currently online and
+          available to the operating system on which Open vSwitch is running,
+          as an integer.  This may be less than the number installed, if some
+          are not online or if they are not available to the operating
+          system.
         </column>
 
         <column name="statistics" key="load_average">
@@ -2614,8 +2691,8 @@
             The names of interfaces implemented as Linux and BSD network
             devices, including interfaces with type <code>internal</code>,
             <code>tap</code>, or <code>system</code> plus the different types
-            of tunnel ports, are limited to 15 bytes. Windows limits these
-            names to 255 bytes.
+            of tunnel ports, are limited to 15 bytes.  In general, different
+            datapath implementations may have different limitations.
           </li>
 
           <li>
@@ -2799,40 +2876,6 @@
             </p>
           </dd>
 
-          <dt><code>lisp</code></dt>
-          <dd>
-            <p>
-              A layer 3 tunnel over the experimental, UDP-based Locator/ID
-              Separation Protocol (RFC 6830).
-            </p>
-            <p>
-              Only IPv4 and IPv6 packets are supported by the protocol, and
-              they are sent and received without an Ethernet header.  Traffic
-              to/from LISP ports is expected to be configured explicitly, and
-              the ports are not intended to participate in learning based
-              switching.  As such, they are always excluded from packet
-              flooding.
-            </p>
-          </dd>
-
-          <dt><code>stt</code></dt>
-          <dd>
-            The Stateless TCP Tunnel (STT) is particularly useful when tunnel
-            endpoints are in end-systems, as it utilizes the capabilities of
-            standard network interface cards to improve performance.  STT utilizes
-            a TCP-like header inside the IP header. It is stateless, i.e., there is
-            no TCP connection state of any kind associated with the tunnel.  The
-            TCP-like header is used to leverage the capabilities of existing
-            network interface cards, but should not be interpreted as implying
-            any sort of connection state between endpoints.
-            Since the STT protocol does not engage in the usual TCP 3-way handshake,
-            so it will have difficulty traversing stateful firewalls.
-            The protocol is documented at
-            https://tools.ietf.org/html/draft-davie-stt
-
-            All traffic uses a default destination port of 7471.
-          </dd>
-
           <dt><code>patch</code></dt>
           <dd>
             A pair of virtual devices that act as a patch cable.
@@ -2888,8 +2931,7 @@
       <p>
         These options apply to interfaces with <ref column="type"/> of
         <code>geneve</code>, <code>bareudp</code>, <code>gre</code>,
-        <code>ip6gre</code>, <code>vxlan</code>, <code>lisp</code>,
-        <code>stt</code> and <code>srv6</code>.
+        <code>ip6gre</code>, <code>vxlan</code>, and <code>srv6</code>.
       </p>
 
       <p>
@@ -2983,9 +3025,8 @@
             key="in_key"/> at all.
           </li>
           <li>
-            A positive 24-bit (for Geneve, VXLAN, and LISP), 32-bit (for GRE)
-            or 64-bit (for STT) number.  The tunnel receives only
-            packets with the specified key.
+            A positive 24-bit (for Geneve and VXLAN) or 32-bit (for GRE)
+            number.  The tunnel receives only packets with the specified key.
           </li>
           <li>
             The word <code>flow</code>.  The tunnel accepts packets with any
@@ -3014,9 +3055,9 @@
             key="out_key"/> at all.
           </li>
           <li>
-            A positive 24-bit (for Geneve, VXLAN and LISP), 32-bit (for GRE) or
-            64-bit (for STT) number.  Packets sent through the tunnel
-            will have the specified key.
+            A positive 24-bit (for Geneve and VXLAN) or 32-bit (for GRE)
+            number.  Packets sent through the tunnel will have the specified
+            key.
           </li>
           <li>
             The word <code>flow</code>.  Packets sent through the tunnel will
@@ -3029,8 +3070,8 @@
       </column>
 
       <column name="options" key="dst_port">
-        Optional.  The tunnel transport layer destination port, for UDP and TCP
-        based tunnel protocols (Geneve, VXLAN, LISP, and STT).
+        Optional.  The tunnel transport layer destination port, for UDP
+        based tunnel protocols (Geneve, VXLAN).
       </column>
 
       <column name="options" key="key">
@@ -3066,31 +3107,6 @@
         option sets packet mark for the tunnel endpoint for all tunnel packets
         including tunnel monitoring.
       </column>
-
-      <group title="Tunnel Options: lisp only">
-        <column name="options" key="packet_type"
-                type='{"type": "string", "enum": ["set",
-                      ["legacy_l3", "ptap"]]}'>
-          <p>
-            A LISP tunnel sends and receives only IPv4 and IPv6 packets.  This
-            option controls what how the tunnel represents the packets that it
-            sends and receives:
-          </p>
-
-          <ul>
-            <li>
-              By default, or if this option is <code>legacy_l3</code>, the
-              tunnel represents packets as Ethernet frames for compatibility
-              with legacy OpenFlow controllers that expect this behavior.
-            </li>
-            <li>
-              If this option is <code>ptap</code>, the tunnel represents
-              packets using the <code>packet_type</code> mechanism introduced
-              in OpenFlow 1.5.
-            </li>
-          </ul>
-        </column>
-      </group>
 
       <group title="Tunnel Options: vxlan only">
 
@@ -3175,12 +3191,6 @@
               OpenFlow controllers that expect this behavior.
             </li>
             <li>
-              The <code>legacy_l3</code> option is only available via the
-              user space datapath.  The OVS kernel datapath does not support
-              devices of type ARPHRD_IPGRE which is the requirement for
-              <code>legacy_l3</code> type packets.
-            </li>
-            <li>
               If this option is <code>ptap</code>, the tunnel sends and
               receives any kind of packet.  Open vSwitch represents packets in
               the tunnel using the <code>packet_type</code> mechanism
@@ -3207,20 +3217,23 @@
         <column name="options" key="csum" type='{"type": "boolean"}'>
           <p>
             Optional.  Compute encapsulation header (either GRE or UDP)
-            checksums on outgoing packets.  Default is disabled, set to
-            <code>true</code> to enable.  Checksums present on incoming
-            packets will be validated regardless of this setting.
+            checksums on outgoing packets.  When unset (the default value),
+            checksum computing for outgoing packets is enabled for UDP IPv6
+            tunnels, and disabled for GRE and IPv4 UDP tunnels.  When set to
+            <code>false</code>, no checksums will be computed for outgoing
+            tunnel encapsulation headers.  When <code>true</code>, checksums
+            will be computed for all outgoing tunnel encapsulation headers.
+            Checksums present on incoming packets will be validated
+            regardless of this setting.  Incoming packets without a checksum
+            will also be accepted regardless of this setting.
           </p>
 
           <p>
-            When using the upstream Linux kernel module, computation of
-            checksums for <code>geneve</code> and <code>vxlan</code> requires
-            Linux kernel version 4.0 or higher. <code>gre</code> and
+            When using the Linux kernel datapath, computation of checksums
+            for <code>geneve</code> and <code>vxlan</code> requires Linux
+            kernel version 4.0 or higher.  <code>gre</code> and
             <code>ip6gre</code> support checksums for all versions of
             Open vSwitch that support GRE.
-            The out of tree kernel module distributed as part of OVS
-            can compute all tunnel checksums on any kernel version that it
-            is compatible with.
           </p>
 
         </column>
@@ -3229,11 +3242,10 @@
       <group title="Tunnel Options: IPsec">
         <p>
           Setting any of these options enables IPsec support for a given
-          tunnel.  <code>gre</code>, <code>geneve</code>,
-          <code>vxlan</code> and <code>stt</code>
-          interfaces support these options.  See the <code>IPsec</code>
-          section in the <ref table="Open_vSwitch"/> table for a description
-          of each mode.
+          tunnel.  <code>gre</code>, <code>geneve</code> and
+          <code>vxlan</code> interfaces support these options.  See the
+          <code>IPsec</code> section in the <ref table="Open_vSwitch"/> table
+          for a description of each mode.
         </p>
         <column name="options" key="psk" type='{"type": "string"}'>
           <p>
@@ -3469,24 +3481,25 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
         </p>
       </column>
 
-      <column name="options" key="use-need-wakeup"
-              type='{"type": "boolean"}'>
-        <p>
-          Specifies whether to use need_wakeup feature in afxdp netdev.
-          If enabled, OVS explicitly wakes up the kernel RX, using poll()
-          syscall and wakes up TX, using sendto() syscall. For physical
-          devices, this feature improves the performance by avoiding
-          unnecessary sendto syscalls.
-          Defaults to true if supported by libbpf.
-        </p>
-      </column>
-
       <column name="options" key="vhost-server-path"
               type='{"type": "string"}'>
         <p>
           The value specifies the path to the socket associated with a vHost
           User client mode device that has been or will be created by QEMU.
           Only supported by dpdkvhostuserclient interfaces.
+        </p>
+      </column>
+
+      <column name="options" key="vhost-max-queue-pairs"
+              type='{"type": "integer", "minInteger" : 1, "maxInteger": 128}'>
+        <p>
+          The value specifies the maximum number of queue pairs supported by
+          a vHost device. This is ignored for vhost-user backends, only VDUSE
+          is supported.
+          Only supported by dpdkvhostuserclient interfaces.
+        </p>
+        <p>
+          Default value is 1.
         </p>
       </column>
 
@@ -3503,22 +3516,22 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
       </column>
 
       <column name="options" key="n_rxq_desc"
-              type='{"type": "integer", "minInteger": 1, "maxInteger": 4096}'>
+              type='{"type": "integer", "minInteger": 1}'>
         <p>
           Specifies the rx queue size (number rx descriptors) for dpdk ports.
-          The value must be a power of 2, less than 4096 and supported
-          by the hardware of the device being configured.
+          The value must be a power of 2 and supported by the hardware of the
+          device being configured.
           If not specified or an incorrect value is specified, 2048 rx
           descriptors will be used by default.
         </p>
       </column>
 
       <column name="options" key="n_txq_desc"
-              type='{"type": "integer", "minInteger": 1, "maxInteger": 4096}'>
+              type='{"type": "integer", "minInteger": 1}'>
         <p>
           Specifies the tx queue size (number tx descriptors) for dpdk ports.
-          The value must be a power of 2, less than 4096 and supported
-          by the hardware of the device being configured.
+          The value must be a power of 2 and supported by the hardware of the
+          device being configured.
           If not specified or an incorrect value is specified, 2048 tx
           descriptors will be used by default.
         </p>
@@ -3747,6 +3760,19 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
 
       <column name="status" key="firmware_version">
         The version string of the network adapter's firmware, if available.
+      </column>
+
+      <column name="status" key="peer_ifindex">
+        <p>
+          For veth devices on Linux, this column contains the interface index
+          of the peer veth device.  This allows applications to
+          programmatically discover veth pairs without requiring additional
+          system calls or parsing network interface information.
+        </p>
+        <p>
+          Only present for veth devices (when <ref column="status"
+          key="driver_name"/> is "veth").  Not available on non-Linux systems.
+        </p>
       </column>
 
       <column name="status" key="source_ip">
@@ -4647,16 +4673,48 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
       <column name="options" key="dpdk-lsc-interrupt"
               type='{"type": "boolean"}'>
         <p>
-          Set this value to <code>true</code> to configure interrupt mode for
-          Link State Change (LSC) detection instead of poll mode for the DPDK
-          interface.
+          Set this value to <code>false</code> to configure poll mode for
+          Link State Change (LSC) detection instead of interrupt mode for the
+          DPDK interface.
         </p>
         <p>
-          If this value is not set, poll mode is configured.
+          If this value is not set, interrupt mode is configured.
         </p>
         <p>
           This parameter has an effect only on netdev dpdk interfaces.
         </p>
+      </column>
+    </group>
+
+    <group title="Hardware Offload Configuration">
+      <column name="other_config" key="hw-offload-priority"
+              type='{"type": "string"}'>
+        <p>
+          This configuration sets an explicit list of hardware offload
+          providers to try on this Interface.  The argument should be a
+          comma-separated list of hardware offload provider names, or the
+          word <code>none</code>.
+        </p>
+        <p>
+          If <code>none</code> is encountered in the list, further trying of
+          offload providers is stopped.  For example, if the list only contains
+          <code>none</code>, hardware offload is disabled on this interface
+          even if it is globally enabled.  Note that unknown hardware offload
+          provider names are ignored.
+        </p>
+        <p>
+          If not set, uses the global
+          <ref table="Open_vSwitch" column="other_config"
+               key="hw-offload-priority"/>
+          configuration.  Changing this value after offload enablement requires
+          restarting the daemon.  To avoid restarting the daemon, set this
+          option in the same transaction that adds the port.  For example:
+        </p>
+
+        <pre>
+ovs-vsctl add-port br0 p1 -- \
+          set Interface p1 other_config:hw-offload-priority=none
+       </pre>
       </column>
     </group>
 
@@ -4835,9 +4893,9 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
         </p>
 
         <p>
-          By default, the <code>prefixes=ip_dst,ip_src</code> are used
-          on each flow table.  This instructs the flow classifier to
-          track the IP destination and source addresses used by the
+          By default, the <code>prefixes=ip_dst,ip_src,ipv6_dst,ipv6_src</code>
+          are used on each flow table.  This instructs the flow classifier to
+          track the IPv4 and IPv6 destination and source addresses used by the
           rules in this specific flow table.
         </p>
 
@@ -4860,14 +4918,14 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
 
           <dt><code>ovs-vsctl set Flow_Table table0 prefixes=ip_dst,ip_src</code></dt>
           <dd>
-            Enables prefix tracking for IP source and destination
+            Enables prefix tracking for IPv4 source and destination
             address fields.
           </dd>
         </dl>
 
         <p>
           There is a maximum number of fields that can be enabled for any
-          one flow table.  Currently this limit is 3.
+          one flow table.  Currently this limit is 4.
         </p>
       </column>
     </group>
@@ -5256,6 +5314,23 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
         VLANs on which packets are selected for mirroring.  An empty set
         selects packets on all VLANs.
       </column>
+      <column name="filter">
+        <p>
+          When set, only packets that match <ref column="filter"/> are
+          selected for mirroring.  Packets that do not match are ignored
+          by thie mirror.  The <ref column="filter"/> syntax is described
+          in <code>ovs-fields</code>(7).  A field may be given with a mask,
+          e.g. <code>ip,nw_src=10.0.0.0/24</code>.
+          However, the <code>in_port</code> field is not supported;
+          <ref column="select_src_port"/> should be used to limit the
+          mirror to a source port.
+        </p>
+        <p>
+          This filter is applied after <ref column="select_all"/>, <ref
+          column="select_dst_port"/>, <ref column="select_src_port"/>, and
+          <ref column="select_vlan"/>.
+        </p>
+      </column>
     </group>
 
     <group title="Mirroring Destination Configuration">
@@ -5422,14 +5497,14 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
         <dl>
           <dt><code>ssl:<var>host</var></code>[<code>:<var>port</var></code>]</dt>
           <dd>
-            <p>The specified SSL <var>port</var> on the host at the
+            <p>The specified SSL/TLS <var>port</var> on the host at the
             given <var>host</var>, which can either be a DNS name (if built
             with unbound library) or an IP address.  The <ref table="Open_vSwitch"
             column="ssl"/> column in the <ref table="Open_vSwitch"/> table must
-            point to a valid SSL configuration when this form is used.</p>
+            point to a valid SSL/TLS configuration when this form is used.</p>
             <p>If <var>port</var> is not specified, it defaults to 6653.</p>
-            <p>SSL support is an optional feature that is not always built as
-            part of Open vSwitch.</p>
+            <p>SSL/TLS support is an optional feature that is not always built
+            as part of Open vSwitch.</p>
           </dd>
           <dt><code>tcp:<var>host</var></code>[<code>:<var>port</var></code>]</dt>
           <dd>
@@ -5452,7 +5527,8 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
           <dt><code>pssl:</code>[<var>port</var>][<code>:<var>host</var></code>]</dt>
           <dd>
             <p>
-              Listens for SSL connections on the specified TCP <var>port</var>.
+              Listens for SSL/TLS connections on the specified TCP
+              <var>port</var>.
               If <var>host</var>, which can either be a DNS name (if built with
               unbound library) or an IP address, is specified, then connections
               are restricted to the resolved or specified local IP address
@@ -5465,14 +5541,14 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
               IPv4 (but not IPv6) addresses.  The
               <ref table="Open_vSwitch" column="ssl"/>
               column in the <ref table="Open_vSwitch"/> table must point to a
-              valid SSL configuration when this form is used.
+              valid SSL/TLS configuration when this form is used.
             </p>
             <p>
               If <var>port</var> is not specified, it currently to 6653.
             </p>
             <p>
-              SSL support is an optional feature that is not always built as
-              part of Open vSwitch.
+              SSL/TLS support is an optional feature that is not always built
+              as part of Open vSwitch.
             </p>
           </dd>
           <dt><code>ptcp:</code>[<var>port</var>][<code>:<var>host</var></code>]</dt>
@@ -5842,18 +5918,18 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
           <dt><code>ssl:<var>host</var></code>[<code>:<var>port</var></code>]</dt>
           <dd>
             <p>
-              The specified SSL <var>port</var> on the host at the given
+              The specified SSL/TLS <var>port</var> on the host at the given
               <var>host</var>, which can either be a DNS name (if built with
               unbound library) or an IP address.  The <ref table="Open_vSwitch"
               column="ssl"/> column in the <ref table="Open_vSwitch"/>
-              table must point to a valid SSL configuration when this
+              table must point to a valid SSL/TLS configuration when this
               form is used.
             </p>
             <p>
               If <var>port</var> is not specified, it defaults to 6640.
             </p>
             <p>
-              SSL support is an optional feature that is not always
+              SSL/TLS support is an optional feature that is not always
               built as part of Open vSwitch.
             </p>
           </dd>
@@ -5874,7 +5950,8 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
           <dt><code>pssl:</code>[<var>port</var>][<code>:<var>host</var></code>]</dt>
           <dd>
             <p>
-              Listens for SSL connections on the specified TCP <var>port</var>.
+              Listens for SSL/TLS connections on the specified TCP
+              <var>port</var>.
               Specify 0 for <var>port</var> to have the kernel automatically
               choose an available port.  If <var>host</var>, which can either
               be a DNS name (if built with unbound library) or an IP address,
@@ -5884,15 +5961,15 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
               e.g. <code>pssl:6640:[::1]</code>.  If <var>host</var> is not
               specified then it listens only on IPv4 (but not IPv6) addresses.
               The <ref table="Open_vSwitch" column="ssl"/> column in the <ref
-              table="Open_vSwitch"/> table must point to a valid SSL
+              table="Open_vSwitch"/> table must point to a valid SSL/TLS
               configuration when this form is used.
             </p>
             <p>
               If <var>port</var> is not specified, it defaults to 6640.
             </p>
             <p>
-              SSL support is an optional feature that is not always built as
-              part of Open vSwitch.
+              SSL/TLS support is an optional feature that is not always built
+              as part of Open vSwitch.
             </p>
           </dd>
           <dt><code>ptcp:</code>[<var>port</var>][<code>:<var>host</var></code>]</dt>
@@ -6172,13 +6249,12 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
     <p>
       A datapath is responsible for providing the packet handling in Open
       vSwitch.  There are two primary datapath implementations used by
-      Open vSwitch: kernel and userspace.  Kernel datapath
-      implementations are available for Linux and Hyper-V, and selected
-      as <code>system</code> in the <ref column="datapath_type"/> column
-      of the <ref table="Bridge"/> table.  The userspace datapath is used
-      by DPDK and AF-XDP, and is selected as <code>netdev</code> in the
-      <ref column="datapath_type"/> column of the <ref table="Bridge"/>
-      table.
+      Open vSwitch: kernel and userspace.  Kernel datapath implementation is
+      available for Linux and selected as <code>system</code> in the
+      <ref column="datapath_type"/> column of the <ref table="Bridge"/> table.
+      The userspace datapath is used by DPDK and AF-XDP, and is selected as
+      <code>netdev</code> in the <ref column="datapath_type"/> column of the
+      <ref table="Bridge"/> table.
     </p>
     <p>
       A datapath of a particular type is shared by all the bridges that use
@@ -6198,17 +6274,6 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
 
       <ul>
         <li>
-          When the kernel module included in the Open vSwitch source tree is
-          used, this column reports the Open vSwitch version from which the
-          module was taken.
-        </li>
-
-        <li>
-          When the kernel module that is part of the upstream Linux kernel is
-          used, this column reports <code>&lt;unknown&gt;</code>.
-        </li>
-
-        <li>
           When the datapath is built into the <code>ovs-vswitchd</code>
           binary, this column reports <code>&lt;built-in&gt;</code>.  A
           built-in datapath is by definition the same version as the rest of
@@ -6216,23 +6281,22 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
         </li>
 
         <li>
-          Other datapaths (such as the Hyper-V kernel datapath) currently
-          report <code>&lt;unknown&gt;</code>.
+          Other datapaths currently report <code>&lt;unknown&gt;</code>.
         </li>
       </ul>
 
       <p>
         A version discrepancy between <code>ovs-vswitchd</code> and the
         datapath in use is not normally cause for alarm.  The Open vSwitch
-        kernel datapaths for Linux and Hyper-V, in particular, are designed
-        for maximum inter-version compatibility: any userspace version works
-        with with any kernel version.  Some reasons do exist to insist on
-        particular user/kernel pairings.  First, newer kernel versions add
-        new features, that can only be used by new-enough userspace, e.g.
-        VXLAN tunneling requires certain minimal userspace and kernel
-        versions.  Second, as an extension to the first reason, some newer
-        kernel versions add new features for enhancing performance that only
-        new-enough userspace versions can take advantage of.
+        kernel datapaths for Linux, in particular, is designed for maximum
+        inter-version compatibility: any userspace version works with any
+        kernel version.  Some reasons do exist to insist on particular
+        user/kernel pairings.  First, newer kernel versions add new features,
+        that can only be used by new-enough userspace, e.g. VXLAN tunneling
+        requires certain minimal userspace and kernel versions.  Second, as
+        an extension to the first reason, some newer kernel versions add new
+        features for enhancing performance that only new-enough userspace
+        versions can take advantage of.
       </p>
     </column>
 
@@ -6249,10 +6313,9 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
         features.  For the <code>netdev</code> datapath, the
         capabilities are fixed for a given version of Open vSwitch
         because this datapath is built into the
-        <code>ovs-vswitchd</code> binary.  The Linux kernel and
-        Windows and other datapaths, which are external to OVS
-        userspace, can vary in version and capabilities independently
-        from <code>ovs-vswitchd</code>.
+        <code>ovs-vswitchd</code> binary.  The Linux kernel and other
+        datapaths, which are external to OVS userspace, can vary in version
+        and capabilities independently from <code>ovs-vswitchd</code>.
       </p>
 
       <p>
@@ -6511,6 +6574,11 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
         called <code>NXT_CT_FLUSH</code>. The <code>NXT_CT_FLUSH</code>
         extensions allows to flush CT entries based on specified parameters.
       </column>
+      <column name="capabilities" key="psample"
+              type='{"type": "boolean"}'>
+        True if the datapath supports OVS_ACTION_ATTR_PSAMPLE.  If false,
+        local sampling will not be supported with the Linux kernel datapath.
+      </column>
     </group>
 
     <column name="ct_zone_default_limit">
@@ -6666,11 +6734,11 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
   </table>
 
   <table name="SSL">
-    SSL configuration for an Open_vSwitch.
+    SSL/TLS configuration for an Open_vSwitch.
 
     <column name="private_key">
       Name of a PEM file containing the private key used as the switch's
-      identity for SSL connections to the controller.
+      identity for SSL/TLS connections to the controller.
     </column>
 
     <column name="certificate">
@@ -6687,12 +6755,12 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
 
     <column name="bootstrap_ca_cert">
       If set to <code>true</code>, then Open vSwitch will attempt to
-      obtain the CA certificate from the controller on its first SSL
+      obtain the CA certificate from the controller on its first SSL/TLS
       connection and save it to the named PEM file. If it is successful,
       it will immediately drop the connection and reconnect, and from then
-      on all SSL connections must be authenticated by a certificate signed
+      on all SSL/TLS connections must be authenticated by a certificate signed
       by the CA certificate thus obtained.  <em>This option exposes the
-      SSL connection to a man-in-the-middle attack obtaining the initial
+      SSL/TLS connection to a man-in-the-middle attack obtaining the initial
       CA certificate.</em>  It may still be useful for bootstrapping.
     </column>
 
@@ -6859,7 +6927,7 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
           <p>type: unsigned 8-bit integer.</p>
           <p>data type semantics: identifier.</p>
           <p>description: Identifier of the layer 2 network overlay network
-          encapsulation type: 0x01 VxLAN, 0x02 GRE, 0x03 LISP, 0x07 GENEVE.</p>
+          encapsulation type: 0x01 VxLAN, 0x02 GRE, 0x07 GENEVE.</p>
         </dd>
         <dt>tunnelKey:</dt>
         <dd>
@@ -6868,9 +6936,8 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
           <p>data type semantics: identifier.</p>
           <p>description: Key which is used for identifying an individual
           traffic flow within a VxLAN (24-bit VNI), GENEVE (24-bit VNI),
-          GRE (32-bit key), or LISP (24-bit instance ID) tunnel. The
-          key is encoded in this octetarray as a 3-, 4-, or 8-byte integer
-          ID in network byte order.</p>
+          or GRE (32-bit key) tunnel. The key is encoded in this octetarray
+          as a 3- or 4-byte integer ID in network byte order.</p>
         </dd>
         <dt>tunnelSourceIPv4Address:</dt>
         <dd>
@@ -7008,10 +7075,37 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
 
   <table name="Flow_Sample_Collector_Set">
     <p>
-      A set of IPFIX collectors of packet samples generated by OpenFlow
-      <code>sample</code> actions.  This table is used only for IPFIX
-      flow-based sampling, not for per-bridge sampling (see the <ref
-      table="IPFIX"/> table for a description of the two forms).
+      A set of IPFIX or local sampling collectors of packet samples generated
+      by OpenFlow <code>sample</code> actions.
+    </p>
+
+    <p>
+      If the column <code>ipfix</code> contains a reference to a
+      valid IPFIX entry, samples will be emitted via IPFIX.  This mechanism
+      is known as flow-based IPFIX sampling, as opposed to bridge-based
+      sampling (see the <ref table="IPFIX"/> table for a description of the
+      two forms).
+    </p>
+
+    <p>
+      If the column <code>local_group_id</code> contains an integer and the
+      running datapath supports local sample emission, packets will be sent
+      to some local sample collector.  Samples will contain the group number
+      specified by <code>local_group_id</code> which helps identify their
+      source as well as a 64-bit cookie result from the concatenation of the
+      observation_domain_id an the observation_point_id in network byte order.
+
+      The way the sample is emitted and made available for local collectors
+      is datapath-specific.
+
+      Currently only Linux kernel datapath supports local sampling which is
+      implemented by sending the packet to the <code>psample</code> netlink
+      multicast group.
+    </p>
+
+    <p>
+      Note: both <code>local_group_id</code> and <code>ipfix</code> can be
+      configured simultaneously.
     </p>
 
     <column name="id">
@@ -7028,6 +7122,12 @@ ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
     <column name="ipfix">
       Configuration of the set of IPFIX collectors to send one flow
       record per sampled packet to.
+    </column>
+
+    <column name="local_group_id"
+            type='{"type": "integer", "minInteger": 0,
+                   "maxInteger": 4294967295}'>
+      Configuration of the sample group id to be used in local sampling.
     </column>
 
     <group title="Common Columns">

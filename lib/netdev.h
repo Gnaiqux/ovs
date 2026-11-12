@@ -19,6 +19,8 @@
 
 #include "openvswitch/netdev.h"
 #include "openvswitch/types.h"
+#include "ovs-atomic.h"
+#include "ovs-rcu.h"
 #include "packets.h"
 #include "flow.h"
 
@@ -111,6 +113,22 @@ enum netdev_srv6_flowlabel {
     SRV6_FLOWLABEL_COMPUTE,
 };
 
+enum netdev_tnl_csum {
+    /* Default value for UDP tunnels if no configurations is present.  Enforce
+     * checksum calculation in IPv6 tunnels, disable in IPv4 tunnels. */
+    NETDEV_TNL_CSUM_DEFAULT = 0,
+
+    /* Checksum explicitly to be calculated. */
+    NETDEV_TNL_CSUM_ENABLED,
+
+    /* Checksum calculation explicitly disabled. */
+    NETDEV_TNL_CSUM_DISABLED,
+
+    /* A value for when there is no checksum or the default value is no
+     * checksum regardless of IP version. */
+    NETDEV_TNL_DEFAULT_NO_CSUM,
+};
+
 /* Configuration specific to tunnels. */
 struct netdev_tunnel_config {
     ovs_be64 in_key;
@@ -139,7 +157,7 @@ struct netdev_tunnel_config {
     uint8_t tos;
     bool tos_inherit;
 
-    bool csum;
+    enum netdev_tnl_csum csum;
     bool dont_fragment;
     enum netdev_pt_mode pt_mode;
 
@@ -200,6 +218,7 @@ int netdev_set_tx_multiq(struct netdev *, unsigned int n_txq);
 enum netdev_pt_mode netdev_get_pt_mode(const struct netdev *);
 void netdev_set_dpif_type(struct netdev *, const char *);
 const char *netdev_get_dpif_type(const struct netdev *);
+uint32_t netdev_get_block_id(struct netdev *);
 
 /* Packet reception. */
 int netdev_rxq_open(struct netdev *, struct netdev_rxq **, int id);
@@ -240,6 +259,7 @@ int netdev_build_header(const struct netdev *, struct ovs_action_push_tnl *data,
                         const struct netdev_tnl_build_header_params *params);
 
 int netdev_push_header(const struct netdev *netdev,
+                       const struct netdev *ingress_netdev,
                        struct dp_packet_batch *,
                        const struct ovs_action_push_tnl *data);
 void netdev_pop_header(struct netdev *netdev, struct dp_packet_batch *);
@@ -369,11 +389,28 @@ int netdev_dump_queue_stats(const struct netdev *,
 
 extern struct seq *tnl_conf_seq;
 
-#ifndef _WIN32
 void netdev_get_addrs_list_flush(void);
 int netdev_get_addrs(const char dev[], struct in6_addr **paddr,
                      struct in6_addr **pmask, int *n_in6);
-#endif
+
+/* Offload-capable (HW) netdev information. */
+struct netdev_hw_info {
+    bool oor;                         /* Out of Offload Resources (OOR)? */
+    /* Is dpif_offload's netdev_hw_post_process() supported? */
+    atomic_bool post_process_api_supported;
+    int offload_count;                /* Offloaded flow count. */
+    int pending_count;                /* Pending (non-offloaded) flow count. */
+    OVSRCU_TYPE(void *) offload_data; /* Offload metadata. */
+};
+
+enum hw_info_type {
+    HW_INFO_TYPE_OOR = 1,        /* Out of Offload Resources (OOR) state. */
+    HW_INFO_TYPE_PEND_COUNT = 2, /* Pending(non-offloaded) flow count. */
+    HW_INFO_TYPE_OFFL_COUNT = 3  /* Offloaded flow count. */
+};
+
+int netdev_get_hw_info(struct netdev *, int type);
+void netdev_set_hw_info(struct netdev *, int type, int val);
 
 #ifdef  __cplusplus
 }

@@ -3,24 +3,27 @@ name: Build and Test
 on: [push, pull_request]
 
 env:
-  python_default: 3.12
+  python_default: 3.14
 
 jobs:
   build-dpdk:
+    strategy:
+      matrix:
+        runner: [ubuntu-26.04]
     env:
-      dependencies: gcc libbpf-dev libnuma-dev libpcap-dev ninja-build pkgconf
+      dependencies: gcc libnuma-dev libxdp-dev ninja-build pkgconf
       CC: gcc
-      DPDK_GIT: https://dpdk.org/git/dpdk
-      DPDK_VER: 23.11
+      DPDK_GIT: https://github.com/DPDK/dpdk
+      DPDK_VER: 25.11.2
     name: dpdk gcc
     outputs:
       dpdk_key: ${{ steps.gen_dpdk_key.outputs.key }}
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
 
     steps:
     - name: checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
 
     - name: update PATH
       run:  |
@@ -33,7 +36,8 @@ jobs:
       # This also allows us to use cache from any branch as long as version
       # and a way we're building DPDK stays the same.
       run:  |
-        cat .ci/dpdk-* > dpdk-ci-signature
+        echo ${{ matrix.runner }} > dpdk-ci-signature
+        cat .ci/dpdk-* >> dpdk-ci-signature
         grep -rwE 'DPDK_GIT|DPDK_VER' .github/ >> dpdk-ci-signature
         if [ "${DPDK_VER##refs/*/}" != "${DPDK_VER}" ]; then
             git ls-remote --heads $DPDK_GIT $DPDK_VER >> dpdk-ci-signature
@@ -48,14 +52,14 @@ jobs:
 
     - name: cache
       id: dpdk_cache
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: dpdk-dir
         key:  ${{ steps.gen_dpdk_key.outputs.key }}
 
     - name: set up python
       if: steps.dpdk_cache.outputs.cache-hit != 'true'
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: ${{ env.python_default }}
 
@@ -74,13 +78,66 @@ jobs:
       if: steps.dpdk_cache.outputs.cache-hit != 'true'
       run:  ./.ci/dpdk-build.sh
 
+  build-libreswan:
+    strategy:
+      matrix:
+        runner: [ubuntu-26.04]
+    env:
+      dependencies: build-essential fakeroot devscripts equivs
+      libreswan_ver: v5.4
+    name: libreswan
+    outputs:
+      libreswan_key: ${{ steps.gen_libreswan_key.outputs.key }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+
+    steps:
+    - name: Checkout Libreswan
+      uses: actions/checkout@v6
+      with:
+        repository: libreswan/libreswan
+        path: libreswan
+        ref: ${{ env.libreswan_ver }}
+
+    - name: generate cache key
+      id: gen_libreswan_key
+      run: echo 'key=libreswan-${{ env.libreswan_ver }}-${{ matrix.runner }}'
+                >> $GITHUB_OUTPUT
+
+    - name: cache
+      id: libreswan_cache
+      uses: actions/cache@v5
+      with:
+        path: libreswan-deb
+        key:  ${{ steps.gen_libreswan_key.outputs.key }}
+
+    - name: update APT cache
+      if: steps.libreswan_cache.outputs.cache-hit != 'true'
+      run: sudo apt update || true
+
+    - name: install common dependencies
+      if: steps.libreswan_cache.outputs.cache-hit != 'true'
+      run: sudo apt install -y ${{ env.dependencies }}
+
+    - name: install build dependencies
+      if: steps.libreswan_cache.outputs.cache-hit != 'true'
+      run: mk-build-deps --install --root-cmd sudo
+                         libreswan/packaging/debian/control
+
+    - name: build
+      if: steps.libreswan_cache.outputs.cache-hit != 'true'
+      run: cd libreswan && make deb
+
+    - name: move the package to cache
+      if: steps.libreswan_cache.outputs.cache-hit != 'true'
+      run: mkdir -p libreswan-deb && mv libreswan_*.deb ./libreswan-deb
+
   build-linux:
-    needs: build-dpdk
+    needs: [build-dpdk, build-libreswan]
     env:
       dependencies: |
         automake libtool gcc bc libjemalloc2 libjemalloc-dev libssl-dev \
-        llvm-dev libnuma-dev libpcap-dev selinux-policy-dev libbpf-dev \
-        lftp libreswan
+        llvm-dev libnuma-dev selinux-policy-dev libxdp-dev lftp
       CC:          ${{ matrix.compiler }}
       DPDK:        ${{ matrix.dpdk }}
       DPDK_SHARED: ${{ matrix.dpdk_shared }}
@@ -93,7 +150,7 @@ jobs:
       TEST_RANGE:  ${{ matrix.test_range }}
 
     name: linux ${{ join(matrix.*, ' ') }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
 
     strategy:
@@ -210,7 +267,7 @@ jobs:
 
     steps:
     - name: checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
 
     - name: update PATH
       run:  |
@@ -218,21 +275,43 @@ jobs:
         echo "$HOME/.local/bin" >> $GITHUB_PATH
 
     - name: set up python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: ${{ env.python_default }}
 
-    - name: cache
+    - name: fix /etc/hosts
+      # On multiple occasions GitHub added things to /etc/hosts that are not
+      # a correct syntax for this file causing test failures:
+      #   https://github.com/actions/runner-images/issues/3353
+      #   https://github.com/actions/runner-images/issues/12192
+      # Just clearing those out, if any.
+      run: |
+        set -x
+        cp /etc/hosts ./hosts.bak
+        sed -E -n \
+          '/^[[:space:]]*(#.*|[0-9a-fA-F:.]+([[:space:]]+[a-zA-Z0-9.-]+)+|)$/p' \
+          ./hosts.bak | sudo tee /etc/hosts
+        diff -u ./hosts.bak /etc/hosts || true
+
+    - name: DPDK cache
       if:   matrix.dpdk != '' || matrix.dpdk_shared != ''
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: dpdk-dir
         key:  ${{ needs.build-dpdk.outputs.dpdk_key }}
+
+    - name: Libreswan cache
+      uses: actions/cache@v5
+      with:
+        path: libreswan-deb
+        key:  ${{ needs.build-libreswan.outputs.libreswan_key }}
 
     - name: update APT cache
       run:  sudo apt update || true
     - name: install common dependencies
       run:  sudo apt install -y ${{ env.dependencies }}
+    - name: install Libreswan
+      run:  sudo apt install -y ./libreswan-deb/libreswan_*.deb
     - name: install libunbound libunwind python3-unbound
       # GitHub Actions doesn't have 32-bit versions of these libraries.
       if:   matrix.m32 == ''
@@ -241,13 +320,12 @@ jobs:
       if:   matrix.m32 != ''
       run:  sudo apt install -y gcc-multilib
 
-    - name: Reduce ASLR entropy
-      if:   matrix.sanitizers != ''
-      # Asan in llvm 14 provided in ubuntu-22.04 is incompatible with
-      # high-entropy ASLR configured in much newer kernels that GitHub
-      # runners are using leading to random crashes:
-      #   https://github.com/actions/runner-images/issues/9491
-      run: sudo sysctl -w vm.mmap_rnd_bits=28
+    - name: checkout sparse
+      uses: actions/checkout@v6
+      # Official mirror of the git.kernel.org/pub/scm/devel/sparse/sparse.git.
+      with:
+        repository: lucvoo/sparse
+        path: sparse
 
     - name: prepare
       run:  ./.ci/linux-prepare.sh
@@ -270,27 +348,30 @@ jobs:
 
     - name: upload logs on failure
       if: failure() || cancelled()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: logs-linux-${{ join(matrix.*, '-') }}
         path: logs.tgz
 
-  build-clang-analyze:
+  build-clang-analyze-cache:
     needs: build-dpdk
     env:
       dependencies: |
-        automake bc clang-tools libbpf-dev libnuma-dev libpcap-dev \
-        libunbound-dev libunwind-dev libssl-dev libtool llvm-dev
+        automake bc clang-tools libnuma-dev libunbound-dev libunwind-dev \
+        libssl-dev libtool libxdp-dev llvm-dev
       CC:   clang
       DPDK: dpdk
       CLANG_ANALYZE: true
-    name: clang-analyze
-    runs-on: ubuntu-22.04
+    name: clang-analyze-cache
+    outputs:
+      key: ${{ steps.cache_key.outputs.key }}
+      outcome: ${{ steps.build_base.outcome }}
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
 
     steps:
     - name: checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         fetch-depth: 0
 
@@ -349,18 +430,80 @@ jobs:
 
     - name: check for analyzer result cache
       id: clang_cache
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: base-clang-analyzer-results
         key:  ${{ steps.cache_key.outputs.key }}
 
     - name: set up python
-      uses: actions/setup-python@v5
+      if: steps.clang_cache.outputs.cache-hit != 'true'
+      uses: actions/setup-python@v6
       with:
         python-version: ${{ env.python_default }}
 
     - name: get cached dpdk-dir
-      uses: actions/cache/restore@v4
+      if: steps.clang_cache.outputs.cache-hit != 'true'
+      uses: actions/cache/restore@v5
+      with:
+        path: dpdk-dir
+        key:  ${{ needs.build-dpdk.outputs.dpdk_key }}
+
+    - name: update APT cache
+      if: steps.clang_cache.outputs.cache-hit != 'true'
+      run:  sudo apt update || true
+
+    - name: install common dependencies
+      if: steps.clang_cache.outputs.cache-hit != 'true'
+      run:  sudo apt install -y ${{ env.dependencies }}
+
+    - name: prepare
+      if: steps.clang_cache.outputs.cache-hit != 'true'
+      run:  ./.ci/linux-prepare.sh
+
+    - name: build base reference
+      id: build_base
+      if: steps.clang_cache.outputs.cache-hit != 'true'
+      continue-on-error: true
+      run:  ./.ci/linux-build.sh
+
+  build-clang-analyze:
+    needs: [build-dpdk, build-clang-analyze-cache]
+    if: >
+        needs.build-clang-analyze-cache.outputs.outcome == 'success' ||
+        needs.build-clang-analyze-cache.outputs.outcome == 'skipped'
+    env:
+      dependencies: |
+        automake bc clang-tools libnuma-dev libunbound-dev libunwind-dev \
+        libssl-dev libtool libxdp-dev llvm-dev
+      CC:   clang
+      DPDK: dpdk
+      CLANG_ANALYZE: true
+    name: clang-analyze
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+
+    steps:
+    - name: checkout
+      uses: actions/checkout@v6
+
+    - name: update PATH
+      run: |
+        echo "$HOME/bin"        >> $GITHUB_PATH
+        echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+    - name: check for analyzer result cache
+      uses: actions/cache/restore@v5
+      with:
+        path: base-clang-analyzer-results
+        key:  ${{ needs.build-clang-analyze-cache.outputs.key }}
+
+    - name: set up python
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ env.python_default }}
+
+    - name: get cached dpdk-dir
+      uses: actions/cache/restore@v5
       with:
         path: dpdk-dir
         key:  ${{ needs.build-dpdk.outputs.dpdk_key }}
@@ -374,19 +517,34 @@ jobs:
     - name: prepare
       run:  ./.ci/linux-prepare.sh
 
-    - name: build base reference
-      if: steps.clang_cache.outputs.cache-hit != 'true'
-      run:  ./.ci/linux-build.sh
-
-    - name: save cache
-      uses: actions/cache/save@v4
-      if: steps.clang_cache.outputs.cache-hit != 'true'
-      with:
-        path: base-clang-analyzer-results
-        key:  ${{ steps.cache_key.outputs.key }}
-
     - name: build
       run:  ./.ci/linux-build.sh
+
+  build-oss-fuzz:
+    name: build oss-fuzz fuzzers
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+
+    steps:
+    - name: Checkout OVS
+      uses: actions/checkout@v6
+
+    - name: Checkout oss-fuzz
+      uses: actions/checkout@v6
+      with:
+        repository: google/oss-fuzz
+        path: oss-fuzz
+
+    - name: Build oss-fuzz image
+      run: |
+        cd oss-fuzz
+        python infra/helper.py build_image openvswitch --no-pull
+
+    - name: Build oss-fuzz fuzzers
+      run: |
+        cd oss-fuzz
+        python infra/helper.py build_fuzzers --sanitizer address \
+          --engine afl --architecture x86_64 openvswitch $GITHUB_WORKSPACE
 
   build-osx:
     env:
@@ -402,13 +560,13 @@ jobs:
 
     steps:
     - name: checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
     - name: update PATH
       run:  |
         echo "$HOME/bin"        >> $GITHUB_PATH
         echo "$HOME/.local/bin" >> $GITHUB_PATH
     - name: set up python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: ${{ env.python_default }}
     - name: install dependencies
@@ -419,10 +577,49 @@ jobs:
       run:  ./.ci/osx-build.sh
     - name: upload logs on failure
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: logs-osx-clang---disable-ssl
         path: config.log
+
+  build-old-linux-distribution:
+    env:
+      dependencies:   git make automake libtool gcc libnuma-dev zlib1g-dev
+      python_version: 3.14.8
+
+    name: linux gcc (ubuntu-14.04)
+    runs-on:   ubuntu-26.04
+    container: ubuntu:14.04
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+
+    steps:
+    - name: update APT cache
+      run:  sudo apt update || true
+
+    - name: install dependencies
+      run:  sudo apt install -y ${{ env.dependencies }}
+
+    - name: build python
+      run:  |
+        git clone --branch v${{ env.python_version }} --depth 1 \
+            https://github.com/python/cpython cpython
+        cd cpython && ./configure && sudo make -j4 install
+        python3 --version
+
+    - name: checkout
+      run:  |
+        SHA=${{ github.event.pull_request.head.sha || github.sha }}
+        git clone https://github.com/${{ github.repository }}.git ovs
+        cd ovs && git fetch origin $SHA && git checkout $SHA
+
+    - name: prepare
+      run:  cd ovs && ./boot.sh && ./configure --disable-ssl --enable-Werror
+
+    - name: build
+      run:  cd ovs && make -j4
 
   build-linux-deb:
     env:
@@ -432,7 +629,7 @@ jobs:
       DPDK:        ${{ matrix.dpdk }}
 
     name: linux deb ${{ matrix.dpdk }} dpdk
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
 
     strategy:
@@ -443,7 +640,7 @@ jobs:
 
     steps:
     - name: checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
 
     - name: update PATH
       run:  |
@@ -465,15 +662,15 @@ jobs:
       run:  ./.ci/linux-build.sh
 
     - name: upload deb packages
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: deb-packages-${{ matrix.dpdk }}-dpdk
-        path: '/home/runner/work/ovs/*.deb'
+        path: /home/runner/work/${{ github.event.repository.name }}/*.deb
 
   build-linux-rpm:
     name: linux rpm fedora
-    runs-on: ubuntu-latest
-    container: fedora:39
+    runs-on: ubuntu-26.04
+    container: fedora:43
     timeout-minutes: 30
 
     strategy:
@@ -481,13 +678,13 @@ jobs:
 
     steps:
     - name: checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
     - name: install dependencies
       run: |
         dnf install -y rpm-build dnf-plugins-core
         sed -e 's/@VERSION@/0.0.1/' rhel/openvswitch-fedora.spec.in \
             > /tmp/ovs.spec
-        dnf builddep -y /tmp/ovs.spec
+        dnf builddep --exclude='*.i686' -y /tmp/ovs.spec
         rm -f /tmp/ovs.spec
 
     - name: configure
@@ -500,7 +697,7 @@ jobs:
       run:  dnf install -y rpm/rpmbuild/RPMS/*/*.rpm
 
     - name: upload rpm packages
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: rpm-packages
         path: |

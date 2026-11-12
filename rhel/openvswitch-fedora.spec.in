@@ -16,10 +16,6 @@
 # and should not be used otherwise (these tests require root privileges).
 # These tests can be executed, for example, via:
 #    rpmbuild -rb --with check_datapath_kernel openvswitch-fedora.src.rpm
-#
-# These tests will use the currently installed OVS kernel modules.
-
-#%define kernel 2.6.40.4-5.fc15.x86_64
 
 # If libcap-ng isn't available and there is no need for running OVS
 # as regular user, specify the '--without libcapng'
@@ -52,9 +48,8 @@ Group: System Environment/Daemons
 URL: http://www.openvswitch.org/
 Version: @VERSION@
 
-# Nearly all of openvswitch is ASL 2.0.  The bugtool is LGPLv2+, and the
-# lib/sflow*.[ch] files are SISSL
-License: ASL 2.0 and LGPLv2+ and SISSL
+# Nearly all of openvswitch is ASL 2.0.  The lib/sflow*.[ch] files are SISSL.
+License: ASL 2.0 and SISSL
 Release: %{release_number}%{?dist}
 Source: http://openvswitch.org/releases/%{name}-%{version}.tar.gz
 
@@ -70,10 +65,15 @@ BuildRequires: /usr/bin/sphinx-build-3
 BuildRequires: procps-ng
 %if %{with libcapng}
 BuildRequires: libcap-ng libcap-ng-devel
+Provides: user(openvswitch)
+Provides: group(openvswitch)
+%if %{with dpdk}
+Provides: group(hugetlbfs)
+%endif
 %endif
 %if %{with dpdk}
 BuildRequires: libpcap-devel numactl-devel
-BuildRequires: dpdk-devel >= 23.11
+BuildRequires: dpdk-devel >= 25.11
 Provides: %{name}-dpdk = %{version}-%{release}
 %endif
 %if %{with afxdp}
@@ -85,8 +85,6 @@ BuildRequires: libbpf-devel systemtap-sdt-devel
 BuildRequires: unbound unbound-devel
 
 Requires: openssl hostname iproute module-init-tools unbound
-#Upstream kernel commit 4f647e0a3c37b8d5086214128614a136064110c3
-#Requires: kernel >= 3.15.0-0
 
 Requires(pre): shadow-utils
 Requires(post): /bin/sed
@@ -118,7 +116,14 @@ Summary: Open vSwitch python3 bindings
 License: ASL 2.0
 BuildArch: noarch
 Requires: python3
-Suggests: python3-netaddr python3-pyparsing python3-unbound
+
+# DNS resolution support in Python IDL.
+Suggests: python3-unbound
+# Dependencies of ovs.flow library.
+Suggests: python3-netaddr python3-pyparsing
+# Dependencies of ovs-flowviz.
+Suggests: python3-click python3-graphviz python3-rich
+
 %{?python_provide:%python_provide python3-openvswitch = %{version}-%{release}}
 
 %description -n python3-openvswitch
@@ -141,7 +146,7 @@ License: ASL 2.0
 This provides shared library, libopenswitch.so and the openvswitch header
 files needed to build an external application.
 
-%if 0%{?rhel} > 7 || 0%{?fedora} > 28
+%if (0%{?rhel} > 7 && 0%{?rhel} < 9) || (0%{?fedora} > 28 && 0%{?fedora} < 41)
 %package -n network-scripts-%{name}
 Summary: Open vSwitch legacy network service support
 License: ASL 2.0
@@ -186,6 +191,7 @@ This package provides IPsec tunneling support for OVS tunnels.
         --disable-static \
         --enable-shared \
         --with-pkidir=%{_sharedstatedir}/openvswitch/pki \
+        --with-version-suffix=-%{release} \
         PYTHON3=%{__python3}
 
 build-aux/dpdkstrip.py \
@@ -222,6 +228,9 @@ for service in openvswitch ovsdb-server ovs-vswitchd ovs-delete-transient-ports 
                         rhel/usr_lib_systemd_system_${service}.service \
                         $RPM_BUILD_ROOT%{_unitdir}/${service}.service
 done
+install -p -D -m 0644 \
+        rhel/usr_lib_systemd_system_ovsdb-server.socket \
+        $RPM_BUILD_ROOT%{_unitdir}/ovsdb-server.socket
 install -m 0755 rhel/etc_init.d_openvswitch \
         $RPM_BUILD_ROOT%{_datadir}/openvswitch/scripts/openvswitch.init
 
@@ -235,14 +244,20 @@ install -m 0644 vswitchd/vswitch.ovsschema \
         $RPM_BUILD_ROOT/%{_datadir}/openvswitch/vswitch.ovsschema
 
 install -d -m 0755 $RPM_BUILD_ROOT/%{_sysconfdir}/sysconfig/network-scripts/
+
+%if ! (0%{?rhel} >= 9 || 0%{?fedora} >= 41)
 install -p -m 0755 rhel/etc_sysconfig_network-scripts_ifdown-ovs \
         $RPM_BUILD_ROOT/%{_sysconfdir}/sysconfig/network-scripts/ifdown-ovs
 install -p -m 0755 rhel/etc_sysconfig_network-scripts_ifup-ovs \
         $RPM_BUILD_ROOT/%{_sysconfdir}/sysconfig/network-scripts/ifup-ovs
+%endif
 
 install -d -m 0755 $RPM_BUILD_ROOT%{python3_sitelib}
 cp -a $RPM_BUILD_ROOT/%{_datadir}/openvswitch/python/* \
    $RPM_BUILD_ROOT%{python3_sitelib}
+
+mv $RPM_BUILD_ROOT%{python3_sitelib}/ovs/flowviz/ovs-flowviz \
+   $RPM_BUILD_ROOT/%{_bindir}/ovs-flowviz
 
 rm -rf $RPM_BUILD_ROOT/%{_datadir}/openvswitch/python/
 
@@ -259,8 +274,8 @@ install -p -D -m 0755 \
         rhel/usr_share_openvswitch_scripts_ovs-systemd-reload \
         $RPM_BUILD_ROOT%{_datadir}/openvswitch/scripts/ovs-systemd-reload
 
-# remove unpackaged files
-rm -f $RPM_BUILD_ROOT%{_bindir}/ovs-parse-backtrace
+# Remove .la files, if present (automatic with %__brp_remove_la_files on f36+).
+rm -f $RPM_BUILD_ROOT%{_libdir}/*.la
 
 %check
 %if %{with check}
@@ -397,33 +412,26 @@ fi
 %{_datadir}/selinux/packages/%{name}/openvswitch-custom.pp
 
 %files -n python3-openvswitch
+%{_bindir}/ovs-flowviz
+%{_mandir}/man8/ovs-flowviz.8*
 %{python3_sitelib}/ovs
 
 %files test
-%{_bindir}/ovs-test
-%{_bindir}/ovs-vlan-test
-%{_bindir}/ovs-l3ping
 %{_bindir}/ovs-pcap
 %{_bindir}/ovs-tcpdump
 %{_bindir}/ovs-tcpundump
 %{_datadir}/openvswitch/scripts/usdt/*
-%{_mandir}/man8/ovs-test.8*
-%{_mandir}/man8/ovs-vlan-test.8*
-%{_mandir}/man8/ovs-l3ping.8*
 %{_mandir}/man1/ovs-pcap.1*
 %{_mandir}/man8/ovs-tcpdump.8*
 %{_mandir}/man1/ovs-tcpundump.1*
-%{python3_sitelib}/ovstest
 
 %files devel
 %{_libdir}/lib*.so
 %{_libdir}/pkgconfig/*.pc
 %{_includedir}/openvswitch/*
 %{_includedir}/openflow/*
-%exclude %{_libdir}/*.la
-%exclude %{_libdir}/*.a
 
-%if 0%{?rhel} > 7 || 0%{?fedora} > 28
+%if (0%{?rhel} > 7 && 0%{?rhel} < 9) || (0%{?fedora} > 28 && 0%{?fedora} < 41)
 %files -n network-scripts-%{name}
 %{_sysconfdir}/sysconfig/network-scripts/ifup-ovs
 %{_sysconfdir}/sysconfig/network-scripts/ifdown-ovs
@@ -447,6 +455,7 @@ fi
 %config(noreplace) %{_sysconfdir}/logrotate.d/openvswitch
 %{_unitdir}/openvswitch.service
 %{_unitdir}/ovsdb-server.service
+%{_unitdir}/ovsdb-server.socket
 %{_unitdir}/ovs-vswitchd.service
 %{_unitdir}/ovs-delete-transient-ports.service
 %{_datadir}/openvswitch/scripts/openvswitch.init
@@ -454,8 +463,6 @@ fi
 %{_sysconfdir}/sysconfig/network-scripts/ifup-ovs
 %{_sysconfdir}/sysconfig/network-scripts/ifdown-ovs
 %endif
-%{_datadir}/openvswitch/bugtool-plugins/
-%{_datadir}/openvswitch/scripts/ovs-bugtool-*
 %{_datadir}/openvswitch/scripts/ovs-check-dead-ifs
 %{_datadir}/openvswitch/scripts/ovs-lib
 %{_datadir}/openvswitch/scripts/ovs-save
@@ -478,7 +485,6 @@ fi
 %{_bindir}/ovs-pki
 %{_bindir}/vtep-ctl
 %{_libdir}/lib*.so.*
-%{_sbindir}/ovs-bugtool
 %{_sbindir}/ovs-vswitchd
 %{_sbindir}/ovsdb-server
 %{_mandir}/man1/ovsdb-client.1*
@@ -495,7 +501,6 @@ fi
 %{_mandir}/man7/ovsdb-server.7*
 %{_mandir}/man8/vtep-ctl.8*
 %{_mandir}/man8/ovs-appctl.8*
-%{_mandir}/man8/ovs-bugtool.8*
 %{_mandir}/man8/ovs-ctl.8*
 %{_mandir}/man8/ovs-dpctl.8*
 %{_mandir}/man8/ovs-dpctl-top.8*
@@ -504,7 +509,6 @@ fi
 %{_mandir}/man8/ovs-pki.8*
 %{_mandir}/man8/ovs-vsctl.8*
 %{_mandir}/man8/ovs-vswitchd.8*
-%{_mandir}/man8/ovs-parse-backtrace.8*
 %{_mandir}/man8/ovs-testcontroller.8*
 %if %{with dpdk}
 %{_prefix}/lib/udev/rules.d/91-vfio.rules

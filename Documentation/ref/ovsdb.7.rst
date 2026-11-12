@@ -665,7 +665,7 @@ the opposite arrangement as well.
 OVSDB supports the following active connection methods:
 
 ssl:<host>:<port>
-    The specified SSL or TLS <port> on the given <host>.
+    The specified SSL/TLS <port> on the given <host>.
 
 tcp:<host>:<port>
     The specified TCP <port> on the given <host>.
@@ -673,9 +673,6 @@ tcp:<host>:<port>
 unix:<file>
     On Unix-like systems, connect to the Unix domain server socket named
     <file>.
-
-    On Windows, connect to a local named pipe that is represented by a file
-    created in the path <file> to mimic the behavior of a Unix domain socket.
 
 <method1>,<method2>,...,<methodN>
     For a clustered database service to be highly available, a client must be
@@ -692,7 +689,7 @@ unix:<file>
 OVSDB supports the following passive connection methods:
 
 pssl:<port>[:<ip>]
-    Listen on the given TCP <port> for SSL or TLS connections.  By default,
+    Listen on the given TCP <port> for SSL/TLS connections.  By default,
     connections are not bound to a particular local IP address.  Specifying
     <ip> limits connections to those from the given IP.
 
@@ -705,9 +702,15 @@ punix:<file>
     On Unix-like systems, listens for connections on the Unix domain socket
     named <file>.
 
-    On Windows, listens on a local named pipe, creating a named pipe
-    <file> to mimic the behavior of a Unix domain socket. The ACLs of the named
-    pipe include LocalSystem, Administrators, and Creator Owner.
+pfd:<fd>
+    Listen on a pre-opened file descriptor <fd>.  The file descriptor must
+    refer to a bound, listening Unix domain stream socket.  This is intended
+    for use with systemd socket activation, where systemd opens the socket
+    and passes it to the service.
+
+    For security, ``pfd:`` may only be specified on the command line
+    (``--remote=pfd:<fd>``).  It is rejected if added at runtime via
+    ``ovsdb-server/add-remote`` or through the database.
 
 All IP-based connection methods accept IPv4 and IPv6 addresses.  To specify an
 IPv6 address, wrap it in square brackets, e.g.  ``ssl:[::1]:6640``.  Passive
@@ -725,8 +728,8 @@ versions, we encourage users to specify a port number.
 
 The ``ssl`` and ``pssl`` connection methods requires additional configuration
 through ``--private-key``, ``--certificate``, and ``--ca-cert`` command line
-options.  Open vSwitch can be built without SSL support, in which case these
-connection methods are not supported.
+options.  Open vSwitch can be built without SSL/TLS support, in which case
+these connection methods are not supported.
 
 Database Life Cycle
 ===================

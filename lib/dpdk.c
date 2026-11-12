@@ -31,7 +31,6 @@
 #include "dirs.h"
 #include "fatal-signal.h"
 #include "netdev-dpdk.h"
-#include "netdev-offload-provider.h"
 #include "openvswitch/dynamic-string.h"
 #include "openvswitch/vlog.h"
 #include "ovs-atomic.h"
@@ -64,18 +63,71 @@ args_contains(const struct svec *args, const char *value)
     return false;
 }
 
+static int
+compare_core_ids(const void *a_, const void *b_)
+{
+    const unsigned int *a = a_;
+    const unsigned int *b = b_;
+
+    return *a < *b ? -1 : *a > *b;
+}
+
+/* Converts a hexadecimal core mask to DPDK lcore list format.
+ * Returns NULL if no valid bits are set in the mask. */
+static char *
+cmask_to_lcore_list(const char *cmask)
+{
+    struct ds ds = DS_EMPTY_INITIALIZER;
+    struct ovs_numa_dump *lcore_dump;
+    struct ovs_numa_info_core *core;
+    unsigned int *core_ids = NULL;
+    unsigned int num_cores;
+    unsigned int i = 0;
+
+    lcore_dump = ovs_numa_dump_cores_with_cmask(cmask);
+
+    num_cores = ovs_numa_dump_count(lcore_dump);
+    if (num_cores == 0) {
+        ovs_numa_dump_destroy(lcore_dump);
+        return NULL;
+    }
+    core_ids = xmalloc(num_cores * sizeof *core_ids);
+
+    FOR_EACH_CORE_ON_DUMP (core, lcore_dump) {
+        core_ids[i++] = core->core_id;
+    }
+
+    /* ovs_numa_dump uses a hash map, so sort by core id. */
+    qsort(core_ids, num_cores, sizeof *core_ids, compare_core_ids);
+
+    if (num_cores > RTE_MAX_LCORE) {
+        VLOG_INFO("Truncating DPDK lcore list as dpdk-lcore-mask has >"
+                  " %u lcores", RTE_MAX_LCORE);
+        num_cores = RTE_MAX_LCORE;
+    }
+
+    for (i = 0; i < num_cores; i++) {
+        ds_put_format(&ds, "%u@%u,", i, core_ids[i]);
+    }
+    /* Remove trailing comma. */
+    ds_chomp(&ds, ',');
+
+    ovs_numa_dump_destroy(lcore_dump);
+    free(core_ids);
+    return ds_steal_cstr(&ds);
+}
+
 static void
 construct_dpdk_options(const struct smap *ovs_other_config, struct svec *args)
 {
     struct dpdk_options_map {
         const char *ovs_configuration;
         const char *dpdk_option;
-        bool default_enabled;
-        const char *default_value;
+        char *(*param_conversion) (const char *);
     } opts[] = {
-        {"dpdk-lcore-mask",   "-c",             false, NULL},
-        {"dpdk-hugepage-dir", "--huge-dir",     false, NULL},
-        {"dpdk-socket-limit", "--socket-limit", false, NULL},
+        {"dpdk-lcore-mask",   "--lcores",       cmask_to_lcore_list},
+        {"dpdk-hugepage-dir", "--huge-dir",     NULL},
+        {"dpdk-socket-limit", "--socket-limit", NULL},
     };
 
     int i;
@@ -84,17 +136,27 @@ construct_dpdk_options(const struct smap *ovs_other_config, struct svec *args)
     for (i = 0; i < ARRAY_SIZE(opts); ++i) {
         const char *value = smap_get(ovs_other_config,
                                      opts[i].ovs_configuration);
-        if (!value && opts[i].default_enabled) {
-            value = opts[i].default_value;
-        }
 
         if (value) {
             if (!args_contains(args, opts[i].dpdk_option)) {
+                char *dpdk_val = NULL;
+
+                if (opts[i].param_conversion) {
+                    dpdk_val = (opts[i].param_conversion)(value);
+                    if (!dpdk_val) {
+                        VLOG_WARN("Ignoring database defined option '%s'"
+                                  " due to invalid value '%s'",
+                                  opts[i].ovs_configuration, value);
+                        continue;
+                    }
+                    value = dpdk_val;
+                }
                 svec_add(args, opts[i].dpdk_option);
                 svec_add(args, value);
+                free(dpdk_val);
             } else {
                 VLOG_WARN("Ignoring database defined option '%s' due to "
-                          "dpdk-extra config", opts[i].dpdk_option);
+                          "dpdk-extra config", opts[i].ovs_configuration);
             }
         }
     }
@@ -123,7 +185,7 @@ construct_dpdk_mutex_options(const struct smap *ovs_other_config,
     int i;
     for (i = 0; i < ARRAY_SIZE(excl_opts); ++i) {
         int found_opts = 0, scan, found_pos = -1;
-        const char *found_value;
+        const char *found_value = NULL;
         struct dpdk_exclusive_options_map *popt = &excl_opts[i];
 
         for (scan = 0; scan < MAX_DPDK_EXCL_OPTS
@@ -323,7 +385,6 @@ dpdk_init__(const struct smap *ovs_other_config)
     if (log_stream == NULL) {
         VLOG_ERR("Can't redirect DPDK log: %s.", ovs_strerror(errno));
     } else {
-        setbuf(log_stream, NULL);
         rte_openlog_stream(log_stream);
     }
 
@@ -337,7 +398,9 @@ dpdk_init__(const struct smap *ovs_other_config)
     }
 #endif
 
-    if (args_contains(&args, "-c") || args_contains(&args, "-l")) {
+    if (args_contains(&args, "-c") ||
+        args_contains(&args, "-l") ||
+        args_contains(&args, "--lcores")) {
         auto_determine = false;
     }
 
@@ -363,8 +426,39 @@ dpdk_init__(const struct smap *ovs_other_config)
              * thread affintity - default to core #0 */
             VLOG_ERR("Thread getaffinity failed. Using core #0");
         }
-        svec_add(&args, "-l");
-        svec_add_nocopy(&args, xasprintf("%d", cpu));
+        svec_add(&args, "--lcores");
+        svec_add_nocopy(&args, xasprintf("0@%d", cpu));
+    }
+
+    if (!args_contains(&args, "-a") && !args_contains(&args, "--allow")
+        && !args_contains(&args, "-b") && !args_contains(&args, "--block")
+        && !smap_get_bool(ovs_other_config, "dpdk-probe-at-init", false)) {
+#ifdef RTE_BUS_AUXILIARY
+        svec_add(&args, "-a");
+        svec_add(&args, "auxiliary:");
+#endif
+#ifdef RTE_BUS_CDX
+        svec_add(&args, "-a");
+        svec_add(&args, "cdx:cdx-");
+#endif
+#ifdef RTE_BUS_FSLMC
+        svec_add(&args, "-a");
+        svec_add(&args, "fslmc:dpni.65535");
+#endif
+#ifdef RTE_BUS_PCI
+        if (!args_contains(&args, "--no-pci")) {
+            svec_add(&args, "-a");
+            svec_add(&args, "pci:0000:00:00.0");
+        }
+#endif
+#ifdef RTE_BUS_UACCE
+        svec_add(&args, "-a");
+        svec_add(&args, "uacce:");
+#endif
+#ifdef RTE_BUS_VMBUS
+        svec_add(&args, "-a");
+        svec_add(&args, "vmbus:00000000-0000-0000-0000-000000000000");
+#endif
     }
 
     svec_terminate(&args);
@@ -436,13 +530,14 @@ dpdk_init__(const struct smap *ovs_other_config)
     unixctl_command_register("dpdk/get-malloc-stats", "", 0, 0,
                              dpdk_unixctl_mem_stream,
                              malloc_dump_stats_wrapper);
+    unixctl_command_register("dpdk/get-memzone-stats", "", 0, 0,
+                             dpdk_unixctl_mem_stream, rte_memzone_dump);
 
     /* We are called from the main thread here */
     RTE_PER_LCORE(_lcore_id) = NON_PMD_CORE_ID;
 
     /* Finally, register the dpdk classes */
     netdev_dpdk_register(ovs_other_config);
-    netdev_register_flow_api_provider(&netdev_offload_dpdk);
     return true;
 }
 

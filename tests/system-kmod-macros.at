@@ -14,21 +14,17 @@ m4_define([_ADD_BR], [[add-br $1 -- set Bridge $1 protocols=OpenFlow10,OpenFlow1
 # specifies the expected output after filtering through uuidfilt.
 # 'dbinit-aux-args' are passed as additional commands to 'ovs-vsctl init'
 # before starting ovs-vswitchd.
-#
-# Best-effort loading of all available vport modules is performed.
-#
 m4_define([OVS_TRAFFIC_VSWITCHD_START],
   [AT_CHECK([modprobe openvswitch])
    on_exit 'modprobe -r openvswitch'
-   m4_foreach([mod], [[vport_geneve], [vport_gre], [vport_lisp], [vport_stt], [vport_vxlan]],
-              [modprobe -q mod || echo "Module mod not loaded."
-               on_exit 'modprobe -q -r mod'
-              ])
    on_exit 'ovs-dpctl del-dp ovs-system'
    on_exit 'ovs-appctl dpctl/flush-conntrack'
    _OVS_VSWITCHD_START([], [$3])
    dnl Add bridges, ports, etc.
    AT_CHECK([ovs-vsctl -- _ADD_BR([br0]) -- $1 m4_if([$2], [], [], [| uuidfilt])], [0], [$2])
+
+   dnl Start retis capture if requested.
+   RETIS_CHECK_AND_RUN()
 ])
 
 # OVS_TRAFFIC_VSWITCHD_STOP([ALLOWLIST], [extra_cmds])
@@ -60,9 +56,13 @@ m4_define([CONFIGURE_VETH_OFFLOADS],
 # Perform requirements checks for running conntrack tests, and flush the
 # kernel conntrack tables when the test is finished.
 #
+# nf_conntrack_ipv[46] are old names in kernels before 4.18.  These will
+# fail on newer kernels, while nf_conntrack will fail on older ones.  But
+# these failures do not affect the test execution.
+#
 m4_define([CHECK_CONNTRACK],
-    [m4_foreach([mod], [[nf_conntrack_ipv4], [nf_conntrack_ipv6], [nf_nat_ftp],
-                        [nf_nat_tftp]],
+    [m4_foreach([mod], [[nf_conntrack_ipv4], [nf_conntrack_ipv6],
+                        [nf_conntrack], [nf_conntrack_netlink]],
                 [modprobe mod || echo "Module mod not loaded."
                  on_exit 'modprobe -r mod'
                 ])
@@ -74,9 +74,13 @@ m4_define([CHECK_CONNTRACK],
 # CHECK_CONNTRACK_ALG()
 #
 # Perform requirements checks for running conntrack ALG tests. The kernel
-# supports ALG, so no check is needed.
+# supports ALG, so no check is needed.  But we need to load the modules.
 #
-m4_define([CHECK_CONNTRACK_ALG])
+m4_define([CHECK_CONNTRACK_ALG],
+    [m4_foreach([mod], [[nf_nat_ftp], [nf_nat_tftp]],
+                [modprobe mod || echo "Module mod not loaded."
+                 on_exit 'modprobe -r mod'])]
+)
 
 # CHECK_CONNTRACK_LOCAL_STACK()
 #
@@ -94,6 +98,15 @@ m4_define([CHECK_CONNTRACK_FRAG_OVERLAP],
     AT_SKIP_IF([:])
 ])
 
+# CHECK_CONNTRACK_SNAT_ICMP_ID()
+#
+# Skip ICMP id conflict tests on kernel datapath. The fix for unique ICMP
+# id allocation on SNAT is in the userspace conntrack only.
+m4_define([CHECK_CONNTRACK_SNAT_ICMP_ID],
+[
+    AT_SKIP_IF([:])
+])
+
 # CHECK_CONNTRACK_NAT()
 #
 # Perform requirements checks for running conntrack NAT tests. The kernel
@@ -105,12 +118,8 @@ m4_define([CHECK_CONNTRACK_NAT])
 #
 # Perform requirements checks for running conntrack all-zero IP SNAT tests.
 # The kernel always supports all-zero IP SNAT, so no check is needed.
-# However, the Windows datapath using the same netlink interface does not.
 #
-m4_define([CHECK_CONNTRACK_ZEROIP_SNAT],
-[
-    AT_SKIP_IF([test "$IS_WIN32" = "yes"])
-])
+m4_define([CHECK_CONNTRACK_ZEROIP_SNAT])
 
 # CHECK_CONNTRACK_SCTP()
 #
@@ -119,7 +128,6 @@ m4_define([CHECK_CONNTRACK_ZEROIP_SNAT],
 #
 m4_define([CHECK_CONNTRACK_SCTP],
 [
-   AT_SKIP_IF([test "$IS_WIN32" = "yes"])
    AT_SKIP_IF([! test -e /proc/sys/net/netfilter/nf_conntrack_sctp_timeout_closed])
 ])
 
@@ -202,6 +210,14 @@ m4_define([DPCTL_CHECK_FRAGMENTATION_FAIL],
 
 ])
 
+# OVS_CHECK_FRAG_LARGE
+#
+# This check isn't valid for kernel
+m4_define([OVS_CHECK_FRAG_LARGE],
+[
+
+])
+
 # OVS_CHECK_MIN_KERNEL([minversion], [minsublevel])
 #
 # Skip test if kernel version falls below minversion.minsublevel
@@ -253,6 +269,11 @@ m4_define([VSCTL_ADD_DATAPATH_TABLE],
 # specific regression.
 m4_define([CHECK_L3L4_CONNTRACK_REASM])
 
+# CHECK_NO_DPDK_OFFLOAD
+#
+# The kernel module tests do not use dpdk's rte_flow offload.
+m4_define([CHECK_NO_DPDK_OFFLOAD])
+
 # CHECK_NO_TC_OFFLOAD
 #
 # The kernel module tests do not use TC offload.
@@ -266,4 +287,95 @@ m4_define([OVS_CHECK_BAREUDP],
 [
     AT_SKIP_IF([! ip link add dev ovs_bareudp0 type bareudp dstport 6635 ethertype mpls_uc 2>&1 >/dev/null])
     AT_CHECK([ip link del dev ovs_bareudp0])
+])
+
+# IPTABLES_CHECK_EXTERNAL_CT()
+#
+# Checks if packets can be tracked outside OvS.
+# iptables variant of this macro
+m4_define([IPTABLES_CHECK_EXTERNAL_CT],
+[
+    dnl Kernel config (CONFIG_NETFILTER_XT_TARGET_CT)
+    dnl and user space extensions need to be present.
+    AT_SKIP_IF([! iptables -t raw -I OUTPUT 1 -j CT])
+    AT_CHECK([iptables -t raw -D OUTPUT 1])
+])
+
+# NFT_CHECK_EXTERNAL_CT()
+#
+# Checks if packets can be tracked outside OvS.
+# nft variant of this macro
+m4_define([NFT_CHECK_EXTERNAL_CT],
+[
+    dnl Kernel config (CONFIG_NETFILTER_XT_TARGET_CT)
+    dnl and user space extensions need to be present.
+    AT_SKIP_IF([! nft -c -f - << EOF
+                table ip raw {
+                    chain output-ovs-testsuite {
+                        type filter hook output priority raw;
+                        ct state new
+                    }
+                }
+EOF
+               ])
+])
+
+# CHECK_EXTERNAL_CT()
+#
+# Checks if packets can be tracked outside OvS.
+m4_define([CHECK_EXTERNAL_CT],
+[
+    dnl Kernel config (CONFIG_NETFILTER_XT_TARGET_CT)
+    dnl and user space extensions need to be present.
+    if test $HAVE_NFT = yes; then
+         NFT_CHECK_EXTERNAL_CT()
+    elif test $HAVE_IPTABLES = yes; then
+         IPTABLES_CHECK_EXTERNAL_CT()
+    else
+         AT_SKIP_IF([true])
+    fi
+])
+
+# IPTABLES_ADD_EXTERNAL_CT()
+#
+# Let conntrack start tracking the packets outside OvS.
+# iptables variant of this macro
+m4_define([IPTABLES_ADD_EXTERNAL_CT],
+[
+    AT_CHECK([iptables -t raw -I OUTPUT 1 -o $1 -j CT])
+    on_exit 'iptables -t raw -D OUTPUT 1'
+])
+
+# NFT_ADD_EXTERNAL_CT()
+#
+# Let conntrack start tracking the packets outside OvS.
+# nft variant of this macro
+m4_define([NFT_ADD_EXTERNAL_CT],
+[
+    if ! nft list table ip raw > /dev/null 2>1; then
+        on_exit 'nft "delete table ip raw"'
+    fi
+
+    AT_CHECK([nft -f - << EOF
+                  table ip raw {
+                      chain output-ovs-testsuite {
+                          type filter hook output priority raw;
+                          oifname "$1" ct state new
+                      }
+                  }
+EOF
+               ])
+    on_exit 'nft "delete chain ip raw output-ovs-testsuite"'
+])
+
+# ADD_EXTERNAL_CT()
+#
+# Checks if packets can be tracked outside OvS.
+m4_define([ADD_EXTERNAL_CT],
+[
+    if test $HAVE_NFT = yes; then
+        NFT_ADD_EXTERNAL_CT([$1])
+    else
+        IPTABLES_ADD_EXTERNAL_CT([$1])
+    fi
 ])

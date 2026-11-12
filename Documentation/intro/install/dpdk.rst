@@ -42,7 +42,7 @@ Build requirements
 In addition to the requirements described in :doc:`general`, building Open
 vSwitch with DPDK will require the following:
 
-- DPDK 23.11
+- DPDK 25.11.2
 
 - A `DPDK supported NIC`_
 
@@ -59,8 +59,8 @@ vSwitch with DPDK will require the following:
 
 Detailed system requirements can be found at `DPDK requirements`_.
 
-.. _DPDK supported NIC: https://doc.dpdk.org/guides-23.11/nics/index.html
-.. _DPDK requirements: https://doc.dpdk.org/guides-23.11/linux_gsg/sys_reqs.html
+.. _DPDK supported NIC: https://doc.dpdk.org/guides-25.11/nics/index.html
+.. _DPDK requirements: https://doc.dpdk.org/guides-25.11/linux_gsg/sys_reqs.html
 
 .. _dpdk-install:
 
@@ -73,9 +73,9 @@ Install DPDK
 #. Download the `DPDK sources`_, extract the file and set ``DPDK_DIR``::
 
        $ cd /usr/src/
-       $ wget https://fast.dpdk.org/rel/dpdk-23.11.tar.xz
-       $ tar xf dpdk-23.11.tar.xz
-       $ export DPDK_DIR=/usr/src/dpdk-23.11
+       $ wget https://fast.dpdk.org/rel/dpdk-25.11.2.tar.xz
+       $ tar xf dpdk-25.11.2.tar.xz
+       $ export DPDK_DIR=/usr/src/dpdk-stable-25.11.2
        $ cd $DPDK_DIR
 
 #. Configure and install DPDK using Meson
@@ -121,7 +121,7 @@ Install DPDK
 
 .. _DPDK sources: http://dpdk.org/rel
 .. _DPDK documentation:
-   https://doc.dpdk.org/guides-23.11/linux_gsg/build_dpdk.html
+   https://doc.dpdk.org/guides-25.11/linux_gsg/build_dpdk.html
 
 Install OVS
 ~~~~~~~~~~~
@@ -156,14 +156,7 @@ has to be configured to build against the DPDK library (``--with-dpdk``).
      option described in :ref:`general-configuring`.
 
    It is strongly recommended to build OVS with at least ``-msse4.2`` and
-   ``-mpopcnt`` optimization flags. If these flags are not enabled, the AVX512
-   optimized DPCLS implementation is not available in the resulting binary.
-   For technical details see the subtable registration code in the
-   ``lib/dpif-netdev-lookup.c`` file.
-
-   An example that enables the AVX512 optimizations is::
-
-       $ ./configure --with-dpdk=static CFLAGS="-Ofast -msse4.2 -mpopcnt"
+   ``-mpopcnt`` optimization flags.
 
 #. Build and install OVS, as described in :ref:`general-building`
 
@@ -175,25 +168,6 @@ Additional information can be found in :doc:`general`.
   working IOMMU.  Visit the `RHEL README`__ for additional information.
 
 __ https://github.com/openvswitch/ovs/blob/main/rhel/README.RHEL.rst
-
-
-Possible issues when enabling AVX512
-++++++++++++++++++++++++++++++++++++
-
-The enabling of ISA optimized builds requires build-system support.
-Certain versions of the assembler provided by binutils is known to have
-AVX512 assembling issues. The binutils versions affected are 2.30 and 2.31.
-As many distros backport fixes to previous versions of a package, checking
-the version output of ``as -v`` can err on the side of disabling AVX512. To
-remedy this, the OVS build system uses a build-time check to see if ``as``
-will correctly assemble the AVX512 code. The output of a good version when
-running the ``./configure`` step of the build process is as follows::
-
-   $ checking binutils avx512 assembler checks passing... yes
-
-If a bug is detected in the binutils assembler, it would indicate ``no``.
-Build an updated binutils, or request a backport of this binutils
-fix commit ``2069ccaf8dc28ea699bd901fdd35d90613e4402a`` to fix the issue.
 
 
 Setup
@@ -292,6 +266,12 @@ listed below. Defaults will be provided for all values not explicitly set.
   Comma separated list of memory to pre-allocate from hugepages on specific
   sockets. If not specified, this option will not be set by default. DPDK
   default will be used instead.
+
+``dpdk-probe-at-init``
+  Specifies whether DPDK should probe all devices available at initialization.
+  This option is needed when using the ``class=eth,mac=XX:XX:XX:XX:XX:XX``
+  syntax for DPDK ports. Defaults to false. See ``ovs-vswitchd.conf.db(5)``
+  for more details.
 
 ``dpdk-hugepage-dir``
   Directory where hugetlbfs is mounted
@@ -705,7 +685,7 @@ level:
 
 The average number of packets per output batch can be checked in PMD stats::
 
-    $ ovs-appctl dpif-netdev/pmd-stats-show
+    $ ovs-appctl dpif-netdev/pmd-perf-show
 
 Limitations
 ------------
@@ -722,7 +702,7 @@ Limitations
   release notes`_.
 
 .. _DPDK release notes:
-   https://doc.dpdk.org/guides-23.11/rel_notes/release_23_11.html
+   https://doc.dpdk.org/guides-25.11/rel_notes/release_25_11.html
 
 - Upper bound MTU: DPDK device drivers differ in how the L2 frame for a
   given MTU value is calculated e.g. i40e driver includes 2 x vlan headers in

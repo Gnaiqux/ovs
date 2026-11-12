@@ -30,6 +30,8 @@ ofproto_libofproto_la_SOURCES = \
 	ofproto/ofproto-dpif.h \
 	ofproto/ofproto-dpif-ipfix.c \
 	ofproto/ofproto-dpif-ipfix.h \
+	ofproto/ofproto-dpif-lsample.c \
+	ofproto/ofproto-dpif-lsample.h \
 	ofproto/ofproto-dpif-mirror.c \
 	ofproto/ofproto-dpif-mirror.h \
 	ofproto/ofproto-dpif-monitor.c \
@@ -57,9 +59,6 @@ ofproto_libofproto_la_SOURCES = \
 ofproto_libofproto_la_CPPFLAGS = $(AM_CPPFLAGS)
 ofproto_libofproto_la_CFLAGS = $(AM_CFLAGS)
 ofproto_libofproto_la_LIBADD = lib/libsflow.la
-if WIN32
-ofproto_libofproto_la_LIBADD += ${PTHREAD_LIBS}
-endif
 
 pkgconfig_DATA += \
 	ofproto/libofproto.pc

@@ -42,9 +42,6 @@
 #ifdef HAVE_PTHREAD_SET_NAME_NP
 #include <pthread_np.h>
 #endif
-#ifdef _WIN32
-#include <shlwapi.h>
-#endif
 
 VLOG_DEFINE_THIS_MODULE(util);
 
@@ -67,8 +64,8 @@ DEFINE_PER_THREAD_MALLOCED_DATA(char *, subprogram_name);
 /* --version option output. */
 static char *program_version;
 
-/* 'true' if mlockall() succeeded. */
-static bool is_memory_locked = false;
+/* 'true' if mlockall() succeeded, but doesn't support ONFAULT. */
+static bool is_all_memory_locked = false;
 
 /* Buffer used by ovs_strerror() and ovs_format_message(). */
 DEFINE_STATIC_PER_THREAD_DATA(struct { char s[128]; },
@@ -102,15 +99,15 @@ ovs_assert_failure(const char *where, const char *function,
 }
 
 void
-set_memory_locked(void)
+set_all_memory_locked(void)
 {
-    is_memory_locked = true;
+    is_all_memory_locked = true;
 }
 
 bool
-memory_locked(void)
+memory_all_locked(void)
 {
-    return is_memory_locked;
+    return is_all_memory_locked;
 }
 
 void
@@ -224,6 +221,8 @@ xvasprintf(const char *format, va_list args)
     va_list args2;
     size_t needed;
     char *s;
+
+    ovs_assert(format);
 
     va_copy(args2, args);
     needed = vsnprintf(NULL, 0, format, args);
@@ -526,10 +525,7 @@ ovs_retval_to_string(int retval)
             : ovs_strerror(retval));
 }
 
-/* This function returns the string describing the error number in 'error'
- * for POSIX platforms.  For Windows, this function can be used for C library
- * calls.  For socket calls that are also used in Windows, use sock_strerror()
- * instead.  For WINAPI calls, look at ovs_lasterror_to_string(). */
+/* This function returns the string describing the error number in 'error'. */
 const char *
 ovs_strerror(int error)
 {
@@ -590,22 +586,10 @@ ovs_strerror(int error)
 void
 ovs_set_program_name(const char *argv0, const char *version)
 {
-    char *basename;
-#ifdef _WIN32
-    size_t max_len = strlen(argv0) + 1;
-
-    SetErrorMode(GetErrorMode() | SEM_NOGPFAULTERRORBOX);
-#if _MSC_VER < 1900
-     /* This function is deprecated from 1900 (Visual Studio 2015) */
-    _set_output_format(_TWO_DIGIT_EXPONENT);
-#endif
-
-    basename = xmalloc(max_len);
-    _splitpath_s(argv0, NULL, 0, NULL, 0, basename, max_len, NULL, 0);
-#else
     const char *slash = strrchr(argv0, '/');
+    char *basename;
+
     basename = xstrdup(slash ? slash + 1 : argv0);
-#endif
 
     assert_single_threaded();
     free(program_name);
@@ -618,12 +602,14 @@ ovs_set_program_name(const char *argv0, const char *version)
     program_name = basename;
 
     free(program_version);
-    if (!strcmp(version, VERSION)) {
-        program_version = xasprintf("%s (Open vSwitch) "VERSION"\n",
+    if (!strcmp(version, VERSION VERSION_SUFFIX)) {
+        program_version = xasprintf("%s (Open vSwitch) "VERSION
+                                    VERSION_SUFFIX,
                                     program_name);
     } else {
         program_version = xasprintf("%s %s\n"
-                                    "Open vSwitch Library "VERSION"\n",
+                                    "Open vSwitch Library "VERSION
+                                    VERSION_SUFFIX,
                                     program_name, version);
     }
 }
@@ -666,14 +652,8 @@ get_page_size(void)
     static unsigned int cached;
 
     if (!cached) {
-#ifndef _WIN32
         long int value = sysconf(_SC_PAGESIZE);
-#else
-        long int value;
-        SYSTEM_INFO sysinfo;
-        GetSystemInfo(&sysinfo);
-        value = sysinfo.dwPageSize;
-#endif
+
         if (value >= 0) {
             cached = value;
         }
@@ -730,7 +710,7 @@ ctl_timeout_setup(unsigned int secs)
         char *env = getenv("OVS_CTL_TIMEOUT");
 
         if (env && env[0]) {
-            str_to_uint(env, 10, &secs);
+            ovs_ignore(str_to_uint(env, 10, &secs));
         }
     }
     if (secs) {
@@ -760,7 +740,7 @@ ovs_get_program_name(void)
 void
 ovs_print_version(uint8_t min_ofp, uint8_t max_ofp)
 {
-    printf("%s", program_version);
+    printf("%s\n", program_version);
     if (min_ofp || max_ofp) {
         printf("OpenFlow versions %#x:%#x\n", min_ofp, max_ofp);
     }
@@ -1083,11 +1063,7 @@ get_cwd(void)
     size_t size;
 
     /* Get maximum path length or at least a reasonable estimate. */
-#ifndef _WIN32
     path_max = pathconf(".", _PC_PATH_MAX);
-#else
-    path_max = MAX_PATH;
-#endif
     size = (path_max < 0 ? 1024
             : path_max > 10240 ? 10240
             : path_max);
@@ -1117,7 +1093,6 @@ all_slashes_name(const char *s)
                    : ".");
 }
 
-#ifndef _WIN32
 /* Returns the directory name portion of 'file_name' as a malloc()'d string,
  * similar to the POSIX dirname() function but thread-safe. */
 char *
@@ -1159,18 +1134,12 @@ base_name(const char *file_name)
 
     return xmemdup0(file_name + start, end - start);
 }
-#endif /* _WIN32 */
 
 bool
 is_file_name_absolute(const char *fn)
 {
-#ifdef _WIN32
-    /* Use platform specific API */
-    return !PathIsRelative(fn);
-#else
     /* An absolute path begins with /. */
     return fn[0] == '/';
-#endif
 }
 
 /* If 'file_name' is absolute, returns a copy of 'file_name'.  Otherwise,
@@ -1194,15 +1163,6 @@ abs_file_name(const char *dir, const char *file_name)
         return xasprintf("%s%s%s", dir, separator, file_name);
     }
 
-#if _WIN32
-    /* It's a little complicated to make an absolute path on Windows because a
-     * relative path might still specify a drive letter.  The OS has a function
-     * to do the job for us, so use it. */
-    char abs_path[MAX_PATH];
-    DWORD n = GetFullPathName(file_name, sizeof abs_path, abs_path, NULL);
-    return n > 0 && n <= sizeof abs_path ? xmemdup0(abs_path, n) : NULL;
-#else
-    /* Outside Windows, do the job ourselves. */
     char *cwd = get_cwd();
     if (!cwd) {
         return NULL;
@@ -1210,7 +1170,6 @@ abs_file_name(const char *dir, const char *file_name)
     char *abs_name = xasprintf("%s/%s", cwd, file_name);
     free(cwd);
     return abs_name;
-#endif
 }
 
 /* Like readlink(), but returns the link name as a null-terminated string in
@@ -1219,10 +1178,6 @@ abs_file_name(const char *dir, const char *file_name)
 static char *
 xreadlink(const char *filename)
 {
-#ifdef _WIN32
-    errno = ENOENT;
-    return NULL;
-#else
     size_t size;
 
     for (size = 64; ; size *= 2) {
@@ -1241,7 +1196,6 @@ xreadlink(const char *filename)
             return NULL;
         }
     }
-#endif
 }
 
 /* Returns a version of 'filename' with symlinks in the final component
@@ -1253,14 +1207,10 @@ xreadlink(const char *filename)
  *
  *     - Only symlinks in the final component of 'filename' are dereferenced.
  *
- * For Windows platform, this function returns a string that has the same
- * value as the passed string.
- *
  * The caller must eventually free the returned string (with free()). */
 char *
 follow_symlinks(const char *filename)
 {
-#ifndef _WIN32
     struct stat s;
     char *fn;
     int i;
@@ -1305,7 +1255,6 @@ follow_symlinks(const char *filename)
 
     VLOG_WARN("%s: too many levels of symlinks", filename);
     free(fn);
-#endif
     return xstrdup(filename);
 }
 
@@ -1313,7 +1262,7 @@ follow_symlinks(const char *filename)
  * __attribute__((warn_unused_result)) and you genuinely want to ignore
  * its return value.  (Note that every scalar type can be implicitly
  * converted to bool.) */
-void ignore(bool x OVS_UNUSED) { }
+void ovs_ignore(bool x OVS_UNUSED) { }
 
 /* Returns an appropriate delimiter for inserting just before the 0-based item
  * 'index' in a list that has 'total' items in it. */
@@ -1327,7 +1276,7 @@ english_list_delimiter(size_t index, size_t total)
 }
 
 /* Returns the number of trailing 0-bits in 'n'.  Undefined if 'n' == 0. */
-#if __GNUC__ >= 4 || _MSC_VER
+#if __GNUC__ >= 4
 /* Defined inline in util.h. */
 #else
 /* Returns the number of trailing 0-bits in 'n'.  Undefined if 'n' == 0. */
@@ -2373,18 +2322,13 @@ void
 xsleep(unsigned int seconds)
 {
     ovsrcu_quiesce_start();
-#ifdef _WIN32
-    Sleep(seconds * 1000);
-#else
     sleep(seconds);
-#endif
     ovsrcu_quiesce_end();
 }
 
 static void
 xnanosleep__(uint64_t nanoseconds)
 {
-#ifndef _WIN32
     int retval;
     struct timespec ts_sleep;
     nsec_to_timespec(nanoseconds, &ts_sleep);
@@ -2394,23 +2338,6 @@ xnanosleep__(uint64_t nanoseconds)
         retval = nanosleep(&ts_sleep, NULL);
         error = retval < 0 ? errno : 0;
     } while (error == EINTR);
-#else
-    HANDLE timer = CreateWaitableTimer(NULL, FALSE, NULL);
-    if (timer) {
-        LARGE_INTEGER duetime;
-        duetime.QuadPart = -nanoseconds;
-        if (SetWaitableTimer(timer, &duetime, 0, NULL, NULL, FALSE)) {
-            WaitForSingleObject(timer, INFINITE);
-        } else {
-            VLOG_ERR_ONCE("SetWaitableTimer Failed (%s)",
-                           ovs_lasterror_to_string());
-        }
-        CloseHandle(timer);
-    } else {
-        VLOG_ERR_ONCE("CreateWaitableTimer Failed (%s)",
-                       ovs_lasterror_to_string());
-    }
-#endif
 }
 
 /* High resolution sleep with thread quiesce. */
@@ -2452,55 +2379,6 @@ is_stdout_a_tty(void)
     char const *t = getenv("TERM");
     return (isatty(STDOUT_FILENO) && t && strcmp(t, "dumb") != 0);
 }
-
-#ifdef _WIN32
-
-char *
-ovs_format_message(int error)
-{
-    enum { BUFSIZE = sizeof strerror_buffer_get()->s };
-    char *buffer = strerror_buffer_get()->s;
-
-    if (error == 0) {
-        /* See ovs_strerror */
-        return "Success";
-    }
-
-    FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-                  NULL, error, 0, buffer, BUFSIZE, NULL);
-    return buffer;
-}
-
-/* Returns a null-terminated string that explains the last error.
- * Use this function to get the error string for WINAPI calls. */
-char *
-ovs_lasterror_to_string(void)
-{
-    return ovs_format_message(GetLastError());
-}
-
-int
-ftruncate(int fd, off_t length)
-{
-    int error;
-
-    error = _chsize_s(fd, length);
-    if (error) {
-        return -1;
-    }
-    return 0;
-}
-
-OVS_CONSTRUCTOR(winsock_start) {
-    WSADATA wsaData;
-    int error;
-
-    error = WSAStartup(MAKEWORD(2, 2), &wsaData);
-    if (error != 0) {
-        VLOG_FATAL("WSAStartup failed: %s", sock_strerror(sock_errno()));
-   }
-}
-#endif
 
 #ifdef __linux__
 bool

@@ -291,14 +291,14 @@ ovsdb_trigger_try(struct ovsdb_trigger *t, long long int now)
 
             /* Validate parameters. */
             const struct json *params = t->request->params;
-            if (params->type != JSON_ARRAY || params->array.n != 2) {
+            if (params->type != JSON_ARRAY || json_array_size(params) != 2) {
                 trigger_convert_error(t, ovsdb_syntax_error(params, NULL,
                                                             "array expected"));
                 return false;
             }
 
             /* Parse new schema and make a converted copy. */
-            const struct json *new_schema_json = params->array.elems[1];
+            const struct json *new_schema_json = json_array_at(params, 1);
             struct ovsdb_schema *new_schema;
             struct ovsdb_error *error
                 = ovsdb_schema_from_json(new_schema_json, &new_schema);
@@ -398,6 +398,7 @@ ovsdb_trigger_try(struct ovsdb_trigger *t, long long int now)
                 /* Permanent error.  Transition to "completed" state to report
                  * it. */
                 if (!strcmp(t->request->method, "transact")) {
+                    ovs_assert(t->reply);
                     json_array_add(t->reply->result,
                                    ovsdb_error_to_json_free(error));
                     ovsdb_trigger_complete(t);
@@ -405,6 +406,8 @@ ovsdb_trigger_try(struct ovsdb_trigger *t, long long int now)
                     jsonrpc_msg_destroy(t->reply);
                     t->reply = NULL;
                     trigger_convert_error(t, error);
+                } else {
+                    OVS_NOT_REACHED();
                 }
             }
         } else {

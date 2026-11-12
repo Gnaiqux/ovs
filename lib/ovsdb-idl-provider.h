@@ -121,7 +121,8 @@ struct ovsdb_idl_table {
     bool need_table;         /* Monitor table even if no columns are selected
                               * for replication. */
     struct shash columns;    /* Contains "const struct ovsdb_idl_column *"s. */
-    struct sset schema_columns; /* Column names from schema. */
+    struct shash schema_columns; /* Contains "const struct ovsdb_type *" per
+                                  * column as defined in the server schema. */
     struct hmap rows;        /* Contains "struct ovsdb_idl_row"s. */
     struct ovsdb_idl *idl;   /* Containing IDL instance. */
     unsigned int change_seqno[OVSDB_IDL_CHANGE_MAX];
@@ -129,6 +130,9 @@ struct ovsdb_idl_table {
                               * or not. */
     struct ovs_list indexes;    /* Contains "struct ovsdb_idl_index"s */
     struct ovs_list track_list; /* Tracked rows (ovsdb_idl_row.track_node). */
+
+    struct ovsdb_idl_condition *req_cond; /* User requested monitor
+                                           * condition. */
 };
 
 struct ovsdb_idl_class {

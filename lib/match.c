@@ -1462,7 +1462,7 @@ match_format(const struct match *match,
     bool is_megaflow = false;
     int i;
 
-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 42);
+    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 43);
 
     if (priority != OFP_DEFAULT_PRIORITY) {
         ds_put_format(s, "%spriority=%s%d,",
@@ -1618,7 +1618,7 @@ match_format(const struct match *match,
         ds_put_char(s, ',');
     }
     for (i = 0; i < FLOW_MAX_VLAN_HEADERS; i++) {
-        char str_i[8];
+        char str_i[12];
 
         if (!wc->masks.vlans[i].tci) {
             break;

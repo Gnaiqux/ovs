@@ -94,8 +94,10 @@ struct netdev_linux {
     enum netdev_features advertised; /* Cached from ETHTOOL_GSET. */
     enum netdev_features supported;  /* Cached from ETHTOOL_GSET. */
     uint32_t current_speed;          /* Cached from ETHTOOL_GSET. */
+    uint8_t current_duplex;          /* Cached from ETHTOOL_GSET. */
 
     struct ethtool_drvinfo drvinfo;  /* Cached from ETHTOOL_GDRVINFO. */
+    uint64_t peer_ifindex;           /* Cached from ETHTOOL_GSTATS (veth). */
     struct tc *tc;
 
     /* For devices of class netdev_tap_class only. */
@@ -117,9 +119,6 @@ struct netdev_linux {
     enum afxdp_mode xdp_mode;               /* Configured AF_XDP mode. */
     enum afxdp_mode requested_xdp_mode;     /* Requested  AF_XDP mode. */
     enum afxdp_mode xdp_mode_in_use;        /* Effective  AF_XDP mode. */
-
-    bool use_need_wakeup;
-    bool requested_need_wakeup;
 
     struct netdev_afxdp_tx_lock *tx_locks;  /* Array of locks for TX queues. */
 #endif

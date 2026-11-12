@@ -304,7 +304,13 @@ rconn_get_max_backoff(const struct rconn *rc)
 {
     /* rc->max_backoff is 1000 times some 'int', so dividing by 1000 will yield
      * a value in the range of 'int', therefore this is safe. */
-    return rc->max_backoff / 1000;
+    int max_backoff;
+
+    ovs_mutex_lock(&rc->mutex);
+    max_backoff = rc->max_backoff / 1000;
+    ovs_mutex_unlock(&rc->mutex);
+
+    return max_backoff;
 }
 
 void
@@ -1149,14 +1155,7 @@ static void
 report_error(struct rconn *rc, int error)
     OVS_REQUIRES(rc->mutex)
 {
-    /* On Windows, when a peer terminates without calling a closesocket()
-     * on socket fd, we get WSAECONNRESET. Don't print warning messages
-     * for that case. */
-    if (error == EOF
-#ifdef _WIN32
-        || error == WSAECONNRESET
-#endif
-        ) {
+    if (error == EOF) {
         /* If 'rc' isn't reliable, then we don't really expect this connection
          * to last forever anyway (probably it's a connection that we received
          * via accept()), so use DBG level to avoid cluttering the logs. */
@@ -1285,6 +1284,7 @@ close_monitor(struct rconn *rc, size_t idx, int retval)
     VLOG_DBG("%s: closing monitor connection to %s: %s",
              rconn_get_name(rc), vconn_get_name(rc->monitors[idx]),
              ovs_retval_to_string(retval));
+    vconn_close(rc->monitors[idx]);
     rc->monitors[idx] = rc->monitors[--rc->n_monitors];
 }
 

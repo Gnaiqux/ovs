@@ -29,12 +29,64 @@ Subject: Patch this is.
     fi
 
     if test -s expout; then
-        AT_CHECK([$PYTHON3 $top_srcdir/utilities/checkpatch.py $3 -q test.patch],
+        AT_CHECK([OVS_SRC_DIR=$top_srcdir $PYTHON3 \
+                    $top_srcdir/utilities/checkpatch.py $3 -q test.patch],
                  [1], [stdout])
         AT_CHECK([sed '/^Lines checked:/,$d' stdout], [0], [expout])
     else
-        AT_CHECK([$PYTHON3 $top_srcdir/utilities/checkpatch.py $3 -q test.patch])
+        AT_CHECK([OVS_SRC_DIR=$top_srcdir $PYTHON3 \
+                    $top_srcdir/utilities/checkpatch.py $3 -q test.patch])
     fi
+}
+
+# try_checkpatch_file FILENAME SOURCE [ERRORS] [CHECKPATCH-ARGS] [FILTER]
+#
+# Runs checkpatch against FILENAME with SOURCE contents, expecting the set
+# of specified ERRORS (and warnings).  Optionally, sets [CHECKPATCH-ARGS].
+# The optional FILTER can be used to adjust the expected output before
+# processing.
+try_checkpatch_file() {
+   local FILENAME="$1"
+   echo "$2" | sed 's/^    //' > "$FILENAME"
+
+   # Take expected output from $3.
+   if test -n "$3"; then
+       echo "$3" | sed 's/^    //' > expout
+   else
+       : > expout
+   fi
+
+   if test -s expout; then
+       AT_CHECK([OVS_SRC_DIR=$top_srcdir $PYTHON3 \
+                   $top_srcdir/utilities/checkpatch.py $4 -q -f "$FILENAME"],
+                [1], [stdout])
+       AT_CHECK([sed "$5
+                      /^Lines checked:/d
+                      /^$/d" stdout], [0], [expout])
+   else
+       AT_CHECK([OVS_SRC_DIR=$top_srcdir $PYTHON3 \
+                   $top_srcdir/utilities/checkpatch.py $4 -q -f "$FILENAME"])
+   fi
+}
+
+# try_checkpatch_c_file SOURCE [ERRORS] [CHECKPATCH-ARGS] [FILTER]
+#
+# Runs checkpatch against "C" SOURCE contents, expecting the set of
+# specified ERRORS (and warnings).  Optionally, sets [CHECKPATCH-ARGS].
+# The optional FILTER can be used to adjust the expected output before
+# processing.
+try_checkpatch_c_file() {
+    try_checkpatch_file "test.c" "$@"
+}
+
+# try_checkpatch_py_file SOURCE [ERRORS] [CHECKPATCH-ARGS] [FILTER]
+#
+# Runs checkpatch against "Python" SOURCE contents, expecting the set of
+# specified ERRORS (and warnings).  Optionally, sets [CHECKPATCH-ARGS].
+# The optional FILTER can be used to adjust the expected output before
+# processing.
+try_checkpatch_py_file() {
+    try_checkpatch_file "test.py" "$@"
 }
 OVS_END_SHELL_HELPERS
 
@@ -353,6 +405,31 @@ try_checkpatch \
          if (--mcs->n_refs==0) {
 "
 
+try_checkpatch \
+   "COMMON_PATCH_HEADER
+    +char *string;
+    +char **list;
+    +char ***ptr_list;
+    "
+
+try_checkpatch \
+   "COMMON_PATCH_HEADER
+    +char** list;
+    " \
+    "WARNING: Line lacks whitespace around operator
+    #8 FILE: A.c:1:
+    char** list;
+    "
+
+try_checkpatch \
+   "COMMON_PATCH_HEADER
+    +char*** list;
+    " \
+    "WARNING: Line lacks whitespace around operator
+    #8 FILE: A.c:1:
+    char*** list;
+    "
+
 AT_CLEANUP
 
 AT_SETUP([checkpatch - check misuse APIs])
@@ -588,6 +665,23 @@ try_checkpatch \
     "WARNING: The subject, '<area>: <summary>', is over 70 characters, i.e., 85.
     Subject: netdev: This is a way to long commit summary and therefor it should report a WARNING!"
 
+try_checkpatch \
+   "Author: A
+    Commit: A
+    Subject: netdev: This is a way to long commit summary and therefor it
+     should report a WARNING!
+
+    Signed-off-by: A" \
+    "WARNING: The subject, '<area>: <summary>', is over 70 characters, i.e., 85.
+    Subject: netdev: This is a way to long commit summary and therefor it should report a WARNING!"
+
+try_checkpatch \
+   "Author: A
+    Commit: A
+    Subject: [[PATCH v7 branch-x.y RFC]] area: This one is actually not that long and should not be reported.
+
+    Signed-off-by: A"
+
 AT_CLEANUP
 
 AT_SETUP([checkpatch - ignore committer as signoff])
@@ -607,5 +701,215 @@ try_checkpatch \
     Signed-off-by: A" \
     "" \
     "--skip-committer-signoff"
+
+AT_CLEANUP
+
+AT_SETUP([checkpatch - AUTHORS.rst existence])
+
+try_checkpatch \
+   "Author: A <a@a.com>
+    Commit: A <a@a.com>
+    Subject: netdev: Subject.
+
+    Signed-off-by: A <a@a.com>" \
+    ""
+
+try_checkpatch \
+   "Author: A <a@a.com>
+    Commit: A <a@a.com>
+    Subject: netdev: Subject.
+
+    Signed-off-by: A <a@a.com>" \
+    "WARNING: Author 'A <a@a.com>' is not in the AUTHORS.rst file!" \
+    "-a"
+
+AT_CLEANUP
+
+AT_SETUP([checkpatch - file contents checks - bare return])
+try_checkpatch_c_file \
+   "#include <foo.h>
+    #include <bar.h>
+
+    void foo() {
+        return;
+    }" \
+    "WARNING: Empty return followed by brace, consider omitting
+    test.c:6:
+    }"
+AT_CLEANUP
+
+AT_SETUP([checkpatch - file contents checks - parenthesized constructs])
+
+for ctr in 'if' 'while' 'switch' 'HMAP_FOR_EACH' 'BITMAP_FOR_EACH_1'; do
+try_checkpatch_c_file \
+   "#include <foo.h>
+    #include <bar.h>
+
+    void foo() {
+       $ctr (check_node) {
+          something(check_node);
+       }
+    }
+    "
+
+try_checkpatch_c_file \
+   "#include <foo.h>
+    #include <bar.h>
+
+    void foo() {
+       $ctr ( first_run) {
+          something(check_node);
+       }
+    }" \
+    "ERROR: Improper whitespace around control block
+    test.c:5:
+       $ctr ( first_run) {"
+done
+AT_CLEANUP
+
+AT_SETUP([checkpatch - file contents checks - static inline in C files])
+
+try_checkpatch_c_file \
+   "#include <foo.h>
+    #include <bar.h>
+
+    static inline bool foo() {
+    }" \
+   "WARNING: Using 'static inline' in a c-file without ALWAYS_INLINE.
+    test.c:4:
+    static inline bool foo() {"
+
+try_checkpatch_c_file \
+   "#include <foo.h>
+    #include <bar.h>
+
+    static inline
+    bool foo() {
+    }" \
+   "WARNING: Using 'static inline' in a c-file without ALWAYS_INLINE.
+    test.c:4:
+    static inline"
+
+try_checkpatch_c_file \
+   "#include <foo.h>
+    #include <bar.h>
+
+    static   inline
+    bool foo() {
+    }" \
+   "WARNING: Using 'static inline' in a c-file without ALWAYS_INLINE.
+    test.c:4:
+    static   inline"
+
+try_checkpatch_c_file \
+   "#include <foo.h>
+    #include <bar.h>
+
+        static inline
+        bool foo() {
+        }" \
+   "WARNING: Using 'static inline' in a c-file without ALWAYS_INLINE.
+    test.c:4:
+        static inline"
+
+try_checkpatch_c_file \
+   "#include <foo.h>
+    #include <bar.h>
+
+        static inline ALWAYS_INLINE
+        bool foo() {
+        }"
+
+try_checkpatch_c_file \
+   "#include <foo.h>
+    #include <bar.h>
+
+        ALWAYS_INLINE static inline
+        bool foo() {
+        }"
+
+try_checkpatch_c_file \
+   "#include <foo.h>
+    #include <bar.h>
+
+        ALWAYS_INLINE static inline bool foo() {
+        }"
+
+try_checkpatch_c_file \
+   "#include <foo.h>
+    #include <bar.h>
+
+        static inline bool foo() ALWAYS_INLINE {
+        }"
+
+try_checkpatch_c_file \
+   "#include <foo.h>
+    #include <bar.h>
+
+    static void inliner() {
+    }"
+
+dnl This is to confirm that filename selection works
+try_checkpatch_py_file \
+   "#include <foo.h>
+    #include <bar.h>
+
+    static inline bool foo() {
+    }"
+
+AT_CLEANUP
+
+AT_SETUP([checkpatch - spelling checks])
+AT_SKIP_IF([! $PYTHON3 -c 'import enchant' >/dev/null 2>&1])
+
+dnl First check with some default words
+
+try_checkpatch_c_file \
+   "#include <foo.h>
+    #include <bar.h>
+
+    /* naintenance mode */
+    void foo() {
+       $ctr ( first_run ) {
+          something(check_node);
+       }
+    }" \
+    "WARNING: Possible misspelled word: \"naintenance\"
+    test.c:4:
+    /* naintenance mode */" \
+    "-S" \
+    "/^Did you mean:/d"
+
+try_checkpatch_c_file \
+   "#include <foo.h>
+    #include <bar.h>
+
+    /* hugepage mode */
+    void foo() {
+       $ctr ( first_run ) {
+          something(check_node);
+       }
+    }" \
+    "" \
+    "-S"
+
+dnl Second check with some different words
+try_checkpatch_c_file \
+    "/* This code is for my private prooperty. */
+    " \
+    "WARNING: Possible misspelled word: \"prooperty\"
+    test.c:1:
+    /* This code is for my private prooperty. */" \
+    "-S" \
+    "/^Did you mean:/d"
+
+try_checkpatch_py_file \
+    "# This is a python file with an intentionaly misspelled word.
+    # The user wants to check if it's working." \
+    "WARNING: Possible misspelled word: \"intentionaly\"
+    test.py:1:
+    # This is a python file with an intentionaly misspelled word." \
+    "-S" \
+    "/^Did you mean:/d"
 
 AT_CLEANUP

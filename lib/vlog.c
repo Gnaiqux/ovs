@@ -396,7 +396,9 @@ vlog_set_log_file__(char *new_log_file_name)
                   && old_stat.st_ino == new_stat.st_ino));
     ovs_mutex_unlock(&log_file_mutex);
     if (same_file) {
-        close(new_log_fd);
+        if (new_log_fd >= 0) {
+            close(new_log_fd);
+        }
         free(new_log_file_name);
         return 0;
     }
@@ -477,7 +479,6 @@ vlog_reopen_log_file(void)
     }
 }
 
-#ifndef _WIN32
 /* In case a log file exists, change its owner to new 'user' and 'group'.
  *
  * This is useful for handling cases where the --log-file option is
@@ -504,7 +505,6 @@ vlog_change_owner_unix(uid_t user, gid_t group)
         VLOG_FATAL("%s", ds_steal_cstr(&err));
     }
 }
-#endif
 
 /* Set debugging levels.  Returns null if successful, otherwise an error
  * message that the caller must free(). */
@@ -661,7 +661,7 @@ vlog_direct_write_to_log_file_unsafe(const char *s)
     OVS_NO_THREAD_SAFETY_ANALYSIS
 {
     if (log_fd >= 0) {
-        ignore(write(log_fd, s, strlen(s)));
+        ovs_ignore(write(log_fd, s, strlen(s)));
     }
 }
 
@@ -824,6 +824,14 @@ vlog_disable_rate_limit(struct unixctl_conn *conn, int argc,
     set_rate_limits(conn, argc, argv, false);
 }
 
+static void
+vlog_inject_info_log(struct unixctl_conn *conn, int argc OVS_UNUSED,
+                     const char *argv[], void *aux OVS_UNUSED)
+{
+    VLOG_INFO("user-message: %s", argv[1]);
+    unixctl_command_reply(conn, NULL);
+}
+
 /* Initializes the logging subsystem and registers its unixctl server
  * commands. */
 void
@@ -876,6 +884,8 @@ vlog_init(void)
                                  vlog_unixctl_reopen, NULL);
         unixctl_command_register("vlog/close", "", 0, 0,
                                  vlog_unixctl_close, NULL);
+        unixctl_command_register("vlog/message", NULL, 1, 1,
+                                 vlog_inject_info_log, NULL);
 
         ovs_rwlock_rdlock(&pattern_rwlock);
         print_syslog_target_deprecation = syslog_fd >= 0;
@@ -1216,7 +1226,7 @@ vlog_valist(const struct vlog_module *module, enum vlog_level level,
                         async_append_flush(log_writer);
                     }
                 } else {
-                    ignore(write(log_fd, s.string, s.length));
+                    ovs_ignore(write(log_fd, s.string, s.length));
                 }
             }
             ovs_mutex_unlock(&log_file_mutex);

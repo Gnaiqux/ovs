@@ -30,10 +30,10 @@ m4_define([OVS_DPDK_PRE_PHY_SKIP],
 #
 m4_define([OVS_DPDK_START],
   [dnl start ovs dpdk
-   OVS_DPDK_START_OVSDB($3)
+   OVS_DPDK_START_OVSDB($2)
    dnl Enable DPDK functionality
    AT_CHECK([ovs-vsctl --no-wait set Open_vSwitch . other_config:dpdk-init=true])
-   OVS_DPDK_START_VSWITCHD([$1], [$2])
+   OVS_DPDK_START_VSWITCHD([$1])
 ])
 
 
@@ -65,10 +65,10 @@ m4_define([OVS_DPDK_START_OVSDB],
 #
 m4_define([OVS_DPDK_START_VSWITCHD],
   [dnl Change DPDK drivers log levels so that tests only catch errors
-   AT_CHECK([ovs-vsctl --no-wait set Open_vSwitch . other_config:dpdk-extra="--log-level=pmd.*:error $1"])
+   AT_CHECK([ovs-vsctl --no-wait set Open_vSwitch . other_config:dpdk-extra="--log-level=pmd.*:error"])
 
    dnl Start ovs-vswitchd.
-   AT_CHECK([ovs-vswitchd $2 --detach --no-chdir --pidfile --log-file -vvconn -vofproto_dpif -vunixctl], [0], [stdout], [stderr])
+   AT_CHECK([ovs-vswitchd $1 --detach --no-chdir --pidfile --log-file -vvconn -vofproto_dpif -vunixctl], [0], [stdout], [stderr])
    AT_CAPTURE_FILE([ovs-vswitchd.log])
    on_exit "kill_ovs_vswitchd `cat ovs-vswitchd.pid`"
 ])
@@ -102,7 +102,7 @@ m4_define([OVS_DPDK_CHECK_TESTPMD],
 m4_define([OVS_DPDK_START_TESTPMD],
   [AT_CHECK([lscpu], [], [stdout])
    AT_CHECK([cat stdout | grep "NUMA node(s)" | awk '{c=1; while (c++<$(3)) {printf "512,"}; print "512"}' > NUMA_NODE])
-   eal_options="$DPDK_EAL_OPTIONS --in-memory --socket-mem="$(cat NUMA_NODE)" --single-file-segments --no-pci"
+   eal_options="$DPDK_EAL_OPTIONS --in-memory --socket-mem="$(cat NUMA_NODE)" --single-file-segments --no-pci --file-prefix testpmd"
    options="$1"
    test "$options" != "${options%% -- *}" || options="$options -- "
    eal_options="$eal_options ${options%% -- *}"
@@ -139,7 +139,7 @@ m4_define([OVS_TRAFFIC_VSWITCHD_START],
    OVS_DPDK_PRE_CHECK()
    OVS_WAIT_WHILE([ip link show ovs-netdev])
    dnl For functional tests, no need for DPDK PCI probing.
-   OVS_DPDK_START([--no-pci], [--disable-system], [$3])
+   OVS_DPDK_START([--disable-system], [$3])
    dnl Add bridges, ports, etc.
    OVS_WAIT_WHILE([ip link show br0])
    AT_CHECK([ovs-vsctl -- _ADD_BR([br0]) -- $1 m4_if([$2], [], [], [| uuidfilt])], [0], [$2])
@@ -199,3 +199,13 @@ m4_define([CONFIGURE_VETH_OFFLOADS],
     [AT_CHECK([ethtool -K $1 tx off], [0], [ignore], [ignore])
      AT_CHECK([ethtool -K $1 txvlan off], [0], [ignore], [ignore])]
 )
+
+
+# DUMP_DP_IP_CLEAN_SORTED()
+#
+# Clean up and sort the ovs-appctl dpctl/dump-flows output for comparing.
+#
+m4_define([DUMP_DP_IP_CLEAN_SORTED], [dnl
+  grep 'eth_type(0x0800)' \
+    | sed -e 's/eth(src=[[a-z0-9:]]*,dst=[[a-z0-9:]]*)/eth(macs)/;s/recirc_id(0),//' \
+    | strip_used | strip_ptype | sort])

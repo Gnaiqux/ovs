@@ -43,7 +43,6 @@ test_jsonrpc_main(int argc, char *argv[])
     struct ovs_cmdl_context ctx = { .argc = 0, };
     ovs_cmdl_proctitle_init(argc, argv);
     set_program_name(argv[0]);
-    service_start(&argc, &argv);
     parse_options(argc, argv);
     ctx.argc = argc - optind;
     ctx.argv = argv + optind;
@@ -124,7 +123,7 @@ parse_json(const char *s)
 {
     struct json *json = json_from_string(s);
     if (json->type == JSON_STRING) {
-        ovs_fatal(0, "\"%s\": %s", s, json->string);
+        ovs_fatal(0, "\"%s\": %s", s, json_string(json));
     }
     return json;
 }

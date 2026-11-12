@@ -13,7 +13,7 @@
 # limitations under the License.
 
 AC_PREREQ(2.63)
-AC_INIT(openvswitch, 3.3.90, bugs@openvswitch.org)
+AC_INIT(openvswitch, 4.0.90, bugs@openvswitch.org)
 AC_CONFIG_SRCDIR([vswitchd/ovs-vswitchd.c])
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_AUX_DIR([build-aux])
@@ -87,9 +87,6 @@ AC_SEARCH_LIBS([pthread_spin_lock], [pthread])
 AC_CHECK_FUNCS([pthread_spin_lock])
 AC_FUNC_STRERROR_R
 
-OVS_CHECK_WIN64
-OVS_CHECK_WIN32
-OVS_CHECK_VISUAL_STUDIO_DDK
 OVS_CHECK_COVERAGE
 OVS_CHECK_NDEBUG
 OVS_CHECK_USDT
@@ -145,9 +142,8 @@ AX_FUNC_POSIX_MEMALIGN
 OVS_CHECK_UNBOUND
 OVS_CHECK_UNWIND
 
-OVS_CHECK_INCLUDE_NEXT([stdio.h string.h])
+OVS_CHECK_INCLUDE_NEXT([string.h])
 AC_CONFIG_FILES([
-    lib/stdio.h
     lib/string.h
     ovsdb/libovsdb.sym
     ofproto/libofproto.sym
@@ -168,6 +164,8 @@ OVS_ENABLE_OPTION([-Wstrict-prototypes])
 OVS_ENABLE_OPTION([-Wold-style-definition])
 OVS_ENABLE_OPTION([-Wmissing-prototypes])
 OVS_ENABLE_OPTION([-Wmissing-field-initializers])
+OVS_ENABLE_OPTION([-Wmissing-declarations])
+OVS_ENABLE_OPTION([-Wmissing-variable-declarations])
 OVS_ENABLE_OPTION([-Wthread-safety])
 OVS_ENABLE_OPTION([-fno-strict-aliasing])
 OVS_ENABLE_OPTION([-Wswitch-bool])
@@ -182,16 +180,12 @@ OVS_ENABLE_OPTION([-Wmultistatement-macros])
 OVS_ENABLE_OPTION([-Wcast-align=strict])
 OVS_ENABLE_OPTION([-Wno-null-pointer-arithmetic])
 OVS_ENABLE_OPTION([-Warray-bounds-pointer-arithmetic])
+OVS_ENABLE_OPTION([-Wno-default-const-init-field-unsafe])
 OVS_CONDITIONAL_CC_OPTION([-Wno-unused], [HAVE_WNO_UNUSED])
 OVS_CONDITIONAL_CC_OPTION([-Wno-unused-parameter], [HAVE_WNO_UNUSED_PARAMETER])
 OVS_ENABLE_WERROR_TOP
 OVS_ENABLE_SPARSE
 OVS_CTAGS_IDENTIFIERS
-OVS_CHECK_ACTIONS_AUTOVALIDATOR
-OVS_CHECK_DPCLS_AUTOVALIDATOR
-OVS_CHECK_DPIF_AVX512_DEFAULT
-OVS_CHECK_MFEX_AUTOVALIDATOR
-OVS_CHECK_AVX512
 
 AC_ARG_VAR(KARCH, [Kernel Architecture String])
 AC_SUBST(KARCH)
@@ -202,6 +196,7 @@ OVS_CHECK_LINUX_SCTP_CT
 OVS_CHECK_LINUX_VIRTIO_TYPES
 OVS_CHECK_DPDK
 OVS_CHECK_PRAGMA_MESSAGE
+OVS_CHECK_VERSION_SUFFIX
 AC_SUBST([CFLAGS])
 AC_SUBST([OVS_CFLAGS])
 AC_SUBST([OVS_LDFLAGS])
@@ -217,7 +212,6 @@ AC_CONFIG_FILES(include/openvswitch/version.h)
 dnl This makes sure that include/openflow gets created in the build directory.
 AC_CONFIG_COMMANDS([include/openflow/openflow.h.stamp])
 
-AC_CONFIG_COMMANDS([utilities/bugtool/dummy], [:])
 AC_CONFIG_COMMANDS([ipsec/dummy], [:])
 
 m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES])
